@@ -1,32 +1,61 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
 
-# Test binary, built with `go test -c`
-*.test
+# Generated from .proto (если понадобится хранить артефакты вне OUT_DIR)
+# *_pb2.py
+# *.pb.rs
 
-# Code coverage profiles and other test artifacts
-*.out
-coverage.*
-*.coverprofile
-profile.cov
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# IDE / Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.nvim/
+.helix/
+.zed/
 
-# Go workspace file
-go.work
-go.work.sum
-
-# env file
+# Environment / secrets
 .env
+.env.*
+!.env.example
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Logs и runtime
+*.log
+logs/
+brook-*.jsonl
+/brook.toml
+
+# AI-агенты (локальные конфиги / артефакты)
+.claude/
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.continue/
+.windsurf/
+.codex/
+.roo/
+.cline/
+.goose/
+.github/copilot/
+CLAUDE.local.md
+AGENTS.local.md
+GEMINI.local.md
+.ai/
+.llm/
+
+# Временное
+*.tmp
+*.bak
+*.orig
