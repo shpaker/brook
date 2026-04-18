@@ -4,6 +4,7 @@
 
 - [vision.md](vision.md) — что за продукт и для кого
 - [roadmap.md](roadmap.md) — порядок реализации MVP
+- [todo.md](todo.md) — чеклист задач MVP
 - [stack.md](stack.md) — технологический стек и обоснование
 - [features.md](features.md) — функции MVP
 - [post-mvp.md](post-mvp.md) — всё, что идёт после MVP
