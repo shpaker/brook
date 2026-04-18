@@ -42,7 +42,7 @@
 - [ ] `Remove`: то же, что `Cancel`, плюс удаление записи из глобальной очереди
 - [ ] Fallback: нет Range → один сегмент без чанков
 - [ ] `DownloadManager`: реестр engines, очередь, `max_concurrent`
-- [ ] `DownloadManager`: персистентность очереди в отдельной SQLite
+- [ ] `DownloadManager`: персистентность очереди в `./brook.db` (SQLite рядом с `brook.toml`)
 - [ ] Progress-троттлинг в engine: агрегация в окне 200 ms → эмит не чаще 5 Hz per download
 - [ ] State-changes / snapshot — мгновенный эмит, без троттлинга
 - [ ] Центральный `broadcast::Sender<Event>` в `DownloadManager` (ring 1024)
