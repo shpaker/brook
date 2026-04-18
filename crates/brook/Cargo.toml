@@ -1,0 +1,11 @@
+[package]
+name       = "brook"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+brook-proto = { path = "../brook-proto" }
+brook-core  = { path = "../brook-core" }
+brook-api   = { path = "../brook-api" }
+tonic       = { workspace = true }
+tokio       = { workspace = true }

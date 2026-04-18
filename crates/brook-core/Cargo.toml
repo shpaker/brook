@@ -1,0 +1,7 @@
+[package]
+name       = "brook-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }

@@ -1,5 +1,43 @@
 # brook — agent rules
 
+## 0. Workspace
+
+**brook** is a macOS download manager: Rust async core (`brook-core`), gRPC API (`brook-api`), and a ratatui TUI binary (`brook`). Architecture: [docs/architecture.md](docs/architecture.md). Stack: [docs/stack.md](docs/stack.md).
+
+### Crate layout
+
+```
+brook/
+├── Cargo.toml                    # [workspace]
+├── proto/brook/v1/brook.proto    # single source of truth for the API contract
+├── crates/
+│   ├── brook-proto/              # build.rs → prost + tonic stubs
+│   ├── brook-core/               # DownloadManager + DownloadEngine
+│   ├── brook-api/                # gRPC server (tonic), thin wrapper over core
+│   └── brook/                    # MVP binary: ratatui UI, boots core + api in-process
+└── docs/
+```
+
+### Key commands
+
+```sh
+cargo build                # build all crates
+cargo build -p brook       # build binary only
+cargo run -p brook         # run the TUI (reads ./brook.toml from CWD)
+cargo test                 # run all tests
+cargo test -p brook-core   # core unit + integration tests (no network)
+```
+
+### Runtime artifacts in CWD
+
+| File | Purpose |
+|---|---|
+| `brook.toml` | Config (created with defaults if absent) |
+| `brook.db` | Global download queue (SQLite) |
+| `.brook.lock` | Single-instance flock |
+
+Per-download artefacts live next to the target file: `<name>.data.brook` (preallocated) + `<name>.index.brook` (chunk index, SQLite WAL).
+
 ## Git
 
 - **Commit messages — English, Conventional Commits.**

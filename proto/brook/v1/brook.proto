@@ -1,0 +1,94 @@
+syntax = "proto3";
+package brook.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+service DownloadService {
+    rpc List      (ListRequest)            returns (ListResponse);
+    rpc Add       (AddRequest)             returns (AddResponse);
+    rpc Remove    (RemoveRequest)          returns (RemoveResponse);
+
+    rpc Pause     (IdRequest)              returns (StatusResponse);
+    rpc Resume    (IdRequest)              returns (StatusResponse);
+    rpc Cancel    (IdRequest)              returns (StatusResponse);
+
+    rpc PauseAll  (google.protobuf.Empty)  returns (StatusResponse);
+    rpc ResumeAll (google.protobuf.Empty)  returns (StatusResponse);
+
+    // server-streaming: progress ticks and state changes
+    rpc Watch     (WatchRequest)           returns (stream Event);
+}
+
+// ── core types ────────────────────────────────────────────────────────────────
+
+message DownloadId {
+    string value = 1;   // UUID as string
+}
+
+message DownloadSpec {
+    string url         = 1;
+    string target_path = 2;             // absolute path; or prefix from config + filename
+    uint32 segments    = 3;             // 0 = use config default
+    map<string, string> headers = 4;
+}
+
+enum DownloadState {
+    STATE_UNSPECIFIED = 0;
+    QUEUED    = 1;
+    RUNNING   = 2;
+    PAUSED    = 3;
+    DONE      = 4;
+    FAILED    = 5;
+    RETRYING  = 6;
+    CANCELLED = 7;
+}
+
+message Progress {
+    uint64 downloaded_bytes = 1;
+    uint64 total_bytes      = 2;
+    double speed_bps        = 3;
+    uint64 eta_seconds      = 4;
+}
+
+message Download {
+    DownloadId                id            = 1;
+    DownloadSpec              spec          = 2;
+    DownloadState             state         = 3;
+    Progress                  progress      = 4;
+    uint32                    attempt       = 5;
+    string                    error_message = 6;    // FAILED / RETRYING only
+    google.protobuf.Timestamp created_at    = 7;
+    google.protobuf.Timestamp updated_at    = 8;
+}
+
+// ── Watch event ───────────────────────────────────────────────────────────────
+
+message Event {
+    DownloadId id = 1;
+    oneof kind {
+        Download snapshot      = 2;  // full state — overwrite client record
+        Progress progress_tick = 3;  // lightweight delta during RUNNING (≤ 5 Hz)
+        string   log_line      = 4;  // debug tail shown in expanded card
+    }
+}
+
+// ── requests / responses ──────────────────────────────────────────────────────
+
+message ListRequest  {}
+message ListResponse { repeated Download downloads = 1; }
+
+message AddRequest  { DownloadSpec spec = 1; }
+message AddResponse { DownloadId   id   = 1; }
+
+message RemoveRequest  { DownloadId id = 1; }
+message RemoveResponse {}
+
+message IdRequest { DownloadId id = 1; }
+
+message StatusResponse {
+    bool   ok      = 1;
+    string message = 2;
+}
+
+message WatchRequest {}
