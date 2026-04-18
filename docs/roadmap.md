@@ -11,7 +11,7 @@
    - рендерит ratatui-UI, который является gRPC-клиентом к локальному серверу.
 
 ## После MVP
-См. [post-mvp.md](post-mvp.md). Приоритеты — [open-questions.md](open-questions.md).
+См. [post-mvp.md](post-mvp.md) — там зафиксирован порядок (brook-app → speed limit → brookd + auth + TLS).
 
 ## Почему такой порядок (зафиксировано)
 
