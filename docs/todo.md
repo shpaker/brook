@@ -43,6 +43,9 @@
 - [ ] Fallback: нет Range → один сегмент без чанков
 - [ ] `DownloadManager`: реестр engines, очередь, `max_concurrent`
 - [ ] `DownloadManager`: персистентность очереди в отдельной SQLite
+- [ ] Progress-троттлинг в engine: агрегация в окне 200 ms → эмит не чаще 5 Hz per download
+- [ ] State-changes / snapshot — мгновенный эмит, без троттлинга
+- [ ] Центральный `broadcast::Sender<Event>` в `DownloadManager` (ring 1024)
 
 ### Тесты
 - [ ] Без сети (`wiremock` / локальный HTTP)
@@ -52,7 +55,9 @@
 ## 2. `brook-proto` + `brook-api`
 - [ ] Proto: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `Watch`
 - [ ] `brook-api`: реализация сервиса поверх `DownloadManager` (proto ↔ core)
-- [ ] `Watch` — server-streaming из broadcast-канала DownloadManager
+- [ ] `Watch`: per-client fanout-задача (broadcast → tonic tx c `.await`)
+- [ ] Initial snapshots при коннекте Watch — по одному на каждую известную загрузку
+- [ ] Обработка `broadcast::RecvError::Lagged(n)` → синтетические snapshot'ы всех активных загрузок
 - [ ] Bind: `127.0.0.1:<port из конфига>` (дефолт 7090)
 - [ ] `session_id` / `download_id` / `request_id` в gRPC-метаданных
 - [ ] Интеграционные тесты: tonic client ↔ server в одном процессе

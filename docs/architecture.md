@@ -159,6 +159,18 @@ brook/                            # workspace root
 - Запускается как фоновая задача бинаря `brook`.
 - Контракт — [api.md](api.md).
 
+### Поток событий и Watch
+
+- `DownloadEngine` внутри себя агрегирует счётчики в таймере 200 ms — эмитит один `Progress` за окно. State-changes проходят мимо таймера и уходят мгновенно.
+- `DownloadManager` собирает события всех engines в центральный `broadcast::Sender<Event>` (ring 1024). Это единственная точка, откуда питаются Watch-клиенты.
+- На каждого Watch-клиента `brook-api` спавнит fanout-задачу:
+  1. При коннекте — эмитит `snapshot` по каждой известной загрузке (initial state).
+  2. Читает центральный `broadcast`, конвертирует в proto `Event`, пишет в tonic tx.
+  3. `tx.send().await` обеспечивает транспортный backpressure: при медленном клиенте fanout блокируется, broadcast-receiver отстаёт.
+  4. При `RecvError::Lagged(n)` — запрашивает у `DownloadManager` свежие snapshot'ы всех активных загрузок и шлёт их клиенту, затем продолжает нормальный цикл.
+- Гарантия для клиента: сколько бы `progress_tick`-ов он ни потерял, **state всегда догоняется** через `snapshot`.
+- Протокольные детали (какое событие когда, что перезаписывает) — [api.md#watch-события-и-реконсиляция](api.md#watch-события-и-реконсиляция).
+
 ## UI-слой (`brook`)
 - `ratatui` + `crossterm`.
 - gRPC-клиент (`tonic::Channel`) на локальный сервер.
