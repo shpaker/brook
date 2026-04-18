@@ -3,10 +3,12 @@
 Порядок фиксирован ([roadmap.md](roadmap.md)). Не идти дальше, пока текущий этап не закрыт.
 
 ## 0. Workspace
-- [ ] Cargo workspace + 4 крейта: `brook-proto`, `brook-core`, `brook-api`, `brook`
-- [ ] `proto/brook/v1/brook.proto` — скелет из [api.md](api.md)
-- [ ] `brook-proto/build.rs` → `tonic-build`
-- [ ] CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
+- [x] Cargo workspace + 4 крейта: `brook-proto`, `brook-core`, `brook-api`, `brook`
+- [ ] Editorsconfig для rust/markdown/toml
+- [ ] prec config
+- [x] `proto/brook/v1/brook.proto` — скелет из [api.md](api.md)
+- [x] `brook-proto/build.rs` → `tonic-build`
+- [x] CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
 
 ## 1. `brook-core`
 
