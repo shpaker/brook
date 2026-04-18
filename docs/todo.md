@@ -9,30 +9,50 @@
 - [ ] CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
 
 ## 1. `brook-core`
+
+### HTTP-контракт
+- [ ] `reqwest` + `rustls`
+- [ ] HEAD → `Content-Length`, `Accept-Ranges`, `ETag`/`Last-Modified`, `Content-Disposition`
+- [ ] HEAD fallback → `GET Range: bytes=0-0`
+- [ ] Валидация Range-ответа: `206` + корректный `Content-Range` (иначе fallback на один сегмент)
+- [ ] Guard мутации: `If-Match` / `If-Unmodified-Since` на каждый Range; `412` → `FAILED`
+- [ ] Имя файла: `Content-Disposition` → URL-сегмент → промпт
+- [ ] Таймауты: connect 10 s, read (idle) 30 s
+- [ ] Retry: экспо-бэкофф + jitter, max 10 попыток, max delay 60 s
+- [ ] Crash-loop guard: 5 одинаковых ошибок подряд → `FAILED`
+
+### Диск и индекс
 - [ ] Типы: `DownloadId`, `DownloadSpec`, `DownloadState`, `Progress`, `Download`
-- [ ] HTTP (`reqwest` + `rustls`): HEAD → `Content-Length` + `Accept-Ranges`
+- [ ] `statvfs`-проверка свободного места перед пре-аллокацией
 - [ ] Пре-аллокация `<filename>.data.brook` (`F_PREALLOCATE` + `ftruncate`)
 - [ ] Нарезка на чанки 1–4 MB + расчёт offset'ов
-- [ ] SQLite-индекс `<filename>.index.brook` (`rusqlite`, WAL, `synchronous=NORMAL`): схема `pending` / `done`
+- [ ] SQLite-индекс `<filename>.index.brook` (`rusqlite`, WAL, `synchronous=NORMAL`): `pending` / `done`
+- [ ] `pwrite` / `read` wrapper: loop до полного слива, `EINTR`-safe
+- [ ] Завершение: финальный `fsync` → `rename .data.brook` → `<filename>` → удалить индекс
+- [ ] Потеря/повреждение `.index` или `.data` → рестарт с нуля
+
+### Движок и очередь
 - [ ] Work-stealing: общий atomic-счётчик «следующий `pending`»
-- [ ] Сегмент: Range-запрос → потоковый `pwrite` в `.data.brook` буфером 64–256 KB
+- [ ] Сегмент: Range-запрос → потоковый `pwrite` буфером 64–256 KB
 - [ ] Проверка: принято ровно `chunk_size` байт (иначе вернуть в `pending`)
-- [ ] Батчевый commit: каждые 16 чанков → `fsync(.data)` + SQLite-транзакция `UPDATE status='done'`
-- [ ] Ретраи с экспоненциальным бэкофом
+- [ ] Батчевый commit: каждые 16 чанков → `fsync(.data)` + `UPDATE status='done'`
 - [ ] `DownloadEngine`: mpsc команд (`pause`/`resume`/`cancel`), broadcast событий
 - [ ] Ресюм: читаем индекс, докачиваем `pending`
-- [ ] Потеря/повреждение `.index` или `.data` → рестарт с нуля
-- [ ] Завершение: финальный `fsync` → `rename .data.brook` → `<filename>` → удалить индекс
-- [ ] `Orchestrator`: реестр engines, очередь, `max_concurrent`
-- [ ] Orchestrator: персистентность очереди в отдельной SQLite
-- [ ] Fallback: нет Range → один сегмент
-- [ ] Тесты без сети (`wiremock` / локальный HTTP)
-- [ ] Тест: пиковый RSS ≤ 150 MB при 10 параллельных
+- [ ] `Cancel`: статус `CANCELLED` + удалить `.data` и `.index`, запись остаётся в списке
+- [ ] `Remove`: то же, что `Cancel`, плюс удаление записи из глобальной очереди
+- [ ] Fallback: нет Range → один сегмент без чанков
+- [ ] `DownloadManager`: реестр engines, очередь, `max_concurrent`
+- [ ] `DownloadManager`: персистентность очереди в отдельной SQLite
+
+### Тесты
+- [ ] Без сети (`wiremock` / локальный HTTP)
+- [ ] Fault-injection: обрыв, `500` на ретраях, отсутствие `Content-Length`, смена `ETag`
+- [ ] Пиковый RSS ≤ 150 MB при 10 параллельных
 
 ## 2. `brook-proto` + `brook-api`
 - [ ] Proto: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `Watch`
-- [ ] `brook-api`: реализация сервиса поверх `Orchestrator` (proto ↔ core)
-- [ ] `Watch` — server-streaming из broadcast-канала Orchestrator
+- [ ] `brook-api`: реализация сервиса поверх `DownloadManager` (proto ↔ core)
+- [ ] `Watch` — server-streaming из broadcast-канала DownloadManager
 - [ ] Bind: `127.0.0.1:<port из конфига>` (дефолт 7090)
 - [ ] `session_id` / `download_id` / `request_id` в gRPC-метаданных
 - [ ] Интеграционные тесты: tonic client ↔ server в одном процессе
@@ -42,13 +62,16 @@
 - [ ] Чтение `./brook.toml` из CWD
 - [ ] Нет файла → создать с дефолтами + путь в stderr
 - [ ] Unknown key → warning в лог, invalid value → ошибка старта с сообщением
-- [ ] Применить в `Orchestrator` при старте
+- [ ] Применить в `DownloadManager` при старте
 
 ## 4. `brook` (ratatui)
-- [ ] `main`: config → `Orchestrator` → `brook-api` → UI (всё в одном процессе)
+- [ ] `main`: config → `DownloadManager` → `brook-api` → UI (всё в одном процессе)
+- [ ] Single-instance lock: `flock` на `.brook.lock` в CWD; вторая копия → exit с сообщением
+- [ ] Graceful shutdown: `SIGTERM` / `SIGINT` / `q` → пауза engines → batch-flush → exit
 - [ ] tonic-client на `127.0.0.1:<port>`
 - [ ] Фоновая задача: `Watch` → мутация view-model
 - [ ] Список: имя, прогресс-бар, скорость, ETA, иконки `▶` / `❚❚` / `✓` / `✕`
+- [ ] Сортировка: `RUNNING` → `RETRYING` → `QUEUED` → `PAUSED` → `DONE` → `FAILED` → `CANCELLED`, внутри — по `updated_at`
 - [ ] Статус-бар сверху (активные/очередь/скорость), хинт-бар снизу
 - [ ] Навигация: `↑↓` + `jk`, `gG`, `Enter` — разворот карточки
 - [ ] Multi-select: `Space`, `Shift+↑↓` / `Shift+JK`
@@ -56,6 +79,9 @@
 - [ ] Фильтр `/`, `Esc` закрывает модалки/фильтр, `q` — quit
 - [ ] Help overlay `?` — один экран
 - [ ] Модалки дубликатов: URL-in-queue, file-exists
+- [ ] Форматирование байт (humansize: `1.5 MB`, `532 KB`) и ETA (`2h 15m`, `15m 30s`, `<1s`)
+- [ ] Минимальный размер терминала 60×15 + заглушка ниже
+- [ ] `NO_COLOR` — рендер без ANSI-цветов
 - [ ] Мышь игнорируем
 
 ## 5. Наблюдаемость

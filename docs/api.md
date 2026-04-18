@@ -92,9 +92,17 @@ message Event {
 // ... AddRequest / AddResponse / ListResponse / IdRequest / StatusResponse / WatchRequest ...
 ```
 
+## Семантика команд
+
+- **`Pause`** — `RUNNING` → `PAUSED`. Inflight-чанки доводятся до batch-границы, дальше сегменты останавливаются. `.data.brook` и `.index.brook` сохраняются.
+- **`Resume`** — `PAUSED` / `FAILED` → `RUNNING`. Для `FAILED` сбрасывается счётчик попыток, читается `.index.brook`, докачиваются `pending`.
+- **`Cancel`** — из любого live-состояния (`QUEUED` / `RUNNING` / `PAUSED` / `RETRYING` / `FAILED`): статус → `CANCELLED`, `.data.brook` и `.index.brook` удаляются, **запись в списке остаётся**. Это нужно, чтобы пользователь видел, что именно он отменил, и не добавил URL повторно по ошибке. На `DONE` — no-op (финальный файл уже у пользователя).
+- **`Remove`** — сначала то же, что `Cancel` (если загрузка live), затем запись удаляется из глобальной очереди. На `DONE` — только удаление записи; финальный файл остаётся у пользователя.
+- **`PauseAll` / `ResumeAll`** — массовое применение к live-загрузкам (`RUNNING` / `QUEUED` / `RETRYING`).
+
 ## Решённое
 - Транспорт: gRPC (`tonic`), формат — protobuf (`prost`).
-- Локальный UI (`brook`) ходит в API, а не дёргает `Orchestrator` напрямую.
+- Локальный UI (`brook`) ходит в API, а не дёргает `DownloadManager` напрямую.
 - Server-streaming `Watch` — один стрим на клиента, сервер шлёт релевантные события.
 - CorrelationId (`session_id`, `download_id`) прокидывается в gRPC-метаданных.
 - Settings — не в API в MVP; правятся в TOML и подхватываются при следующем старте `brook`.
