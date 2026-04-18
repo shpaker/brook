@@ -5,7 +5,7 @@
 ## 0. Workspace
 - [x] Cargo workspace + 4 крейта: `brook-proto`, `brook-core`, `brook-api`, `brook`
 - [ ] Editorsconfig для rust/markdown/toml
-- [ ] prec config
+- [x] prek config
 - [x] `proto/brook/v1/brook.proto` — скелет из [api.md](api.md)
 - [x] `brook-proto/build.rs` → `tonic-build`
 - [x] CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
