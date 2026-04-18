@@ -11,19 +11,21 @@
 ## 1. `brook-core`
 - [ ] Типы: `DownloadId`, `DownloadSpec`, `DownloadState`, `Progress`, `Download`
 - [ ] HTTP (`reqwest` + `rustls`): HEAD → `Content-Length` + `Accept-Ranges`
-- [ ] Пре-аллокация `<filename>.data.brook` полного размера
-- [ ] Нарезка на чанки + ширина `N` по числу чанков ([architecture.md](architecture.md#именование-n))
-- [ ] SQLite-индекс `<filename>.index.brook` (`rusqlite`): схема + CRUD по чанкам
-- [ ] Сегмент: Range-запрос → `<filename>.chunk.<N>.brook`
-- [ ] Flush чанка: copy в `.data` → `fsync` → delete temp → mark `done`
+- [ ] Пре-аллокация `<filename>.data.brook` (`F_PREALLOCATE` + `ftruncate`)
+- [ ] Нарезка на чанки 1–4 MB + расчёт offset'ов
+- [ ] SQLite-индекс `<filename>.index.brook` (`rusqlite`, WAL, `synchronous=NORMAL`): схема `pending` / `done`
+- [ ] Work-stealing: общий atomic-счётчик «следующий `pending`»
+- [ ] Сегмент: Range-запрос → потоковый `pwrite` в `.data.brook` буфером 64–256 KB
+- [ ] Проверка: принято ровно `chunk_size` байт (иначе вернуть в `pending`)
+- [ ] Батчевый commit: каждые 16 чанков → `fsync(.data)` + SQLite-транзакция `UPDATE status='done'`
 - [ ] Ретраи с экспоненциальным бэкофом
 - [ ] `DownloadEngine`: mpsc команд (`pause`/`resume`/`cancel`), broadcast событий
-- [ ] Ресюм: читаем индекс, добиваем не-`done`
+- [ ] Ресюм: читаем индекс, докачиваем `pending`
 - [ ] Потеря/повреждение `.index` или `.data` → рестарт с нуля
-- [ ] Завершение: `rename .data.brook` → `<filename>`, удалить индекс
+- [ ] Завершение: финальный `fsync` → `rename .data.brook` → `<filename>` → удалить индекс
 - [ ] `Orchestrator`: реестр engines, очередь, `max_concurrent`
 - [ ] Orchestrator: персистентность очереди в отдельной SQLite
-- [ ] Fallback: нет Range → один сегмент, без чанков-переносов
+- [ ] Fallback: нет Range → один сегмент
 - [ ] Тесты без сети (`wiremock` / локальный HTTP)
 - [ ] Тест: пиковый RSS ≤ 150 MB при 10 параллельных
 
