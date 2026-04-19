@@ -9,13 +9,24 @@
 //! Соседи по слою:
 //! - `piece_storage` — запись и индексирование кусков одной загрузки.
 //! - `queue_store` — персистентность глобальной очереди.
+//! - `http` — осмотр URL и потоковое получение байт (в т.ч. Range).
 //!
 //! Всё, что здесь живёт, — это только `trait` и сопутствующие типы.
 //! Никаких `impl for ...` конкретных бэкендов в ядре нет и быть не должно.
 
+pub mod http;
 pub mod piece_storage;
 pub mod queue_store;
 
+pub use http::{
+    ByteStream,
+    InspectError,
+    InspectReport,
+    RangeError,
+    RangeGuard,
+    THttpInspect,
+    TRangeFetch,
+};
 pub use piece_storage::{
     TPieceStorage,
     TPieceStorageFactory,

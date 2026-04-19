@@ -37,7 +37,14 @@ pub use error::{
     Result,
 };
 pub use ports::{
+    ByteStream,
+    InspectError,
+    InspectReport,
+    RangeError,
+    RangeGuard,
+    THttpInspect,
     TPieceStorage,
     TPieceStorageFactory,
     TQueueStore,
+    TRangeFetch,
 };

@@ -38,37 +38,32 @@
 - [x] Юнит-тест: round-trip через `MemoryPieceStorage`
 - [x] Юнит-тест: round-trip через `MemoryTQueueStore`
 
-### 1.4 HTTP-клиенты (обёртки над `reqwest`)
-- [ ] Правило: любой HTTP-вызов идёт через структуру с суффиксом `Client` (`HttpProbeClient`, `RangeFetchClient` и т.п.); `reqwest::Client`/`Response`/`RequestBuilder` не протекают в публичные сигнатуры core
-- [ ] Единый билдер `HttpClientBuilder` (таймауты, rustls, пулы соединений) — общая точка создания `reqwest::Client` для всех `*Client`
-- [ ] Middleware-слой логирования запрос/ответ (`reqwest-middleware` + своя `RequestResponseLoggingMiddleware`): метод, URL, статус, размер, длительность; тело — только по фиче `http-trace-body`
-- [ ] Корреляция: пробрасывание `download_id` / `request_id` в span через middleware (из tracing-контекста)
-- [ ] Ошибки `*Client` — типизированные доменные enum'ы, без утечки `reqwest::Error` в вызывающий код
-- [ ] Юнит-тест (`wiremock`): middleware пишет ровно одну пару запрос/ответ на вызов, с корректным статусом и длительностью
+### 1.4 HTTP-слой (порт в `brook-core` + адаптер `brook-http`)
+- [ ] Новый крейт `brook-http`; `brook-core` содержит только порты и не тянет `reqwest`
+- [ ] Порты в `brook-core`: `THttpInspect::inspect`, `TRangeFetch::{fetch_range, fetch_full}`; domain-типы `InspectReport`, `RangeGuard`, `ByteStream`; enum'ы `InspectError`, `RangeError`
+- [ ] Метод `is_transient()` на `InspectError` и `RangeError` — для будущего `RetryPolicy` (HTTP-слой сам retry не делает)
+- [ ] Правило: реализации называются `*Client` (`HttpInspectClient`, `RangeFetchClient`); `reqwest::{Client,Response,RequestBuilder,Error}` и `reqwest_middleware::Error` не утекают за пределы `brook-http`
+- [ ] `HttpClientBuilder` — единая точка сборки `reqwest::Client`: rustls, connect timeout 10 s, read (idle) 30 s, pool idle 90 s, User-Agent `brook/<version>`
+- [ ] Автокомпрессия выключена (`no_gzip`, `no_brotli`, `no_deflate`) — байт-точность `Content-Length` и Range
+- [ ] Политика редиректов: `redirect::Policy::limited(10)`
+- [ ] Middleware `RequestResponseLoggingMiddleware` (`reqwest-middleware`): method/URL/статус/длительность/`Content-Length`; тело не логируется; корреляция `download_id`/`request_id` из `tracing::Span::current()`
+- [ ] Валидация URL на границе адаптера: только `http`/`https`, иначе `InvalidScheme` до сетевого вызова
+- [ ] `HttpInspectClient::inspect`: `HEAD` → на 4xx/5xx fallback `GET Range: bytes=0-0`; парсинг `Content-Length`, `Accept-Ranges`, `ETag`, `Last-Modified`, `Content-Disposition`
+- [ ] Имя файла: `Content-Disposition filename*=` (RFC 5987) → `filename=` → последний сегмент URL-пути
+- [ ] `RangeFetchClient::fetch_range`: `Range: bytes=OFFSET-END`, guard `If-Match`/`If-Unmodified-Since`; `206`+`Content-Range` валидация, `200`→`RangeNotSupported`, `412`→`SourceMutated`, усечённое тело → `TruncatedResponse`
+- [ ] `RangeFetchClient::fetch_full`: полный стрим до EOF — для no-Range fallback на уровне engine
+- [ ] Cancellation: дроп `ByteStream` отменяет in-flight запрос
+- [ ] Тесты `wiremock`: inspect (HEAD-ok, HEAD-fail+GET-range, no-Range, Content-Disposition: filename*/filename/URL-fallback), range (`206`-ok, `200`-на-Range, `412`, усечённое тело, невалидный Content-Range, cancellation), fetch_full до EOF, logging (ровно одна пара событий + корреляция), invalid scheme без сетевого вызова
+- [ ] Юнит-тесты на `is_transient()` для `InspectError` и `RangeError`
+- [ ] Гарантия hex-arch: `cargo tree -p brook-core | grep reqwest` — пусто
 
-### 1.5 HTTP-контракт (`HttpProbeClient`)
-- [ ] `HttpProbeClient::head`: парсинг `Content-Length`, `Accept-Ranges`, `ETag`, `Last-Modified`, `Content-Disposition`
-- [ ] Fallback: `HEAD` → 4xx/5xx → `GET Range: bytes=0-0`, размер из `Content-Range`
-- [ ] Имя файла: `Content-Disposition filename*=` → `filename=` → последний сегмент URL
-- [ ] Connect timeout 10 s
-- [ ] Read (idle) timeout 30 s без новых байт в теле
-- [ ] Тесты (`wiremock`): HEAD-ok, HEAD-fail+GET-range-ok, no-Range, Content-Disposition
-
-### 1.6 Range-запрос через `RangeFetchClient`
-- [ ] `RangeFetchClient::fetch_range(url, offset, len, guard) -> stream`
-- [ ] Валидация: код `206` + `Content-Range: bytes X-Y/TOTAL` совпадает с запрошенным
-- [ ] `200 OK` на Range-запрос → сигнал «Range-неспособен» для fallback
-- [ ] Guard мутации: `If-Match: <etag>` (или `If-Unmodified-Since`) в каждом Range-запросе
-- [ ] `412 Precondition Failed` → типизированная ошибка `SourceMutated`
-- [ ] Проверка: принято ровно `piece_size` байт, иначе `TruncatedResponse`
-- [ ] Тесты: `206`-ok, `200`-на-Range, `412`, усечённое тело
-
-### 1.7 Retry-политика
+### 1.5 Retry-политика
 - [ ] `RetryPolicy`: экспо-бэкофф `1s × 2^attempt` + jitter ±20 %, max delay 60 s, max 10 попыток
+- [ ] Классификация через `is_transient()` из 1.4 (транзиентные → ретрай, остальные → fail fast)
 - [ ] Crash-loop guard: 5 одинаковых ошибок подряд → `FAILED`
 - [ ] Юнит-тесты на расчёт задержек и trigger crash-loop
 
-### 1.8 Пре-аллокация и нарезка (`LocalPieceStorage`)
+### 1.6 Пре-аллокация и нарезка (`LocalPieceStorage`)
 - [ ] Крейт-локация: `LocalPieceStorage` в `brookd` (реализация `TPieceStorage`)
 - [ ] `statvfs`-проверка свободного места на целевой ФС
 - [ ] `F_PREALLOCATE` + `ftruncate` для `<filename>.data.brook`
@@ -77,13 +72,13 @@
 - [ ] Расчёт offset'ов и числа кусков
 - [ ] Тест: пре-аллокация 100 MB файла, проверка размера
 
-### 1.9 `pwrite`/`read` обёртки
+### 1.7 `pwrite`/`read` обёртки
 - [ ] `pwrite_full`: loop до полного слива, `EINTR`-safe
 - [ ] `read_full`: аналогично
 - [ ] Прокидывает только реальные ошибки (`ENOSPC`, `EIO`)
 - [ ] Юнит-тест на частичную запись (мок)
 
-### 1.10 Piece index — `PieceIndexRepository`
+### 1.8 Piece index — `PieceIndexRepository`
 - [ ] Миграция: `pieces(idx INTEGER PK, offset, size, status TEXT CHECK)` + `meta(key, value)`
 - [ ] SQLite WAL + `synchronous=NORMAL` при открытии `.index.brook`
 - [ ] `PieceIndexRepository::open(path) -> Self` (создаёт/открывает)
@@ -95,7 +90,7 @@
 - [ ] SQL-строки и `rusqlite::Connection` живут только внутри этого модуля
 - [ ] Юнит-тесты на каждый метод
 
-### 1.11 `LocalPieceStorage` поверх репозитория
+### 1.9 `LocalPieceStorage` поверх репозитория
 - [ ] `LocalPieceStorage::new(spec)` открывает `.data.brook` (`pwrite`-handle) + `PieceIndexRepository`
 - [ ] `write_piece_bytes`: `pwrite_full` по offset'у куска
 - [ ] `commit_batch`: `fsync(.data)` → `PieceIndexRepository::commit_done_batch`
@@ -105,30 +100,30 @@
 - [ ] Сбои: `.index` или `.data` отсутствует/битый → стартовать с нуля
 - [ ] Интеграционный тест на полный цикл init → write → commit → finalize
 
-### 1.12 `DownloadEngine` — скелет
+### 1.10 `DownloadEngine` — скелет
 - [ ] Структура `DownloadEngine<S: TPieceStorage>` с mpsc команд и broadcast событий
 - [ ] `spawn(spec, storage) -> (handle, events_rx)`
 - [ ] Обработка `Pause` / `Resume` / `Cancel`
 - [ ] Юнит-тест: команды меняют state, эмитят `StateChanged`
 
-### 1.13 `DownloadEngine` — воркеры
+### 1.11 `DownloadEngine` — воркеры
 - [ ] Общий atomic-счётчик «следующий `pending` piece» (work-stealing)
 - [ ] Спаун N воркеров по `spec.workers`
-- [ ] Воркер: берёт piece → Range-запрос → потоковый `write_piece_bytes` буфером 64–256 KB
+- [ ] Воркер: берёт piece → `TRangeFetch::fetch_range` → потоковый `write_piece_bytes` буфером 64–256 KB
 - [ ] Проверка полноты куска → либо `done`, либо обратно в `pending`
 - [ ] Батч-коммит каждые 16 кусков → `commit_batch`
 - [ ] Коммит на `pause` / `shutdown` / перед `finalize`
-- [ ] Fallback: сервер без Range → один воркер без кусков, до EOF
+- [ ] No-Range режим (`InspectReport.accepts_ranges=false` или `RangeError::RangeNotSupported`) → один воркер, `TRangeFetch::fetch_full`, до EOF
 - [ ] Тесты с `wiremock`: нормальная загрузка, обрыв посреди куска, 500+retry
 
-### 1.14 `DownloadEngine` — события
+### 1.12 `DownloadEngine` — события
 - [ ] Агрегация счётчиков в таймере 200 ms → один `Progress` за окно
 - [ ] State-changes — мгновенный эмит, без таймера
 - [ ] `Completed` после успешного `finalize`
 - [ ] `Failed(reason)` на терминальной ошибке
 - [ ] Юнит-тест: частота `Progress` ≤ 5 Hz
 
-### 1.15 `DownloadManager`
+### 1.13 `DownloadManager`
 - [ ] Структура `DownloadManager` с реестром engines по `DownloadId`
 - [ ] Принимает `TPieceStorageFactory` + `TQueueStore` в конструкторе
 - [ ] `add(spec)` — insert в queue-store, спаун engine при наличии слота
@@ -140,8 +135,8 @@
 - [ ] Snapshot по запросу (для Watch-реконсиляции)
 - [ ] Интеграционный тест: 3 engines, `max_concurrent=2`, очередь соблюдается
 
-### 1.16 Тесты `brook-core`
-- [ ] Fault-injection: обрыв на полуслове, `500` с ретраем, смена `ETag` → `FAILED`
+### 1.14 Тесты `brook-core`
+- [ ] Fault-injection (через `brook-http` + `wiremock`): обрыв на полуслове, `500` с ретраем, смена `ETag` → `FAILED`
 - [ ] Отсутствие `Content-Length` → fallback-режим
 - [ ] Пиковый RSS ≤ 150 MB при 10 параллельных engines (отдельный perf-тест, `ignored`)
 
