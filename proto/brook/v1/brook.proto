@@ -39,9 +39,6 @@ message DownloadSpec {
   string url = 1;
   // Абсолютный путь или префикс из конфига + имя файла.
   string target_path = 2;
-  // 0 = взять из конфига.
-  uint32 workers = 3;
-  map<string, string> headers = 4;
 }
 
 // Состояние загрузки.
@@ -65,6 +62,31 @@ message Progress {
   uint64 eta_seconds = 4;
 }
 
+// Состояние отдельного куска.
+enum PieceState {
+  PIECE_STATE_UNSPECIFIED = 0;
+  PIECE_STATE_PENDING = 1;
+  PIECE_STATE_DOWNLOADING = 2;
+  PIECE_STATE_DONE = 3;
+  PIECE_STATE_FAILED = 4;
+}
+
+// Обновление по одному куску — для чанкового прогрессбара на клиенте.
+// Размер куска известен из Download.piece_size, здесь передаём только долю.
+message PieceUpdate {
+  // Порядковый номер куска (0..piece_count).
+  uint32 index = 1;
+  PieceState state = 2;
+  // Доля загруженного в этом куске, 0.0..1.0.
+  float progress = 3;
+}
+
+// Кусок, который сейчас качается: индекс + доля загруженного 0.0..1.0.
+message PieceInProgress {
+  uint32 index = 1;
+  float progress = 2;
+}
+
 // Полное состояние загрузки.
 message Download {
   DownloadId id = 1;
@@ -77,6 +99,14 @@ message Download {
   string error_message = 6;
   google.protobuf.Timestamp created_at = 7;
   google.protobuf.Timestamp updated_at = 8;
+  // Общее число кусков (0, если размер ещё не известен).
+  uint32 piece_count = 9;
+  // Размер куска в байтах (последний кусок может быть меньше).
+  uint64 piece_size = 10;
+  // Индексы полностью загруженных кусков.
+  repeated uint32 completed_pieces = 11;
+  // Куски, которые качаются прямо сейчас.
+  repeated PieceInProgress in_progress_pieces = 12;
 }
 
 // Событие, отправляемое клиенту в Watch-стриме.
@@ -85,10 +115,8 @@ message Event {
   oneof kind {
     // Полный снимок — перезаписать запись на клиенте.
     Download snapshot = 2;
-    // Дельта во время RUNNING (не чаще 5 Гц).
-    Progress progress_tick = 3;
-    // Строка лога для раскрытой карточки загрузки.
-    string log_line = 4;
+    // Изменение состояния одного куска.
+    PieceUpdate piece_update = 3;
   }
 }
 
