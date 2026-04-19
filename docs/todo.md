@@ -17,20 +17,20 @@
 ## 1. `brook-core`
 
 ### 1.1 Доменные типы (без I/O)
-- [ ] Тип `DownloadId` (xid, newtype)
-- [ ] Enum `DownloadState` (`QUEUED`, `RUNNING`, `PAUSED`, `RETRYING`, `DONE`, `FAILED`, `CANCELLED`)
-- [ ] Структура `DownloadSpec` (url, target_dir, filename, headers, workers)
-- [ ] Структура `Progress` (bytes_done, bytes_total, pieces_done, pieces_total, speed_bps, eta_secs)
-- [ ] Структура `Download` (id, spec, state, progress, timestamps)
-- [ ] Enum `DownloadCommand` (`Pause`, `Resume`, `Cancel`)
-- [ ] Enum `DownloadEvent` (`Progress`, `StateChanged`, `WorkerUpdate`, `Completed`, `Failed`, `Snapshot`)
-- [ ] Юнит-тесты: сериализация/дефолты/конверсии
+- [x] Тип `DownloadId` (newtype над `uuid::Uuid`; миграция на `xid` тривиальна внутри newtype)
+- [x] Enum `DownloadState` (`Queued`, `Running`, `Paused`, `Retrying`, `Done`, `Failed`, `Cancelled`)
+- [x] Структура `DownloadSpec` (url, target_dir, filename, headers, workers)
+- [x] Структура `Progress` (bytes_done, bytes_total, pieces_done, pieces_total, speed_bps, eta_secs)
+- [x] Структура `Download` (id, spec, state, progress, attempt, error, timestamps)
+- [x] Enum `DownloadCommand` (`Pause`, `Resume`, `Cancel`)
+- [x] Enum `DownloadEvent` (`Progress`, `StateChanged`, `WorkerUpdate`, `Completed`, `Failed`, `Snapshot`)
+- [x] Юнит-тесты: сериализация/дефолты/конверсии
 
 ### 1.2 Трейты абстракций (без реализаций)
-- [ ] `TPieceStorage`: `write_piece_bytes`, `commit_batch`, `pending_pieces`, `finalize`, `abort`
-- [ ] `TPieceStorageFactory`: `create(spec) -> impl TPieceStorage`
-- [ ] `TQueueStore`: `load_all`, `insert`, `update_state`, `remove`
-- [ ] Документирующие doc-комментарии инвариантов (commit ⇒ persisted)
+- [x] `TPieceStorage`: `write_piece_bytes`, `commit_batch`, `pending_pieces`, `finalize`, `abort`
+- [x] `TPieceStorageFactory`: `create(spec) -> impl TPieceStorage`
+- [x] `TQueueStore`: `load_all`, `insert`, `update_state`, `remove`
+- [x] Документирующие doc-комментарии инвариантов (commit ⇒ persisted)
 
 ### 1.3 In-memory реализации для тестов
 - [ ] `MemoryPieceStorage` (test-utils, feature `test-utils`)
