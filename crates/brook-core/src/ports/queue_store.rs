@@ -11,7 +11,11 @@
 
 use std::future::Future;
 
-use crate::domain::{Download, DownloadId, DownloadState};
+use crate::domain::{
+    Download,
+    DownloadId,
+    DownloadState,
+};
 use crate::error::Result;
 
 pub trait TQueueStore: Send + Sync {

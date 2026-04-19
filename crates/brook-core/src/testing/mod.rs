@@ -9,5 +9,8 @@
 pub mod memory_piece_storage;
 pub mod memory_queue_store;
 
-pub use memory_piece_storage::{MemoryPieceStorage, MemoryPieceStorageFactory};
+pub use memory_piece_storage::{
+    MemoryPieceStorage,
+    MemoryPieceStorageFactory,
+};
 pub use memory_queue_store::MemoryTQueueStore;

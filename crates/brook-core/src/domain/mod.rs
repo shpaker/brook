@@ -30,5 +30,8 @@ pub use download::Download;
 pub use event::DownloadEvent;
 pub use id::DownloadId;
 pub use progress::Progress;
-pub use spec::{DownloadSpec, default_workers};
+pub use spec::{
+    DownloadSpec,
+    default_workers,
+};
 pub use state::DownloadState;

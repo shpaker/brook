@@ -7,7 +7,10 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::error::{Error, Result};
+use crate::error::{
+    Error,
+    Result,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DownloadState {

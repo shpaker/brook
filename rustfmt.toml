@@ -1,0 +1,21 @@
+# Stable options
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# Nightly-only options (требуют `cargo +nightly fmt`).
+# Держим здесь, чтобы правила форматирования были единым источником истины;
+# CI-форматтер можно запускать на nightly отдельной командой.
+unstable_features = true
+
+# Импорты из одного модуля — склеиваем в один `use foo::{ ... }`.
+# `pub use foo::A; pub use foo::B;` → `pub use foo::{A, B};`.
+imports_granularity = "Module"
+
+# Группы импортов: std → внешние крейты → crate/super/self, разделены пустой строкой.
+group_imports = "StdExternalCrate"
+
+# Элементы внутри `{ ... }` — каждый на своей строке (вертикальная раскладка).
+imports_layout = "Vertical"

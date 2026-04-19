@@ -10,8 +10,15 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use crate::domain::{Download, DownloadId, DownloadState};
-use crate::error::{Error, Result};
+use crate::domain::{
+    Download,
+    DownloadId,
+    DownloadState,
+};
+use crate::error::{
+    Error,
+    Result,
+};
 use crate::ports::TQueueStore;
 
 /// In-memory очередь. Клонирует `Download` при каждой операции, чтобы

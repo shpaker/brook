@@ -11,12 +11,21 @@
 //! и проще: он не требует `await`. `tokio::sync::Mutex` нужен, когда под
 //! замком есть `.await` — здесь такого нет.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 use std::sync::Mutex;
 
 use crate::domain::DownloadSpec;
-use crate::error::{Error, Result};
-use crate::ports::{TPieceStorage, TPieceStorageFactory};
+use crate::error::{
+    Error,
+    Result,
+};
+use crate::ports::{
+    TPieceStorage,
+    TPieceStorageFactory,
+};
 
 /// In-memory хранилище piece'ов одной загрузки.
 ///

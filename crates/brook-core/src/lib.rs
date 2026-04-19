@@ -23,8 +23,21 @@ mod ports;
 pub mod testing;
 
 pub use domain::{
-    Download, DownloadCommand, DownloadEvent, DownloadId, DownloadSpec, DownloadState, Progress,
+    Download,
+    DownloadCommand,
+    DownloadEvent,
+    DownloadId,
+    DownloadSpec,
+    DownloadState,
+    Progress,
     default_workers,
 };
-pub use error::{Error, Result};
-pub use ports::{TPieceStorage, TPieceStorageFactory, TQueueStore};
+pub use error::{
+    Error,
+    Result,
+};
+pub use ports::{
+    TPieceStorage,
+    TPieceStorageFactory,
+    TQueueStore,
+};

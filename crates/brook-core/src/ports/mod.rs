@@ -16,5 +16,8 @@
 pub mod piece_storage;
 pub mod queue_store;
 
-pub use piece_storage::{TPieceStorage, TPieceStorageFactory};
+pub use piece_storage::{
+    TPieceStorage,
+    TPieceStorageFactory,
+};
 pub use queue_store::TQueueStore;
