@@ -1,32 +1,30 @@
 //! `brook-core` — ядро менеджера загрузок.
 //!
-//! Слой без сетевого и дискового I/O по умолчанию: здесь живут
-//! **доменные типы** (этап 1.1) и **трейты абстракций** (этап 1.2).
-//! Конкретные реализации (HTTP-probe, engine, SQLite-хранилища)
-//! приходят в следующих этапах roadmap'а.
+//! Ядро следует паттерну **Hexagonal Architecture** (Ports & Adapters):
+//! - [`domain`] — сущности и value-объекты (чистые типы, без I/O).
+//! - [`ports`] — outbound-трейты, через которые ядро обращается наружу
+//!   (хранилище piece'ов, персистентность очереди, позднее — HTTP-клиент).
+//! - *Services* (этап 1.3+) — application-координаторы `DownloadManager`
+//!   и `DownloadEngine`. Появятся в `src/service/`.
+//! - *Adapters* — реализации `ports` — живут **вне** `brook-core`:
+//!   SQLite/HTTP — в `brookd`, gRPC — в `brook-api`.
 //!
 //! Публичный API намеренно плоский: `brook_core::DownloadId`,
-//! `brook_core::TPieceStorage` и т.п. Внутренняя раскладка по файлам —
-//! просто для читабельности; перекроить модули без breaking change легко.
+//! `brook_core::TPieceStorage` и т.п. Внутренняя раскладка по папкам —
+//! чтобы слои не смешивались; перекроить модули без breaking change легко.
 
-mod command;
-mod download;
+mod domain;
 mod error;
-mod event;
-mod id;
-mod piece_storage;
-mod progress;
-mod queue_store;
-mod spec;
-mod state;
+mod ports;
 
-pub use command::DownloadCommand;
-pub use download::Download;
+/// In-memory реализации портов для юнит-тестов. Видны только под feature
+/// `test-utils`, чтобы боевые бинари не тянули тестовый код.
+#[cfg(feature = "test-utils")]
+pub mod testing;
+
+pub use domain::{
+    Download, DownloadCommand, DownloadEvent, DownloadId, DownloadSpec, DownloadState, Progress,
+    default_workers,
+};
 pub use error::{Error, Result};
-pub use event::DownloadEvent;
-pub use id::DownloadId;
-pub use piece_storage::{TPieceStorage, TPieceStorageFactory};
-pub use progress::Progress;
-pub use queue_store::TQueueStore;
-pub use spec::{DownloadSpec, HeaderPair, default_workers};
-pub use state::DownloadState;
+pub use ports::{TPieceStorage, TPieceStorageFactory, TQueueStore};

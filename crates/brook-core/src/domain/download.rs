@@ -5,10 +5,10 @@
 
 use std::time::SystemTime;
 
-use crate::id::DownloadId;
-use crate::progress::Progress;
-use crate::spec::DownloadSpec;
-use crate::state::DownloadState;
+use super::id::DownloadId;
+use super::progress::Progress;
+use super::spec::DownloadSpec;
+use super::state::DownloadState;
 
 #[derive(Debug, Clone)]
 pub struct Download {

@@ -6,13 +6,6 @@
 
 use std::path::PathBuf;
 
-/// Пара «имя заголовка — значение».
-///
-/// Почему `(String, String)`, а не `HashMap`: порядок заголовков важен
-/// (некоторые серверы чувствительны), и дубликаты с одним именем допустимы
-/// (например, `Cookie`).
-pub type HeaderPair = (String, String);
-
 /// Спецификация одной загрузки.
 ///
 /// `PathBuf` (а не `String`) для путей — чтобы работало с платформенными
@@ -26,8 +19,6 @@ pub struct DownloadSpec {
     pub target_dir: PathBuf,
     /// Явно заданное имя файла (None → определить на этапе probe).
     pub filename: Option<String>,
-    /// Дополнительные HTTP-заголовки (Authorization, Cookie и т.п.).
-    pub headers: Vec<HeaderPair>,
     /// Сколько параллельных воркеров качают piece'ы этой загрузки.
     pub workers: u32,
 }
@@ -44,7 +35,6 @@ impl DownloadSpec {
             url: url.into(),
             target_dir: target_dir.into(),
             filename: None,
-            headers: Vec::new(),
             workers: default_workers(),
         }
     }
@@ -66,7 +56,6 @@ mod tests {
         assert_eq!(spec.url, "https://example.com/f");
         assert_eq!(spec.target_dir, PathBuf::from("/tmp"));
         assert_eq!(spec.filename, None);
-        assert!(spec.headers.is_empty());
         assert_eq!(spec.workers, default_workers());
     }
 

@@ -19,8 +19,8 @@
 
 use std::future::Future;
 
+use crate::domain::DownloadSpec;
 use crate::error::Result;
-use crate::spec::DownloadSpec;
 
 /// Хранилище piece'ов **одной конкретной** загрузки.
 ///

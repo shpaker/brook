@@ -7,14 +7,12 @@
 //! repository-границы».
 //!
 //! Про форму сигнатур (`-> impl Future + Send`) — см. пояснение в
-//! [`crate::piece_storage`].
+//! [`super::piece_storage`].
 
 use std::future::Future;
 
-use crate::download::Download;
+use crate::domain::{Download, DownloadId, DownloadState};
 use crate::error::Result;
-use crate::id::DownloadId;
-use crate::state::DownloadState;
 
 pub trait TQueueStore: Send + Sync {
     /// Все загрузки из хранилища (при старте демона).

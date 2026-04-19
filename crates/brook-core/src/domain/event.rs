@@ -4,10 +4,10 @@
 //! Вызывающий делает `match` и компилятор гарантирует, что ни один
 //! вариант не забыт.
 
-use crate::download::Download;
-use crate::id::DownloadId;
-use crate::progress::Progress;
-use crate::state::DownloadState;
+use super::download::Download;
+use super::id::DownloadId;
+use super::progress::Progress;
+use super::state::DownloadState;
 
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
@@ -45,8 +45,8 @@ pub enum DownloadEvent {
 
 #[cfg(test)]
 mod tests {
+    use super::super::spec::DownloadSpec;
     use super::*;
-    use crate::spec::DownloadSpec;
 
     #[test]
     fn match_exhaustive_compiles() {

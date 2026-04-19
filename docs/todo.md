@@ -19,7 +19,7 @@
 ### 1.1 Доменные типы (без I/O)
 - [x] Тип `DownloadId` (newtype над `uuid::Uuid`; миграция на `xid` тривиальна внутри newtype)
 - [x] Enum `DownloadState` (`Queued`, `Running`, `Paused`, `Retrying`, `Done`, `Failed`, `Cancelled`)
-- [x] Структура `DownloadSpec` (url, target_dir, filename, headers, workers)
+- [x] Структура `DownloadSpec` (url, target_dir, filename, workers)
 - [x] Структура `Progress` (bytes_done, bytes_total, pieces_done, pieces_total, speed_bps, eta_secs)
 - [x] Структура `Download` (id, spec, state, progress, attempt, error, timestamps)
 - [x] Enum `DownloadCommand` (`Pause`, `Resume`, `Cancel`)
@@ -33,22 +33,29 @@
 - [x] Документирующие doc-комментарии инвариантов (commit ⇒ persisted)
 
 ### 1.3 In-memory реализации для тестов
-- [ ] `MemoryPieceStorage` (test-utils, feature `test-utils`)
-- [ ] `MemoryTQueueStore` (test-utils)
-- [ ] Юнит-тест: round-trip через `MemoryPieceStorage`
-- [ ] Юнит-тест: round-trip через `MemoryTQueueStore`
+- [x] `MemoryPieceStorage` (test-utils, feature `test-utils`)
+- [x] `MemoryTQueueStore` (test-utils)
+- [x] Юнит-тест: round-trip через `MemoryPieceStorage`
+- [x] Юнит-тест: round-trip через `MemoryTQueueStore`
 
-### 1.4 HTTP-контракт (`HttpProbe`)
-- [ ] Подключить `reqwest` + `rustls` в `brook-core`
-- [ ] `HttpProbe::head`: парсинг `Content-Length`, `Accept-Ranges`, `ETag`, `Last-Modified`, `Content-Disposition`
+### 1.4 HTTP-клиенты (обёртки над `reqwest`)
+- [ ] Правило: любой HTTP-вызов идёт через структуру с суффиксом `Client` (`HttpProbeClient`, `RangeFetchClient` и т.п.); `reqwest::Client`/`Response`/`RequestBuilder` не протекают в публичные сигнатуры core
+- [ ] Единый билдер `HttpClientBuilder` (таймауты, rustls, пулы соединений) — общая точка создания `reqwest::Client` для всех `*Client`
+- [ ] Middleware-слой логирования запрос/ответ (`reqwest-middleware` + своя `RequestResponseLoggingMiddleware`): метод, URL, статус, размер, длительность; тело — только по фиче `http-trace-body`
+- [ ] Корреляция: пробрасывание `download_id` / `request_id` в span через middleware (из tracing-контекста)
+- [ ] Ошибки `*Client` — типизированные доменные enum'ы, без утечки `reqwest::Error` в вызывающий код
+- [ ] Юнит-тест (`wiremock`): middleware пишет ровно одну пару запрос/ответ на вызов, с корректным статусом и длительностью
+
+### 1.5 HTTP-контракт (`HttpProbeClient`)
+- [ ] `HttpProbeClient::head`: парсинг `Content-Length`, `Accept-Ranges`, `ETag`, `Last-Modified`, `Content-Disposition`
 - [ ] Fallback: `HEAD` → 4xx/5xx → `GET Range: bytes=0-0`, размер из `Content-Range`
 - [ ] Имя файла: `Content-Disposition filename*=` → `filename=` → последний сегмент URL
 - [ ] Connect timeout 10 s
 - [ ] Read (idle) timeout 30 s без новых байт в теле
 - [ ] Тесты (`wiremock`): HEAD-ok, HEAD-fail+GET-range-ok, no-Range, Content-Disposition
 
-### 1.5 Range-запрос и валидация
-- [ ] `HttpFetcher::fetch_range(url, offset, len, guard) -> stream`
+### 1.6 Range-запрос через `RangeFetchClient`
+- [ ] `RangeFetchClient::fetch_range(url, offset, len, guard) -> stream`
 - [ ] Валидация: код `206` + `Content-Range: bytes X-Y/TOTAL` совпадает с запрошенным
 - [ ] `200 OK` на Range-запрос → сигнал «Range-неспособен» для fallback
 - [ ] Guard мутации: `If-Match: <etag>` (или `If-Unmodified-Since`) в каждом Range-запросе
@@ -56,12 +63,12 @@
 - [ ] Проверка: принято ровно `piece_size` байт, иначе `TruncatedResponse`
 - [ ] Тесты: `206`-ok, `200`-на-Range, `412`, усечённое тело
 
-### 1.6 Retry-политика
+### 1.7 Retry-политика
 - [ ] `RetryPolicy`: экспо-бэкофф `1s × 2^attempt` + jitter ±20 %, max delay 60 s, max 10 попыток
 - [ ] Crash-loop guard: 5 одинаковых ошибок подряд → `FAILED`
 - [ ] Юнит-тесты на расчёт задержек и trigger crash-loop
 
-### 1.7 Пре-аллокация и нарезка (`LocalPieceStorage`)
+### 1.8 Пре-аллокация и нарезка (`LocalPieceStorage`)
 - [ ] Крейт-локация: `LocalPieceStorage` в `brookd` (реализация `TPieceStorage`)
 - [ ] `statvfs`-проверка свободного места на целевой ФС
 - [ ] `F_PREALLOCATE` + `ftruncate` для `<filename>.data.brook`
@@ -70,13 +77,13 @@
 - [ ] Расчёт offset'ов и числа кусков
 - [ ] Тест: пре-аллокация 100 MB файла, проверка размера
 
-### 1.8 `pwrite`/`read` обёртки
+### 1.9 `pwrite`/`read` обёртки
 - [ ] `pwrite_full`: loop до полного слива, `EINTR`-safe
 - [ ] `read_full`: аналогично
 - [ ] Прокидывает только реальные ошибки (`ENOSPC`, `EIO`)
 - [ ] Юнит-тест на частичную запись (мок)
 
-### 1.9 Piece index — `PieceIndexRepository`
+### 1.10 Piece index — `PieceIndexRepository`
 - [ ] Миграция: `pieces(idx INTEGER PK, offset, size, status TEXT CHECK)` + `meta(key, value)`
 - [ ] SQLite WAL + `synchronous=NORMAL` при открытии `.index.brook`
 - [ ] `PieceIndexRepository::open(path) -> Self` (создаёт/открывает)
@@ -88,7 +95,7 @@
 - [ ] SQL-строки и `rusqlite::Connection` живут только внутри этого модуля
 - [ ] Юнит-тесты на каждый метод
 
-### 1.10 `LocalPieceStorage` поверх репозитория
+### 1.11 `LocalPieceStorage` поверх репозитория
 - [ ] `LocalPieceStorage::new(spec)` открывает `.data.brook` (`pwrite`-handle) + `PieceIndexRepository`
 - [ ] `write_piece_bytes`: `pwrite_full` по offset'у куска
 - [ ] `commit_batch`: `fsync(.data)` → `PieceIndexRepository::commit_done_batch`
@@ -98,13 +105,13 @@
 - [ ] Сбои: `.index` или `.data` отсутствует/битый → стартовать с нуля
 - [ ] Интеграционный тест на полный цикл init → write → commit → finalize
 
-### 1.11 `DownloadEngine` — скелет
+### 1.12 `DownloadEngine` — скелет
 - [ ] Структура `DownloadEngine<S: TPieceStorage>` с mpsc команд и broadcast событий
 - [ ] `spawn(spec, storage) -> (handle, events_rx)`
 - [ ] Обработка `Pause` / `Resume` / `Cancel`
 - [ ] Юнит-тест: команды меняют state, эмитят `StateChanged`
 
-### 1.12 `DownloadEngine` — воркеры
+### 1.13 `DownloadEngine` — воркеры
 - [ ] Общий atomic-счётчик «следующий `pending` piece» (work-stealing)
 - [ ] Спаун N воркеров по `spec.workers`
 - [ ] Воркер: берёт piece → Range-запрос → потоковый `write_piece_bytes` буфером 64–256 KB
@@ -114,14 +121,14 @@
 - [ ] Fallback: сервер без Range → один воркер без кусков, до EOF
 - [ ] Тесты с `wiremock`: нормальная загрузка, обрыв посреди куска, 500+retry
 
-### 1.13 `DownloadEngine` — события
+### 1.14 `DownloadEngine` — события
 - [ ] Агрегация счётчиков в таймере 200 ms → один `Progress` за окно
 - [ ] State-changes — мгновенный эмит, без таймера
 - [ ] `Completed` после успешного `finalize`
 - [ ] `Failed(reason)` на терминальной ошибке
 - [ ] Юнит-тест: частота `Progress` ≤ 5 Hz
 
-### 1.14 `DownloadManager`
+### 1.15 `DownloadManager`
 - [ ] Структура `DownloadManager` с реестром engines по `DownloadId`
 - [ ] Принимает `TPieceStorageFactory` + `TQueueStore` в конструкторе
 - [ ] `add(spec)` — insert в queue-store, спаун engine при наличии слота
@@ -133,7 +140,7 @@
 - [ ] Snapshot по запросу (для Watch-реконсиляции)
 - [ ] Интеграционный тест: 3 engines, `max_concurrent=2`, очередь соблюдается
 
-### 1.15 Тесты `brook-core`
+### 1.16 Тесты `brook-core`
 - [ ] Fault-injection: обрыв на полуслове, `500` с ретраем, смена `ETag` → `FAILED`
 - [ ] Отсутствие `Content-Length` → fallback-режим
 - [ ] Пиковый RSS ≤ 150 MB при 10 параллельных engines (отдельный perf-тест, `ignored`)
