@@ -19,12 +19,17 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
       - name: fmt
-        run: cargo fmt --check
+        run: cargo +nightly fmt --check
 
       - name: clippy
         run: cargo clippy -- -D warnings
