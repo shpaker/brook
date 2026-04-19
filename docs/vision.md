@@ -20,5 +20,5 @@
 - В MVP не делаем кросс-платформенность — только macOS. Но архитектурно не закрываемся.
 
 ## Ключевые решения (зафиксировано)
-- Порядок реализации: `brook-core` → `brook-proto` + `brook-api` → TOML-конфиг → `brook` (ratatui). См. [roadmap.md](roadmap.md).
+- Порядок реализации: `brook-core` → `brook-proto` + `brook-api` → settings в БД → `brookd` (демон) → `brook-tui` (ratatui-клиент, бинарь `brook`). См. [roadmap.md](roadmap.md).
 - Всё, что после MVP, — в [post-mvp.md](post-mvp.md).

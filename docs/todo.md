@@ -4,6 +4,8 @@
 
 ## 0. Workspace
 - [x] Cargo workspace + 4 крейта: `brook-proto`, `brook-core`, `brook-api`, `brook`
+- [ ] Переименовать крейт `brook` → `brook-tui`; бинарь оставить `brook` (`[[bin]] name = "brook"`)
+- [ ] Добавить крейт `brookd` (демон, bin) — итого 5 крейтов
 - [ ] Editorsconfig для rust/markdown/toml
 - [x] prek config
 - [x] `proto/brook/v1/brook.proto` — скелет из [api.md](api.md)
@@ -44,7 +46,7 @@
 - [ ] `Remove`: то же, что `Cancel`, плюс удаление записи из глобальной очереди
 - [ ] Fallback: нет Range → один сегмент без чанков
 - [ ] `DownloadManager`: реестр engines, очередь, `max_concurrent`
-- [ ] `DownloadManager`: персистентность очереди в `./brook.db` (SQLite рядом с `brook.toml`)
+- [ ] `DownloadManager`: персистентность очереди в `./brook.db` (SQLite в CWD)
 - [ ] Progress-троттлинг в engine: агрегация в окне 200 ms → эмит не чаще 5 Hz per download
 - [ ] State-changes / snapshot — мгновенный эмит, без троттлинга
 - [ ] Центральный `broadcast::Sender<Event>` в `DownloadManager` (ring 1024)
@@ -60,22 +62,31 @@
 - [ ] `Watch`: per-client fanout-задача (broadcast → tonic tx c `.await`)
 - [ ] Initial snapshots при коннекте Watch — по одному на каждую известную загрузку
 - [ ] Обработка `broadcast::RecvError::Lagged(n)` → синтетические snapshot'ы всех активных загрузок
-- [ ] Bind: `127.0.0.1:<port из конфига>` (дефолт 7090)
+- [ ] Bind: `127.0.0.1:<port из settings>` (дефолт 7090)
 - [ ] `session_id` / `download_id` / `request_id` в gRPC-метаданных
 - [ ] Интеграционные тесты: tonic client ↔ server в одном процессе
 
-## 3. Конфигурация (TOML)
-- [ ] Структура `Config` (serde)
-- [ ] Чтение `./brook.toml` из CWD
-- [ ] Нет файла → создать с дефолтами + путь в stderr
-- [ ] Unknown key → warning в лог, invalid value → ошибка старта с сообщением
-- [ ] Применить в `DownloadManager` при старте
+## 3. Конфигурация (таблица `settings` в `brook.db`)
+- [ ] Миграция: `CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`
+- [ ] На первом старте `brookd` сидит таблицу дефолтами (ключи — [architecture.md#конфигурация](architecture.md#конфигурация))
+- [ ] Загрузчик: читает строки, парсит в типизированный `Settings`
+- [ ] Invalid value → ошибка старта `brookd` с именем ключа в сообщении
+- [ ] Unknown key → warning в лог, игнорируется
+- [ ] Применение: `Settings` передаётся в `DownloadManager` и `brook-api` при инициализации
+- [ ] API-методов на settings в MVP нет (post-MVP)
 
-## 4. `brook` (ratatui)
-- [ ] `main`: config → `DownloadManager` → `brook-api` → UI (всё в одном процессе)
-- [ ] Single-instance lock: `flock` на `.brook.lock` в CWD; вторая копия → exit с сообщением
-- [ ] Graceful shutdown: `SIGTERM` / `SIGINT` / `q` → пауза engines → batch-flush → exit
-- [ ] tonic-client на `127.0.0.1:<port>`
+## 4. `brookd` (демон)
+- [ ] Бинарь в крейте `brookd`: `tokio::main` → lock → БД → core → api
+- [ ] Single-instance lock: `flock(LOCK_EX | LOCK_NB)` на `.brook.lock` в CWD; вторая копия → exit с сообщением
+- [ ] Открытие / миграции `./brook.db`
+- [ ] Поднимает `DownloadManager` и `brook-api` в асинхронных задачах
+- [ ] Graceful shutdown: `SIGTERM` / `SIGINT` → пауза engines → batch-flush → закрыть gRPC + БД → отпустить lock → exit
+- [ ] `session_id` UUID на процесс в tracing-спанах
+
+## 5. `brook-tui` (ratatui-клиент, бинарь `brook`)
+- [ ] `main`: подключиться по gRPC к `127.0.0.1:<port>` → UI-loop
+- [ ] Флаг `--port` (дефолт 7090); при недоступности `brookd` — сообщение и exit 1
+- [ ] `q` закрывает клиент; на состояние демона не влияет
 - [ ] Фоновая задача: `Watch` → мутация view-model
 - [ ] Список: имя, прогресс-бар, скорость, ETA, иконки `▶` / `❚❚` / `✓` / `✕`
 - [ ] Сортировка: `RUNNING` → `RETRYING` → `QUEUED` → `PAUSED` → `DONE` → `FAILED` → `CANCELLED`, внутри — по `updated_at`
@@ -91,15 +102,16 @@
 - [ ] `NO_COLOR` — рендер без ANSI-цветов
 - [ ] Мышь игнорируем
 
-## 5. Наблюдаемость
+## 6. Наблюдаемость
 - [ ] `tracing` + JSON-форматтер во всех крейтах
 - [ ] `session_id` (UUID на процесс), `download_id`, `request_id` в спанах
 - [ ] `~/Library/Logs/brook/brook-<session_id>.jsonl` + stderr
 - [ ] Ротация: 10 файлов × 50 MB, по размеру
 
-## 6. Quality gate (ручная прогонка)
+## 7. Quality gate (ручная прогонка)
 Сценарии из [open-questions.md](open-questions.md):
-- [ ] Файл >1 GB + пауза + рестарт процесса → ресюм
+- [ ] Файл >1 GB + пауза + рестарт `brookd` → ресюм
+- [ ] TUI-клиент переподключается к работающему демону после `q` и повторного запуска — состояние совпадает
 - [ ] Отмена с очисткой частичного файла
 - [ ] 10 задач одновременно — лимит параллельности соблюдается
 - [ ] Потеря сети → автоматический ретрай → восстановление

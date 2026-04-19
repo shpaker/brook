@@ -17,20 +17,31 @@ brook/                            # workspace root
 │   ├── brook-proto/              # build.rs → prost + tonic stubs
 │   ├── brook-core/               # DownloadManager + DownloadEngine
 │   ├── brook-api/                # gRPC-сервер (tonic), обёртка над core
-│   └── brook/                    # MVP-бинарь: ratatui-UI, стартует core+api локально
+│   ├── brookd/                   # MVP-бинарь: демон, поднимает core + api
+│   └── brook-tui/                # MVP-бинарь: ratatui gRPC-клиент (имя бинаря — `brook`)
 └── docs/
 ```
 
-Клиенты после MVP (`brook-app`, `brookd`) — см. [post-mvp.md](post-mvp.md).
+Клиенты после MVP (`brook-app`) — см. [post-mvp.md](post-mvp.md).
 
 ## Процессная модель
-`brook` при старте поднимает внутри себя:
-1. Читает TOML-конфиг из CWD (`./brook.toml`).
-2. `DownloadManager` (`brook-core`) — асинхронная задача.
-3. gRPC-сервер (`brook-api`) на `127.0.0.1:<port из конфига>` — асинхронная задача.
-4. Рендерит ratatui-UI, который является gRPC-клиентом к локальному серверу.
 
-**UI никогда не дёргает `DownloadManager` напрямую** — только через API. Даже внутри одного процесса. Это даёт равенство: завтра любой другой клиент (локальный или удалённый) работает по тому же контракту.
+В MVP — **два процесса**: демон `brookd` и TUI-клиент `brook` общаются только по gRPC. Это не оптимизация на будущее, а условие целостности контракта: UI равноправен с любым другим клиентом (в том числе удалённым, в post-MVP).
+
+### `brookd` (демон)
+1. Берёт single-instance lock на `.brook.lock` в CWD (флок).
+2. Открывает `./brook.db` (SQLite); при первом старте — сидит таблицу `settings` дефолтами.
+3. Читает `settings` из БД, применяет при инициализации.
+4. Поднимает `DownloadManager` (`brook-core`) — асинхронная задача.
+5. Запускает gRPC-сервер (`brook-api`) на `127.0.0.1:<port из settings>` — асинхронная задача.
+6. Работает до `SIGTERM` / `SIGINT`.
+
+### `brook` (TUI, крейт `brook-tui`)
+1. `tonic::Channel` на `127.0.0.1:<port>` (порт задаётся флагом `--port`, дефолт `7090`).
+2. Рендерит ratatui-UI, который является gRPC-клиентом к `brookd`.
+3. Если демон недоступен — сообщение в UI и подсказка запустить `brookd`; автостарт демона в MVP не делаем.
+
+**UI никогда не дёргает `DownloadManager` напрямую** — только через API. Завтра любой другой клиент (локальный или удалённый) работает по тому же контракту.
 
 ## Модель акторов в `brook-core`
 
@@ -49,8 +60,8 @@ brook/                            # workspace root
 - Очередь: сколько задач активно, кто ждёт.
 - Принимает команды из `brook-api` и роутит в нужный engine.
 - Агрегирует события всех engines в один broadcast-поток для API.
-- Отвечает за персистентность очереди: SQLite-файл `./brook.db` в CWD (рядом с `brook.toml` и `.brook.lock`). Хранит `download_id`, URL, `target_path`, состояние, `created_at`, порядок в очереди, кастомные заголовки. Per-file состояние чанков — в `.index.brook` рядом с `.data.brook`, не в `brook.db`.
-- Применяет конфиг, загруженный из TOML.
+- Отвечает за персистентность очереди: SQLite-файл `./brook.db` в CWD (рядом с `.brook.lock`). Хранит `download_id`, URL, `target_path`, состояние, `created_at`, порядок в очереди, кастомные заголовки, а также таблицу `settings`. Per-file состояние чанков — в `.index.brook` рядом с `.data.brook`, не в `brook.db`.
+- Применяет конфиг, прочитанный из таблицы `settings` при старте `brookd`.
 
 ### Почему именно так
 Пользователь: «Один `DownloadEngine` на загрузку и один менеджер на процесс». Это стандартная актор-модель: каждый engine изолирован, тестируется отдельно, падает независимо. Менеджер — единственная точка координации.
@@ -136,7 +147,7 @@ brook/                            # workspace root
 
 ### Single-instance lock
 
-Два `brook` в одной CWD — гонка за `brook.toml`, глобальную очередь, `.data.brook` в целевой папке. На старте — `flock(LOCK_EX | LOCK_NB)` на `.brook.lock` в CWD. Вторая копия — exit с сообщением «brook уже запущен в этой директории».
+Два `brookd` в одной CWD — гонка за `brook.db`, глобальную очередь, `.data.brook` в целевой папке. На старте `brookd` — `flock(LOCK_EX | LOCK_NB)` на `.brook.lock` в CWD. Вторая копия — exit с сообщением «brookd уже запущен в этой директории». TUI-клиент `brook` лок не берёт — сколько угодно клиентов могут одновременно подключаться к одному демону.
 
 ### Проверки перед стартом загрузки
 
@@ -145,19 +156,21 @@ brook/                            # workspace root
 
 ### Graceful shutdown
 
-`SIGTERM` / `SIGINT` / выход по `q`:
+`SIGTERM` / `SIGINT` в `brookd`:
 1. Прекращаем приём новых команд через gRPC.
 2. Пауза всех `DownloadEngine` — каждый доводит in-flight чанки до batch-границы.
 3. Финальный `fsync(.data.brook)` + batch-коммит `.index.brook` для каждой активной загрузки.
-4. Закрываем gRPC-сервер, `./brook.db`, лог-writer.
+4. Закрываем gRPC-сервер, `./brook.db`, лог-writer, отпускаем `.brook.lock`.
 5. Exit 0.
 
-Без graceful shutdown на ctrl-c — теряем до 16 `done`-чанков трафика на каждую активную загрузку (перекачаются после рестарта).
+В TUI `brook` — `q` просто закрывает клиент, демон продолжает работать. Закрытие клиента при активных загрузках никак их не останавливает.
+
+Без graceful shutdown на ctrl-c демона — теряем до 16 `done`-чанков трафика на каждую активную загрузку (перекачаются после рестарта).
 
 ## API-слой (`brook-api`)
 - Генерируется из `.proto` через `tonic-build` в build.rs `brook-proto`.
 - Тонкая обёртка вокруг `DownloadManager`: proto ↔ core.
-- Запускается как фоновая задача бинаря `brook`.
+- Запускается как фоновая задача бинаря `brookd`.
 - Контракт — [api.md](api.md).
 
 ### Поток событий и Watch
@@ -172,9 +185,9 @@ brook/                            # workspace root
 - Гарантия для клиента: сколько бы `progress_tick`-ов он ни потерял, **state всегда догоняется** через `snapshot`.
 - Протокольные детали (какое событие когда, что перезаписывает) — [api.md#watch-события-и-реконсиляция](api.md#watch-события-и-реконсиляция).
 
-## UI-слой (`brook`)
+## UI-слой (`brook-tui`, бинарь `brook`)
 - `ratatui` + `crossterm`.
-- gRPC-клиент (`tonic::Channel`) на локальный сервер.
+- gRPC-клиент (`tonic::Channel`) к `brookd` на `127.0.0.1:<port>` (флаг `--port`, дефолт 7090).
 - Две точки взаимодействия:
   - Команды — unary (`add`, `pause`, ...).
   - События — подписка на server-streaming (`Watch`); фоновая задача питает view-model.
@@ -183,30 +196,34 @@ brook/                            # workspace root
 
 ## Конфигурация
 
-В MVP — `./brook.toml` в текущей рабочей директории. `brook` читает «из-под ног»: смотрит в CWD при старте. Если файла нет — создаёт с дефолтами, путь пишется в stderr. Неизвестные ключи → warning в лог; недопустимые значения → ошибка старта с явным сообщением.
+Вся конфигурация живёт в таблице `settings` внутри `./brook.db`. TOML-файлов нет. При первом старте `brookd` создаёт БД и сидит таблицу дефолтами. На каждом старте `brookd` читает значения и применяет их в `DownloadManager` и `brook-api`. Изменения на лету и API-методы на settings — см. [post-mvp.md](post-mvp.md). В MVP редактирование — напрямую через SQL (`sqlite3 brook.db`) при остановленном `brookd`.
 
-После загрузки передаётся в `DownloadManager`. Изменения на лету не поддерживаются (hot-reload и API-методы на settings — см. [post-mvp.md](post-mvp.md)).
+Схема таблицы (key/value):
 
-Черновик структуры:
-
-```toml
-[download]
-default_segments = 4
-max_segments = 16
-max_concurrent = 3
-default_dir = "~/Downloads"
-on_duplicate_url = "ask"       # ask | skip | add
-on_file_exists = "ask"         # ask | rename | overwrite
-
-[api]
-port = 7090
-bind = "127.0.0.1"
-
-[log]
-dir = "~/Library/Logs/brook"
-rotate_count = 10
-rotate_size_mb = 50
+```sql
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ```
+
+Ключи и дефолты:
+
+| key                          | default               | назначение                        |
+|------------------------------|-----------------------|-----------------------------------|
+| `download.default_segments`  | `4`                   | сегментов на файл по умолчанию    |
+| `download.max_segments`      | `16`                  | потолок на файл                   |
+| `download.max_concurrent`    | `3`                   | одновременно активных загрузок    |
+| `download.default_dir`       | `~/Downloads`         | дефолтная папка назначения        |
+| `download.on_duplicate_url`  | `ask`                 | `ask` / `skip` / `add`            |
+| `download.on_file_exists`    | `ask`                 | `ask` / `rename` / `overwrite`    |
+| `api.port`                   | `7090`                | порт gRPC                         |
+| `api.bind`                   | `127.0.0.1`           | bind-адрес (только loopback в MVP)|
+| `log.dir`                    | `~/Library/Logs/brook`| каталог JSON-логов                |
+| `log.rotate_count`           | `10`                  | файлов в ротации                  |
+| `log.rotate_size_mb`         | `50`                  | размер файла до ротации           |
+
+Невалидное значение → ошибка старта `brookd` с явным сообщением и именем ключа. Неизвестные ключи в БД — warning в лог, игнорируются.
 
 ## Наблюдаемость
 

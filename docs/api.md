@@ -11,7 +11,7 @@
 Отличия:
 - У нас gRPC + protobuf (а не JSON-RPC).
 - Server-streaming для прогресса (вместо поллинга).
-- В MVP **Settings через API не ходят** — конфиг живёт в TOML (см. [architecture.md#конфигурация](architecture.md#конфигурация)).
+- В MVP **Settings через API не ходят** — конфиг живёт в таблице `settings` внутри `brook.db` (см. [architecture.md#конфигурация](architecture.md#конфигурация)).
 
 ## Расположение
 - Схема: `proto/brook/v1/brook.proto` — единый источник правды.
@@ -47,8 +47,8 @@ message DownloadId { string value = 1; }        // UUID как строка
 
 message DownloadSpec {
     string url = 1;
-    string target_path = 2;                     // абсолютный; либо префикс из TOML + имя
-    uint32 segments = 3;                        // 0 = взять дефолт из конфига
+    string target_path = 2;                     // абсолютный; либо префикс из settings + имя
+    uint32 segments = 3;                        // 0 = взять дефолт из settings
     map<string, string> headers = 4;
 }
 
@@ -141,10 +141,10 @@ message Event {
 
 ## Решённое
 - Транспорт: gRPC (`tonic`), формат — protobuf (`prost`).
-- Локальный UI (`brook`) ходит в API, а не дёргает `DownloadManager` напрямую.
+- Локальный UI (`brook`, крейт `brook-tui`) — отдельный процесс, ходит в `brookd` только через gRPC. «Короткого пути» в обход API нет даже локально.
 - Server-streaming `Watch` — один стрим на клиента, сервер шлёт релевантные события.
 - CorrelationId (`session_id`, `download_id`) прокидывается в gRPC-метаданных.
-- Settings — не в API в MVP; правятся в TOML и подхватываются при следующем старте `brook`.
+- Settings — не в API в MVP; правятся через SQL в `brook.db` и подхватываются при следующем старте `brookd`.
 - Порт по умолчанию — `7090`.
 - В MVP — все методы из схемы выше (включая `PauseAll`/`ResumeAll`).
 
