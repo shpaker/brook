@@ -62,6 +62,7 @@ Per-download artefacts live next to the target file: `<name>.data.brook` (preall
 ## Coding conventions
 
 - **Trait names** — prefix with `T`: `TPieceStorage`, `TQueueStore`, `TPieceStorageFactory`. Applies to all traits in every crate of this workspace.
+- **DB access — only through repository structs.** Any SQLite manipulation (`brook.db`, `.index.brook`) lives inside a dedicated repository struct. SQL strings and `rusqlite::Connection` usage never leak past the repository boundary — callers get domain methods, not queries.
 
 ## Docs
 

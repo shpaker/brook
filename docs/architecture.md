@@ -250,7 +250,7 @@ brook/                            # workspace root
 ## Наблюдаемость
 
 - `tracing` + JSON-форматтер во всех крейтах.
-- `session_id` — UUID, создаётся при старте процесса; прокидывается как поле во всех root-спанах.
+- `session_id` — xid, создаётся при старте процесса; прокидывается как поле во всех root-спанах.
 - `download_id` — у каждой загрузки; `brook-core` входит в `span!(download_id = ...)` при любых операциях.
 - gRPC-запросы получают `request_id`; если касаются конкретной загрузки — добавляется `download_id`.
 - Лог-файлы: `~/Library/Logs/brook/brook-<session_id>.jsonl`. Ротация — [open question](open-questions.md).

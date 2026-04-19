@@ -20,7 +20,7 @@
 
 ## Схема
 
-Все типы и методы — в `proto/brook/v1/brook.proto` (единый источник правды). Методы MVP: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `Watch`. Ключевые типы: `DownloadId` (UUID), `DownloadSpec` (URL, путь, воркеры, заголовки), `DownloadState` (`QUEUED` / `RUNNING` / `PAUSED` / `DONE` / `FAILED` / `RETRYING`), `Progress` (байты, скорость, ETA), `Download` (полный снимок), `Event` (snapshot / progress_tick / log_line).
+Все типы и методы — в `proto/brook/v1/brook.proto` (единый источник правды). Методы MVP: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `Watch`. Ключевые типы: `DownloadId` (xid, 20-символьная строка), `DownloadSpec` (URL, путь, воркеры, заголовки), `DownloadState` (`QUEUED` / `RUNNING` / `PAUSED` / `DONE` / `FAILED` / `RETRYING`), `Progress` (байты, скорость, ETA), `Download` (полный снимок), `Event` (snapshot / progress_tick / log_line).
 
 ## Семантика команд
 
