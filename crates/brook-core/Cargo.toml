@@ -1,0 +1,11 @@
+[package]
+name       = "brook-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio     = { workspace = true }
+reqwest   = { workspace = true }
+tracing   = { workspace = true }
+thiserror = { workspace = true }
+uuid      = { workspace = true }

@@ -34,7 +34,10 @@ Icon?
 *.log
 logs/
 brook-*.jsonl
-/brook.toml
+/brook.db
+/brook.db-wal
+/brook.db-shm
+/.brook.lock
 
 # AI-агенты (локальные конфиги / артефакты)
 .claude/

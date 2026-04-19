@@ -1,0 +1,12 @@
+[package]
+name       = "brook-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prost       = { workspace = true }
+prost-types = { workspace = true }
+tonic       = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"

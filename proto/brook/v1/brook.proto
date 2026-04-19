@@ -1,0 +1,159 @@
+syntax = "proto3";
+package brook.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// Основной сервис управления загрузками.
+service DownloadService {
+  // Получить список всех загрузок.
+  rpc List(ListRequest) returns (ListResponse);
+  // Добавить новую загрузку.
+  rpc Add(AddRequest) returns (AddResponse);
+  // Удалить загрузку по идентификатору.
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Поставить загрузку на паузу.
+  rpc Pause(IdRequest) returns (StatusResponse);
+  // Возобновить приостановленную загрузку.
+  rpc Resume(IdRequest) returns (StatusResponse);
+  // Отменить загрузку.
+  rpc Cancel(IdRequest) returns (StatusResponse);
+
+  // Поставить все загрузки на паузу.
+  rpc PauseAll(google.protobuf.Empty) returns (StatusResponse);
+  // Возобновить все приостановленные загрузки.
+  rpc ResumeAll(google.protobuf.Empty) returns (StatusResponse);
+
+  // Server-streaming: тики прогресса и изменения состояния.
+  rpc Watch(WatchRequest) returns (stream Event);
+}
+
+// Уникальный идентификатор загрузки (UUID в виде строки).
+message DownloadId {
+  string value = 1;
+}
+
+// Параметры создаваемой загрузки.
+message DownloadSpec {
+  string url = 1;
+  // Абсолютный путь или префикс из конфига + имя файла.
+  string target_path = 2;
+}
+
+// Состояние загрузки.
+enum DownloadState {
+  DOWNLOAD_STATE_UNSPECIFIED = 0;
+  DOWNLOAD_STATE_QUEUED = 1;
+  DOWNLOAD_STATE_RUNNING = 2;
+  DOWNLOAD_STATE_PAUSED = 3;
+  DOWNLOAD_STATE_DONE = 4;
+  DOWNLOAD_STATE_FAILED = 5;
+  DOWNLOAD_STATE_RETRYING = 6;
+  DOWNLOAD_STATE_CANCELLED = 7;
+}
+
+// Текущий прогресс загрузки.
+message Progress {
+  uint64 downloaded_bytes = 1;
+  // 0, если размер неизвестен.
+  uint64 total_bytes = 2;
+  double speed_bps = 3;
+  uint64 eta_seconds = 4;
+}
+
+// Состояние отдельного куска.
+enum PieceState {
+  PIECE_STATE_UNSPECIFIED = 0;
+  PIECE_STATE_PENDING = 1;
+  PIECE_STATE_DOWNLOADING = 2;
+  PIECE_STATE_DONE = 3;
+  PIECE_STATE_FAILED = 4;
+}
+
+// Обновление по одному куску — для чанкового прогрессбара на клиенте.
+// Размер куска известен из Download.piece_size, здесь передаём только долю.
+message PieceUpdate {
+  // Порядковый номер куска (0..piece_count).
+  uint32 index = 1;
+  PieceState state = 2;
+  // Доля загруженного в этом куске, 0.0..1.0.
+  float progress = 3;
+}
+
+// Кусок, который сейчас качается: индекс + доля загруженного 0.0..1.0.
+message PieceInProgress {
+  uint32 index = 1;
+  float progress = 2;
+}
+
+// Полное состояние загрузки.
+message Download {
+  DownloadId id = 1;
+  DownloadSpec spec = 2;
+  DownloadState state = 3;
+  Progress progress = 4;
+  // Номер текущей попытки (с 1).
+  uint32 attempt = 5;
+  // Заполняется только для FAILED / RETRYING.
+  string error_message = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  // Общее число кусков (0, если размер ещё не известен).
+  uint32 piece_count = 9;
+  // Размер куска в байтах (последний кусок может быть меньше).
+  uint64 piece_size = 10;
+  // Индексы полностью загруженных кусков.
+  repeated uint32 completed_pieces = 11;
+  // Куски, которые качаются прямо сейчас.
+  repeated PieceInProgress in_progress_pieces = 12;
+}
+
+// Событие, отправляемое клиенту в Watch-стриме.
+message Event {
+  DownloadId id = 1;
+  oneof kind {
+    // Полный снимок — перезаписать запись на клиенте.
+    Download snapshot = 2;
+    // Изменение состояния одного куска.
+    PieceUpdate piece_update = 3;
+  }
+}
+
+message ListRequest {
+}
+
+message ListResponse {
+  repeated Download downloads = 1;
+}
+
+message AddRequest {
+  DownloadSpec spec = 1;
+}
+
+message AddResponse {
+  DownloadId id = 1;
+}
+
+message RemoveRequest {
+  DownloadId id = 1;
+}
+
+message RemoveResponse {
+}
+
+// Запрос по идентификатору загрузки.
+message IdRequest {
+  DownloadId id = 1;
+}
+
+// Универсальный ответ об успехе или ошибке операции.
+message StatusResponse {
+  bool ok = 1;
+  // Описание ошибки при ok = false.
+  string message = 2;
+}
+
+// Параметры подписки (зарезервировано для будущих фильтров).
+message WatchRequest {
+}

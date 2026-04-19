@@ -1,0 +1,16 @@
+[package]
+name    = "brook-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "brook"
+path = "src/main.rs"
+
+[dependencies]
+brook-proto = { path = "../brook-proto" }
+tonic       = { workspace = true }
+tokio       = { workspace = true }
+ratatui     = { workspace = true }
+crossterm   = { workspace = true }
+anyhow      = { workspace = true }
