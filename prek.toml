@@ -18,9 +18,13 @@ repo = "local"
 
 [[repos.hooks]]
 id = "fmt"
-name = "cargo fmt"
+name = "cargo fmt (nightly)"
 language = "system"
-entry = "cargo fmt"
+# Нестабильные опции в rustfmt.toml (imports_granularity, imports_layout,
+# group_imports) понимает только nightly-rustfmt. Проксируем через bash,
+# чтобы сам хук оставался channel-agnostic, а рантайм брал nightly-бинари
+# из toolchain'а напрямую (rustup proxy по умолчанию резолвится в stable).
+entry = "bash -c 'NIGHTLY_BIN=\"$(dirname \"$(rustup which --toolchain nightly rustfmt)\")\"; PATH=\"$NIGHTLY_BIN:$PATH\" cargo fmt \"$@\"' --"
 types = ["rust"]
 pass_filenames = false
 args = ["--check"]

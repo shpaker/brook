@@ -12,7 +12,7 @@ brook/
 ├── proto/brook/v1/brook.proto    # single source of truth for the API contract
 ├── crates/
 │   ├── brook-proto/              # build.rs → prost + tonic stubs
-│   ├── brook-core/               # DownloadManager + DownloadEngine
+│   ├── brook-core/               # hexagonal core: domain + ports (+ services)
 │   ├── brook-api/                # gRPC server (tonic), thin wrapper over core
 │   ├── brookd/                   # daemon binary: boots core + api, holds .brook.lock
 │   └── brook-tui/                # TUI binary (name: brook): ratatui gRPC client
@@ -62,7 +62,29 @@ Per-download artefacts live next to the target file: `<name>.data.brook` (preall
 ## Coding conventions
 
 - **Trait names** — prefix with `T`: `TPieceStorage`, `TQueueStore`, `TPieceStorageFactory`. Applies to all traits in every crate of this workspace.
+- **`brook-core` layout — Hexagonal (Ports & Adapters).** New domain types go into `crates/brook-core/src/domain/` (pure, no I/O, no external-world dependencies). New outbound traits — into `crates/brook-core/src/ports/`. Application services (coordinators like `DownloadManager`, `DownloadEngine`) — into `crates/brook-core/src/service/` (to be created at stage 1.3). Concrete adapters (SQLite, HTTP clients, gRPC) **never** live in `brook-core` — they belong in `brookd`, `brook-api`, or dedicated adapter crates. The public API of `brook-core` stays flat (`brook_core::DownloadId`, `brook_core::TPieceStorage`) — internal folders exist to keep layers from mixing, not to nest the API.
 - **DB access — only through repository structs.** Any SQLite manipulation (`brook.db`, `.index.brook`) lives inside a dedicated repository struct. SQL strings and `rusqlite::Connection` usage never leak past the repository boundary — callers get domain methods, not queries.
+
+## Formatting (Rust)
+
+Конфиг — [rustfmt.toml](rustfmt.toml). Автоформат: `cargo +nightly fmt` (часть опций — nightly-only).
+
+Жёсткие правила, которые должны соблюдаться даже при ручной правке:
+
+- **`use` и `pub use` — один item на строку.** Несколько имён из одного пути склеиваются в общий braced-блок с вертикальной раскладкой:
+  ```rust
+  pub use foo::{
+      A,
+      B,
+  };
+  ```
+  Плоский `pub use foo::A; pub use foo::B;` или однострочный `pub use foo::{A, B};` запрещены — оба приводятся к форме выше (rustfmt с `imports_granularity = "Module"` + `imports_layout = "Vertical"` делает это автоматически).
+  Исключение: re-export всего модуля через `pub use foo::*;` допустим, если это осознанный «фасад».
+- **Группы импортов через пустую строку, в порядке:** `std` → внешние крейты → `crate` / `super` / `self`. Внутри группы — алфавитный порядок.
+- **`max_width = 100`**, отступ — 4 пробела, переводы строк — `LF`.
+- **Edition 2024** на весь workspace.
+- **Никаких `use foo::bar::*`** внутри функций/модулей (только в явных фасадах, см. выше) — конкретные имена в импортах читаются лучше.
+- Перед коммитом прогонять `cargo +nightly fmt --all` и `cargo clippy --all-targets -- -D warnings`.
 
 ## Docs
 

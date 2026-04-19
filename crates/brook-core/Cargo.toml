@@ -3,9 +3,20 @@ name       = "brook-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Включает in-memory реализации портов (`MemoryPieceStorage`, `MemoryTQueueStore`).
+# Нужен для тестов `brook-core` и для тестов/примеров в других крейтах workspace'а.
+# Код боевых бинарей не должен зависеть от этой фичи.
+test-utils = []
+
 [dependencies]
 tokio     = { workspace = true }
 reqwest   = { workspace = true }
 tracing   = { workspace = true }
 thiserror = { workspace = true }
 uuid      = { workspace = true }
+
+[dev-dependencies]
+# Самоссылка включает фичу `test-utils` для юнит-тестов крейта,
+# при этом обычная сборка `brook-core` эту фичу не тянет.
+brook-core = { path = ".", features = ["test-utils"] }
