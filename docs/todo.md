@@ -4,9 +4,9 @@
 
 ## 0. Workspace
 - [x] Cargo workspace + 4 крейта: `brook-proto`, `brook-core`, `brook-api`, `brook`
-- [ ] Переименовать крейт `brook` → `brook-tui`; бинарь оставить `brook` (`[[bin]] name = "brook"`)
-- [ ] Добавить крейт `brookd` (демон, bin) — итого 5 крейтов
-- [ ] Editorsconfig для rust/markdown/toml
+- [x] Переименовать крейт `brook` → `brook-tui`; бинарь оставить `brook` (`[[bin]] name = "brook"`)
+- [x] Добавить крейт `brookd` (демон, bin) — итого 5 крейтов
+- [x] Editorsconfig для rust/markdown/toml
 - [x] prek config
 - [x] `proto/brook/v1/brook.proto` — скелет из [api.md](api.md)
 - [x] `brook-proto/build.rs` → `tonic-build`
