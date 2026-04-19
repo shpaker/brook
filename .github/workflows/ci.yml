@@ -11,8 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protoc
-        run: brew install protobuf
+      - name: Install protoc and protolint
+        run: brew install protobuf protolint
+
+      - name: protolint
+        run: protolint lint proto/
 
       - uses: dtolnay/rust-toolchain@stable
         with:

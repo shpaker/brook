@@ -2,7 +2,7 @@
 
 ## MVP (зафиксированный порядок)
 
-1. **`brook-core`** — движок загрузок. Per-download `DownloadEngine` + единый `DownloadManager`. Сегменты, **чанковая запись**, ресюм, ретраи, SQLite-персистентность. Без сети — сначала на `wiremock` / локальном тест-сервере, затем с реальным HTTP.
+1. **`brook-core`** — движок загрузок. Per-download `DownloadEngine` + единый `DownloadManager`. Воркеры, **покусочная запись**, ресюм, ретраи, SQLite-персистентность. Без сети — сначала на `wiremock` / локальном тест-сервере, затем с реальным HTTP.
 2. **`brook-proto` + `brook-api`** — gRPC-сервер поверх `brook-core`. Контракт в `proto/brook/v1/brook.proto`, сгенерированный код в `brook-proto`, сервер (`tonic`) в `brook-api`. Слушает loopback.
 3. **Конфигурация — в БД.** Таблица `settings` внутри `./brook.db`. На первом старте демон сидит её дефолтами. TOML-файлов нет. API-методов на settings в MVP тоже нет — правка через SQL на остановленном демоне.
 4. **`brookd`** — бинарь-демон: берёт single-instance lock, открывает `brook.db`, поднимает `DownloadManager` и `brook-api`. UI не содержит. Обязательная отдельная процесс-граница между движком и клиентом уже с MVP.

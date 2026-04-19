@@ -18,7 +18,7 @@
 - [ ] `reqwest` + `rustls`
 - [ ] HEAD → `Content-Length`, `Accept-Ranges`, `ETag`/`Last-Modified`, `Content-Disposition`
 - [ ] HEAD fallback → `GET Range: bytes=0-0`
-- [ ] Валидация Range-ответа: `206` + корректный `Content-Range` (иначе fallback на один сегмент)
+- [ ] Валидация Range-ответа: `206` + корректный `Content-Range` (иначе fallback на одного воркера)
 - [ ] Guard мутации: `If-Match` / `If-Unmodified-Since` на каждый Range; `412` → `FAILED`
 - [ ] Имя файла: `Content-Disposition` → URL-сегмент → промпт
 - [ ] Таймауты: connect 10 s, read (idle) 30 s
@@ -29,7 +29,7 @@
 - [ ] Типы: `DownloadId`, `DownloadSpec`, `DownloadState`, `Progress`, `Download`
 - [ ] `statvfs`-проверка свободного места перед пре-аллокацией
 - [ ] Пре-аллокация `<filename>.data.brook` (`F_PREALLOCATE` + `ftruncate`)
-- [ ] Нарезка на чанки 1–4 MB + расчёт offset'ов
+- [ ] Нарезка на куски 1–4 MB + расчёт offset'ов
 - [ ] SQLite-индекс `<filename>.index.brook` (`rusqlite`, WAL, `synchronous=NORMAL`): `pending` / `done`
 - [ ] `pwrite` / `read` wrapper: loop до полного слива, `EINTR`-safe
 - [ ] Завершение: финальный `fsync` → `rename .data.brook` → `<filename>` → удалить индекс
@@ -37,14 +37,14 @@
 
 ### Движок и очередь
 - [ ] Work-stealing: общий atomic-счётчик «следующий `pending`»
-- [ ] Сегмент: Range-запрос → потоковый `pwrite` буфером 64–256 KB
-- [ ] Проверка: принято ровно `chunk_size` байт (иначе вернуть в `pending`)
-- [ ] Батчевый commit: каждые 16 чанков → `fsync(.data)` + `UPDATE status='done'`
+- [ ] Воркер: Range-запрос → потоковый `pwrite` буфером 64–256 KB
+- [ ] Проверка: принято ровно `piece_size` байт (иначе вернуть в `pending`)
+- [ ] Батчевый commit: каждые 16 кусков → `fsync(.data)` + `UPDATE status='done'`
 - [ ] `DownloadEngine`: mpsc команд (`pause`/`resume`/`cancel`), broadcast событий
 - [ ] Ресюм: читаем индекс, докачиваем `pending`
 - [ ] `Cancel`: статус `CANCELLED` + удалить `.data` и `.index`, запись остаётся в списке
 - [ ] `Remove`: то же, что `Cancel`, плюс удаление записи из глобальной очереди
-- [ ] Fallback: нет Range → один сегмент без чанков
+- [ ] Fallback: нет Range → один воркер без кусков
 - [ ] `DownloadManager`: реестр engines, очередь, `max_concurrent`
 - [ ] `DownloadManager`: персистентность очереди в `./brook.db` (SQLite в CWD)
 - [ ] Progress-троттлинг в engine: агрегация в окне 200 ms → эмит не чаще 5 Hz per download

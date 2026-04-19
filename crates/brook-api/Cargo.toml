@@ -8,3 +8,5 @@ brook-proto = { path = "../brook-proto" }
 brook-core  = { path = "../brook-core" }
 tonic       = { workspace = true }
 tokio       = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }

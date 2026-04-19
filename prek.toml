@@ -33,3 +33,10 @@ entry = "cargo clippy"
 types = ["rust"]
 pass_filenames = false
 args = ["--", "-D", "warnings"]
+
+[[repos.hooks]]
+id = "protolint"
+name = "protolint"
+language = "system"
+entry = "protolint lint"
+files = "\\.proto$"
