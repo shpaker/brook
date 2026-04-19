@@ -6,28 +6,45 @@ on:
   pull_request:
 
 jobs:
-  ci:
+  protolint:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install protoc and protolint
-        run: brew install protobuf protolint
-
+      - name: Install protolint
+        run: brew install protolint
       - name: protolint
         run: protolint lint proto/
 
+  fmt:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: fmt
+          components: rustfmt
+      - name: cargo fmt
         run: cargo fmt --check
 
-      - name: clippy
+  clippy:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: brew install protobuf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
         run: cargo clippy -- -D warnings
 
-      - name: test
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: brew install protobuf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
         run: cargo test
