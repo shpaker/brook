@@ -18,83 +18,13 @@
 - Крейт `brook-proto` генерирует Rust-код (`tonic-build` в build.rs).
 - Все клиенты зависят от `brook-proto`.
 
-## Эскиз схемы (draft)
+## Схема
 
-```proto
-syntax = "proto3";
-package brook.v1;
-
-import "google/protobuf/timestamp.proto";
-import "google/protobuf/empty.proto";
-
-service DownloadService {
-    rpc List       (ListRequest)    returns (ListResponse);
-    rpc Add        (AddRequest)     returns (AddResponse);
-    rpc Remove     (RemoveRequest)  returns (RemoveResponse);
-
-    rpc Pause      (IdRequest)      returns (StatusResponse);
-    rpc Resume     (IdRequest)      returns (StatusResponse);
-    rpc Cancel     (IdRequest)      returns (StatusResponse);
-
-    rpc PauseAll   (google.protobuf.Empty) returns (StatusResponse);
-    rpc ResumeAll  (google.protobuf.Empty) returns (StatusResponse);
-
-    // server-streaming — подписка на события (progress, state changes)
-    rpc Watch      (WatchRequest)   returns (stream Event);
-}
-
-message DownloadId { string value = 1; }        // UUID как строка
-
-message DownloadSpec {
-    string url = 1;
-    string target_path = 2;                     // абсолютный; либо префикс из settings + имя
-    uint32 segments = 3;                        // 0 = взять дефолт из settings
-    map<string, string> headers = 4;
-}
-
-enum DownloadState {
-    STATE_UNSPECIFIED = 0;
-    QUEUED = 1;
-    RUNNING = 2;
-    PAUSED = 3;
-    DONE = 4;
-    FAILED = 5;
-    RETRYING = 6;
-}
-
-message Progress {
-    uint64 downloaded_bytes = 1;
-    uint64 total_bytes = 2;
-    double speed_bps = 3;
-    uint64 eta_seconds = 4;
-}
-
-message Download {
-    DownloadId id = 1;
-    DownloadSpec spec = 2;
-    DownloadState state = 3;
-    Progress progress = 4;
-    uint32 attempt = 5;
-    string error_message = 6;                   // только для FAILED / RETRYING
-    google.protobuf.Timestamp created_at = 7;
-    google.protobuf.Timestamp updated_at = 8;
-}
-
-message Event {
-    DownloadId id = 1;
-    oneof kind {
-        Download snapshot = 2;                  // полный снимок (при подписке / смене состояния)
-        Progress progress_tick = 3;             // лёгкий тик во время RUNNING
-        string log_line = 4;                    // опционально — для дебаг-хвоста в UI
-    }
-}
-
-// ... AddRequest / AddResponse / ListResponse / IdRequest / StatusResponse / WatchRequest ...
-```
+Все типы и методы — в `proto/brook/v1/brook.proto` (единый источник правды). Методы MVP: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `Watch`. Ключевые типы: `DownloadId` (UUID), `DownloadSpec` (URL, путь, воркеры, заголовки), `DownloadState` (`QUEUED` / `RUNNING` / `PAUSED` / `DONE` / `FAILED` / `RETRYING`), `Progress` (байты, скорость, ETA), `Download` (полный снимок), `Event` (snapshot / progress_tick / log_line).
 
 ## Семантика команд
 
-- **`Pause`** — `RUNNING` → `PAUSED`. Inflight-чанки доводятся до batch-границы, дальше сегменты останавливаются. `.data.brook` и `.index.brook` сохраняются.
+- **`Pause`** — `RUNNING` → `PAUSED`. Inflight-куски доводятся до batch-границы, дальше воркеры останавливаются. `.data.brook` и `.index.brook` сохраняются.
 - **`Resume`** — `PAUSED` / `FAILED` → `RUNNING`. Для `FAILED` сбрасывается счётчик попыток, читается `.index.brook`, докачиваются `pending`.
 - **`Cancel`** — из любого live-состояния (`QUEUED` / `RUNNING` / `PAUSED` / `RETRYING` / `FAILED`): статус → `CANCELLED`, `.data.brook` и `.index.brook` удаляются, **запись в списке остаётся**. Это нужно, чтобы пользователь видел, что именно он отменил, и не добавил URL повторно по ошибке. На `DONE` — no-op (финальный файл уже у пользователя).
 - **`Remove`** — сначала то же, что `Cancel` (если загрузка live), затем запись удаляется из глобальной очереди. На `DONE` — только удаление записи; финальный файл остаётся у пользователя.
