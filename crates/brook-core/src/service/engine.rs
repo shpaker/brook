@@ -57,6 +57,11 @@ use tokio::sync::{
     watch,
 };
 use tokio::task::JoinHandle;
+use tracing::{
+    debug,
+    info,
+    warn,
+};
 
 use crate::domain::{
     DownloadCommand,
@@ -248,11 +253,14 @@ async fn run_engine<S, F>(
     S: TPieceStorage + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
 {
+    info!(%id, url = %inputs.spec.url, "engine starting");
+
     // Стартовый снимок `pending`: spec говорит, что нужно скачать всё;
     // storage подскажет, чего ещё не хватает (resume-кейс).
     let pending: Vec<u32> = match storage.pending_pieces().await {
         Ok(p) => p,
         Err(e) => {
+            warn!(%id, error = %e, "failed to read pending pieces");
             emit_state(&events_tx, id, DownloadState::Failed);
             let _ = events_tx.send(DownloadEvent::Failed {
                 id,
@@ -264,6 +272,7 @@ async fn run_engine<S, F>(
 
     // Быстрый выход, если качать нечего — сразу финализируем и Completed.
     if pending.is_empty() {
+        info!(%id, "no pending pieces — finalizing immediately");
         emit_state(&events_tx, id, DownloadState::Running);
         match storage.finalize().await {
             Ok(()) => {
@@ -271,6 +280,7 @@ async fn run_engine<S, F>(
                 let _ = events_tx.send(DownloadEvent::Completed { id });
             }
             Err(e) => {
+                warn!(%id, error = %e, "finalize failed");
                 emit_state(&events_tx, id, DownloadState::Failed);
                 let _ = events_tx.send(DownloadEvent::Failed {
                     id,
@@ -305,6 +315,7 @@ async fn run_engine<S, F>(
     } else {
         1
     };
+    info!(%id, pieces = total_pieces_expected, workers = worker_count, accepts_ranges = inputs.accepts_ranges, "spawning workers");
 
     let mut worker_handles: Vec<JoinHandle<()>> = Vec::with_capacity(worker_count);
     if inputs.accepts_ranges {
@@ -354,17 +365,20 @@ async fn run_engine<S, F>(
                 match cmd {
                     DownloadCommand::Pause => {
                         if *state_rx.borrow() == RunState::Running {
+                            info!(%id, "pausing");
                             let _ = state_tx.send(RunState::Paused);
                             emit_state(&events_tx, id, DownloadState::Paused);
                         }
                     }
                     DownloadCommand::Resume => {
                         if *state_rx.borrow() == RunState::Paused {
+                            info!(%id, "resuming");
                             let _ = state_tx.send(RunState::Running);
                             emit_state(&events_tx, id, DownloadState::Running);
                         }
                     }
                     DownloadCommand::Cancel => {
+                        info!(%id, "cancelling");
                         let _ = state_tx.send(RunState::Stopping);
                         final_outcome = Some(Outcome::Cancelled);
                         break;
@@ -388,6 +402,7 @@ async fn run_engine<S, F>(
                         }
                     }
                     WorkerMsg::Failed(err) => {
+                        warn!(%id, error = %err, "worker reported failure");
                         final_outcome = Some(Outcome::Failed(err));
                         let _ = state_tx.send(RunState::Stopping);
                         break;
@@ -460,6 +475,7 @@ async fn run_engine<S, F>(
         Outcome::Completed => {
             match storage.finalize().await {
                 Ok(()) => {
+                    info!(%id, "download completed");
                     // Финальный Progress — «100%».
                     emit_progress(
                         &events_tx,
@@ -473,6 +489,7 @@ async fn run_engine<S, F>(
                     let _ = events_tx.send(DownloadEvent::Completed { id });
                 }
                 Err(e) => {
+                    warn!(%id, error = %e, "finalize failed");
                     emit_state(&events_tx, id, DownloadState::Failed);
                     let _ = events_tx.send(DownloadEvent::Failed {
                         id,
@@ -482,10 +499,12 @@ async fn run_engine<S, F>(
             }
         }
         Outcome::Failed(err) => {
+            warn!(%id, error = %err, "download failed");
             emit_state(&events_tx, id, DownloadState::Failed);
             let _ = events_tx.send(DownloadEvent::Failed { id, error: err });
         }
         Outcome::Cancelled => {
+            info!(%id, "download cancelled — aborting storage");
             let _ = storage.abort().await;
             emit_state(&events_tx, id, DownloadState::Cancelled);
         }
@@ -582,11 +601,13 @@ async fn worker_range<S, F>(
         .await
         {
             Ok(()) => {
+                debug!(piece = idx, "piece done");
                 if worker_tx.send(WorkerMsg::PieceDone(idx)).is_err() {
                     return;
                 }
             }
             Err(PieceError::Transient(msg)) | Err(PieceError::Permanent(msg)) => {
+                warn!(piece = idx, error = %msg, "piece failed — stopping worker");
                 let _ = worker_tx.send(WorkerMsg::Failed(msg));
                 return;
             }
@@ -774,16 +795,20 @@ async fn worker_full<S, F>(
             }
         }
 
-        match fetch_full_and_dispatch(
-            &url,
-            piece_size,
-            total_size,
-            storage.as_ref(),
-            fetch.as_ref(),
-            &bytes_done,
-        )
-        .await
-        {
+        let result = tokio::select! {
+            biased;
+            // Cancellation mid-stream: drop the future to abort the in-flight request.
+            _ = state_rx.wait_for(|s| matches!(s, RunState::Stopping)) => return,
+            r = fetch_full_and_dispatch(
+                &url,
+                piece_size,
+                total_size,
+                storage.as_ref(),
+                fetch.as_ref(),
+                &bytes_done,
+            ) => r,
+        };
+        match result {
             Ok(pieces_done) => {
                 for idx in pieces_done {
                     if worker_tx.send(WorkerMsg::PieceDone(idx)).is_err() {

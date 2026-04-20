@@ -1,3 +1,5 @@
+brook.yaml
+
 # Rust
 /target/
 **/target/

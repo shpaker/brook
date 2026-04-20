@@ -229,27 +229,27 @@
 Рефлексия не включена — везде `-proto proto/brook/v1/brook.proto -import-path proto`.
 
 Happy-path lifecycle:
-- [ ] `List` на пустом состоянии → `{}` (пустой `downloads`)
-- [ ] `Add` с валидным `spec` (url=httpbin, target_dir=/tmp, workers=2) → возвращает `DownloadId`
-- [ ] `List` после `Add` → элемент в состоянии `QUEUED`/`RUNNING`
-- [ ] `Watch` параллельно → initial `Snapshot` + `Progress`/`StateChanged`/`Completed`
-- [ ] `Pause` активного → `StatusResponse{ok:true}`, в `Watch` — `StateChanged(PAUSED)`
-- [ ] `Resume` → `StateChanged(RUNNING)`
-- [ ] `Cancel` → `StateChanged(CANCELLED)`, файл очищен
-- [ ] `Remove` после терминального состояния → успех, `List` снова пуст
+- [x] `List` на пустом состоянии → `{}` (пустой `downloads`)
+- [x] `Add` с валидным `spec` (url=httpbin, target_dir=/tmp, workers=2) → возвращает `DownloadId`
+- [x] `List` после `Add` → элемент в состоянии `QUEUED`/`RUNNING`
+- [x] `Watch` параллельно → initial `Snapshot` + `Progress`/`StateChanged`/`Completed`
+- [x] `Pause` активного → `StatusResponse{ok:true}`, в `Watch` — `StateChanged(PAUSED)`
+- [x] `Resume` → `StateChanged(RUNNING)`
+- [x] `Cancel` → `StateChanged(CANCELLED)`, файл очищен
+- [x] `Remove` после терминального состояния → успех, `List` снова пуст
 
 Валидация и ошибки (маппинг в [mapper.rs](../crates/brook-api/src/mapper.rs)):
-- [ ] `Add` с пустым `url` → `InvalidArgument`
-- [ ] `Add` с пустым `target_dir` → `InvalidArgument`
-- [ ] `Pause`/`Resume`/`Cancel`/`Remove` без `id` → `InvalidArgument`
-- [ ] те же RPC с невалидным UUID (`"not-a-uuid"`) → `InvalidArgument`
-- [ ] `Pause` несуществующего UUID → `NotFound`
-- [ ] `Remove` активной загрузки → `FailedPrecondition` (сообщение про `active`)
+- [x] `Add` с пустым `url` → `InvalidArgument`
+- [x] `Add` с пустым `target_dir` → `InvalidArgument`
+- [x] `Pause`/`Resume`/`Cancel`/`Remove` без `id` → `InvalidArgument`
+- [x] те же RPC с невалидным UUID (`"not-a-uuid"`) → `InvalidArgument`
+- [x] `Pause` несуществующего UUID → `NotFound`
+- [x] `Remove` активной загрузки → `FailedPrecondition` (сообщение про `active`)
 
 Bulk-операции:
-- [ ] Запустить 3 загрузки → `PauseAll` → все уходят в `PAUSED`, `Watch` шлёт 3× `StateChanged`
-- [ ] `ResumeAll` → все возвращаются в `RUNNING`/`QUEUED`
-- [ ] `List` после bulk-операций → состояния консистентны
+- [x] Запустить 3 загрузки → `PauseAll` → все уходят в `PAUSED`, `Watch` шлёт 3× `StateChanged`
+- [x] `ResumeAll` → все возвращаются в `RUNNING`/`QUEUED`
+- [x] `List` после bulk-операций → состояния консистентны
 
 ## 6. `brook-tui` (ratatui-клиент, бинарь `brook`)
 
