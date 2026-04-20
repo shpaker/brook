@@ -15,9 +15,10 @@ brook/                            # workspace root
 │   └── brook/v1/brook.proto      # единый источник правды контракта API
 ├── crates/
 │   ├── brook-proto/              # build.rs → prost + tonic stubs
-│   ├── brook-core/               # гексагональное ядро: domain + ports (+ services)
+│   ├── brook-core/               # гексагональное ядро: domain + ports (+ services); без сети и диска
+│   ├── brook-http/               # HTTP-адаптер: reqwest + middleware, реализует HTTP-порты ядра
 │   ├── brook-api/                # gRPC-сервер (tonic), обёртка над core
-│   ├── brookd/                   # MVP-бинарь: демон, поднимает core + api
+│   ├── brookd/                   # MVP-бинарь: демон, поднимает core + api + адаптеры
 │   └── brook-tui/                # MVP-бинарь: ratatui gRPC-клиент (имя бинаря — `brook`)
 └── docs/
 ```
@@ -48,11 +49,11 @@ brook/                            # workspace root
 Ядро следует паттерну **Hexagonal Architecture** (он же Ports & Adapters). Граница «чистое/грязное» совпадает с границей крейта: всё, что внутри `brook-core`, не знает про сеть, диск и ОС; всё, что снаружи, — знает.
 
 - **Domain** — сущности и value-объекты: идентификатор загрузки, спецификация задачи (url, target_dir, воркеры), конечный автомат состояний, снимок прогресса, агрегат `Download` (spec + runtime-поля), события от engine к подписчикам и команды от клиента к engine. Это чистые типы без I/O и без зависимостей на внешний мир.
-- **Ports** — трейты, через которые ядро обращается наружу: [`TPieceStorage`](#абстракция-хранилища-tpiecestorage) и `TPieceStorageFactory` для хранения кусков, [`TQueueStore`](#абстракция-очереди-queuestore) для персистентности очереди. Это *outbound*-порты: ядро — клиент (вызывает методы), адаптер — сервер (реализует).
+- **Ports** — трейты, через которые ядро обращается наружу: [`TPieceStorage`](#абстракция-хранилища-tpiecestorage) и `TPieceStorageFactory` для хранения кусков, [`TQueueStore`](#абстракция-очереди-queuestore) для персистентности очереди, `THttpInspect` и `TRangeFetch` для сетевого ввода-вывода. Это *outbound*-порты: ядро — клиент (вызывает методы), адаптер — сервер (реализует).
 - **Services** (появятся на этапе 1.3+) — application-координаторы [`DownloadManager`](#downloadmanager-один-на-процесс) и [`DownloadEngine`](#downloadengine-один-на-загрузку). Используют domain и ports, сами I/O не трогают.
-- **Adapters** живут **вне** `brook-core`: SQLite-реализации (`SqliteTQueueStore`, `LocalPieceStorage`) и HTTP-адаптеры — в `brookd`; gRPC-адаптер — в `brook-api`. Тестовые in-memory адаптеры (`MemoryTQueueStore`, `MemoryPieceStorage`) — в test utils самого `brook-core`, но отдельным модулем, не подмешанным в продовый код.
+- **Adapters** живут **вне** `brook-core`: SQLite-реализации (`SqliteTQueueStore`, `LocalPieceStorage`) — в `brookd`; HTTP-адаптер (`HttpInspectClient`, `RangeFetchClient`) — в отдельном крейте `brook-http`, `brookd` подключает его как зависимость; gRPC-адаптер — в `brook-api`. Тестовые in-memory адаптеры (`MemoryTQueueStore`, `MemoryPieceStorage`) — в test utils самого `brook-core`, но отдельным модулем, не подмешанным в продовый код.
 
-Что это даёт: ядро тестируется без сети и без диска (порты подменяются in-memory реализациями); смена бэкенда хранилища не требует изменений в ядре; статическая гарантия — если файл лежит в `brook-core`, у него нет зависимости на `rusqlite` или `reqwest`.
+Что это даёт: ядро тестируется без сети и без диска (порты подменяются in-memory или `wiremock`-адаптерами); смена бэкенда хранилища или HTTP-клиента не требует изменений в ядре; статическая гарантия — если файл лежит в `brook-core`, у него нет зависимости на `rusqlite` или `reqwest` (проверяется через `cargo tree -p brook-core`).
 
 ## Модель акторов в `brook-core`
 

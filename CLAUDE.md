@@ -2,7 +2,7 @@
 
 ## 0. Workspace
 
-**brook** is a macOS download manager: Rust async core (`brook-core`), gRPC API (`brook-api`), daemon (`brookd`), and ratatui TUI client (`brook`). Architecture: [docs/architecture.md](docs/architecture.md). Stack: [docs/stack.md](docs/stack.md).
+**brook** is a macOS download manager: Rust async core (`brook-core`), HTTP adapter (`brook-http`), gRPC API (`brook-api`), daemon (`brookd`), and ratatui TUI client (`brook`). Architecture: [docs/architecture.md](docs/architecture.md). Stack: [docs/stack.md](docs/stack.md).
 
 ### Crate layout
 
@@ -12,9 +12,10 @@ brook/
 ├── proto/brook/v1/brook.proto    # single source of truth for the API contract
 ├── crates/
 │   ├── brook-proto/              # build.rs → prost + tonic stubs
-│   ├── brook-core/               # hexagonal core: domain + ports (+ services)
+│   ├── brook-core/               # hexagonal core: domain + ports (+ services); no network, no disk
+│   ├── brook-http/               # HTTP adapter: reqwest + middleware, impls core's HTTP ports
 │   ├── brook-api/                # gRPC server (tonic), thin wrapper over core
-│   ├── brookd/                   # daemon binary: boots core + api, holds .brook.lock
+│   ├── brookd/                   # daemon binary: boots core + api + adapters, holds .brook.lock
 │   └── brook-tui/                # TUI binary (name: brook): ratatui gRPC client
 └── docs/
 ```
@@ -62,7 +63,7 @@ Per-download artefacts live next to the target file: `<name>.data.brook` (preall
 ## Coding conventions
 
 - **Trait names** — prefix with `T`: `TPieceStorage`, `TQueueStore`, `TPieceStorageFactory`. Applies to all traits in every crate of this workspace.
-- **`brook-core` layout — Hexagonal (Ports & Adapters).** New domain types go into `crates/brook-core/src/domain/` (pure, no I/O, no external-world dependencies). New outbound traits — into `crates/brook-core/src/ports/`. Application services (coordinators like `DownloadManager`, `DownloadEngine`) — into `crates/brook-core/src/service/` (to be created at stage 1.3). Concrete adapters (SQLite, HTTP clients, gRPC) **never** live in `brook-core` — they belong in `brookd`, `brook-api`, or dedicated adapter crates. The public API of `brook-core` stays flat (`brook_core::DownloadId`, `brook_core::TPieceStorage`) — internal folders exist to keep layers from mixing, not to nest the API.
+- **`brook-core` layout — Hexagonal (Ports & Adapters).** New domain types go into `crates/brook-core/src/domain/` (pure, no I/O, no external-world dependencies). New outbound traits — into `crates/brook-core/src/ports/`. Application services (coordinators like `DownloadManager`, `DownloadEngine`) — into `crates/brook-core/src/service/` (to be created at stage 1.3). Concrete adapters (SQLite, HTTP clients, gRPC) **never** live in `brook-core` — they belong in `brookd`, `brook-http`, `brook-api`, or other dedicated adapter crates. `brook-core` must not depend on `reqwest`, `rusqlite`, or any other I/O library; enforced by `cargo tree -p brook-core`. The public API of `brook-core` stays flat (`brook_core::DownloadId`, `brook_core::TPieceStorage`) — internal folders exist to keep layers from mixing, not to nest the API.
 - **DB access — only through repository structs.** Any SQLite manipulation (`brook.db`, `.index.brook`) lives inside a dedicated repository struct. SQL strings and `rusqlite::Connection` usage never leak past the repository boundary — callers get domain methods, not queries.
 
 ## Formatting (Rust)

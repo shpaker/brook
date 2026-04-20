@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 brook-core = { path = "../brook-core" }
+brook-http = { path = "../brook-http" }
 brook-api  = { path = "../brook-api" }
 tokio      = { workspace = true }
 rusqlite   = { workspace = true }
