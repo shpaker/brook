@@ -58,17 +58,17 @@
 - [x] Гарантия hex-arch: `cargo tree -p brook-core | grep reqwest` — пусто
 
 ### 1.5 Retry-политика
-- [ ] `RetryPolicy`: экспо-бэкофф `1s × 2^attempt` + jitter ±20 %, max delay 60 s, max 10 попыток
-- [ ] Классификация через `is_transient()` из 1.4 (транзиентные → ретрай, остальные → fail fast)
-- [ ] Crash-loop guard: 5 одинаковых ошибок подряд → `FAILED`
-- [ ] Юнит-тесты на расчёт задержек и trigger crash-loop
+- [x] `RetryPolicy`: экспо-бэкофф `1s × 2^attempt` + jitter ±20 %, max delay 60 s, max 10 попыток
+- [x] Классификация через `is_transient()` из 1.4 (транзиентные → ретрай, остальные → fail fast)
+- [x] Crash-loop guard: 5 одинаковых ошибок подряд → `FAILED`
+- [x] Юнит-тесты на расчёт задержек и trigger crash-loop
 
 ### 1.6 Пре-аллокация и нарезка (`LocalPieceStorage`)
 - [ ] Крейт-локация: `LocalPieceStorage` в `brookd` (реализация `TPieceStorage`)
 - [ ] `statvfs`-проверка свободного места на целевой ФС
 - [ ] `F_PREALLOCATE` + `ftruncate` для `<filename>.data.brook`
 - [ ] Path-traversal защита: целевой путь под `default_dir` или абсолютный
-- [ ] Выбор `piece_size` 1–4 MB по общему размеру файла
+- [ ] Выбор `piece_size`: `clamp(next_pow2(size / piece_target_count), piece_size_min, piece_size_max)`, дефолты 128 / 16 MiB / 128 MiB; границы читаются из `settings`; запись в `meta` `.index.brook` при создании загрузки
 - [ ] Расчёт offset'ов и числа кусков
 - [ ] Тест: пре-аллокация 100 MB файла, проверка размера
 

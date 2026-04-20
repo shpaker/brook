@@ -1,0 +1,13 @@
+//! Application-services ядра — координаторы между доменными типами и портами.
+//!
+//! Сейчас здесь живёт только чистая доменная логика без I/O. Большие сервисы
+//! (`DownloadEngine`, `DownloadManager`) появятся на этапах 1.10–1.13.
+
+mod retry;
+
+pub use retry::{
+    CrashLoopGuard,
+    CrashLoopState,
+    RetryDecision,
+    RetryPolicy,
+};
