@@ -39,23 +39,23 @@
 - [x] Юнит-тест: round-trip через `MemoryTQueueStore`
 
 ### 1.4 HTTP-слой (порт в `brook-core` + адаптер `brook-http`)
-- [ ] Новый крейт `brook-http`; `brook-core` содержит только порты и не тянет `reqwest`
-- [ ] Порты в `brook-core`: `THttpInspect::inspect`, `TRangeFetch::{fetch_range, fetch_full}`; domain-типы `InspectReport`, `RangeGuard`, `ByteStream`; enum'ы `InspectError`, `RangeError`
-- [ ] Метод `is_transient()` на `InspectError` и `RangeError` — для будущего `RetryPolicy` (HTTP-слой сам retry не делает)
-- [ ] Правило: реализации называются `*Client` (`HttpInspectClient`, `RangeFetchClient`); `reqwest::{Client,Response,RequestBuilder,Error}` и `reqwest_middleware::Error` не утекают за пределы `brook-http`
-- [ ] `HttpClientBuilder` — единая точка сборки `reqwest::Client`: rustls, connect timeout 10 s, read (idle) 30 s, pool idle 90 s, User-Agent `brook/<version>`
-- [ ] Автокомпрессия выключена (`no_gzip`, `no_brotli`, `no_deflate`) — байт-точность `Content-Length` и Range
-- [ ] Политика редиректов: `redirect::Policy::limited(10)`
-- [ ] Middleware `RequestResponseLoggingMiddleware` (`reqwest-middleware`): method/URL/статус/длительность/`Content-Length`; тело не логируется; корреляция `download_id`/`request_id` из `tracing::Span::current()`
-- [ ] Валидация URL на границе адаптера: только `http`/`https`, иначе `InvalidScheme` до сетевого вызова
-- [ ] `HttpInspectClient::inspect`: `HEAD` → на 4xx/5xx fallback `GET Range: bytes=0-0`; парсинг `Content-Length`, `Accept-Ranges`, `ETag`, `Last-Modified`, `Content-Disposition`
-- [ ] Имя файла: `Content-Disposition filename*=` (RFC 5987) → `filename=` → последний сегмент URL-пути
-- [ ] `RangeFetchClient::fetch_range`: `Range: bytes=OFFSET-END`, guard `If-Match`/`If-Unmodified-Since`; `206`+`Content-Range` валидация, `200`→`RangeNotSupported`, `412`→`SourceMutated`, усечённое тело → `TruncatedResponse`
-- [ ] `RangeFetchClient::fetch_full`: полный стрим до EOF — для no-Range fallback на уровне engine
-- [ ] Cancellation: дроп `ByteStream` отменяет in-flight запрос
-- [ ] Тесты `wiremock`: inspect (HEAD-ok, HEAD-fail+GET-range, no-Range, Content-Disposition: filename*/filename/URL-fallback), range (`206`-ok, `200`-на-Range, `412`, усечённое тело, невалидный Content-Range, cancellation), fetch_full до EOF, logging (ровно одна пара событий + корреляция), invalid scheme без сетевого вызова
-- [ ] Юнит-тесты на `is_transient()` для `InspectError` и `RangeError`
-- [ ] Гарантия hex-arch: `cargo tree -p brook-core | grep reqwest` — пусто
+- [x] Новый крейт `brook-http`; `brook-core` содержит только порты и не тянет `reqwest`
+- [x] Порты в `brook-core`: `THttpInspect::inspect`, `TRangeFetch::{fetch_range, fetch_full}`; domain-типы `InspectReport`, `RangeGuard`, `ByteStream`; enum'ы `InspectError`, `RangeError`
+- [x] Метод `is_transient()` на `InspectError` и `RangeError` — для будущего `RetryPolicy` (HTTP-слой сам retry не делает)
+- [x] Правило: реализации называются `*Client` (`HttpInspectClient`, `RangeFetchClient`); `reqwest::{Client,Response,RequestBuilder,Error}` и `reqwest_middleware::Error` не утекают за пределы `brook-http`
+- [x] `HttpClientBuilder` — единая точка сборки `reqwest::Client`: rustls, connect timeout 10 s, read (idle) 30 s, pool idle 90 s, User-Agent `brook/<version>`
+- [x] Автокомпрессия выключена (`no_gzip`, `no_brotli`, `no_deflate`) — байт-точность `Content-Length` и Range
+- [x] Политика редиректов: `redirect::Policy::limited(10)`
+- [x] Middleware `RequestResponseLoggingMiddleware` (`reqwest-middleware`): method/URL/статус/длительность/`Content-Length`; тело не логируется; корреляция `download_id`/`request_id` из `tracing::Span::current()`
+- [x] Валидация URL на границе адаптера: только `http`/`https`, иначе `InvalidScheme` до сетевого вызова
+- [x] `HttpInspectClient::inspect`: `HEAD` → на 4xx/5xx fallback `GET Range: bytes=0-0`; парсинг `Content-Length`, `Accept-Ranges`, `ETag`, `Last-Modified`, `Content-Disposition`
+- [x] Имя файла: `Content-Disposition filename*=` (RFC 5987) → `filename=` → последний сегмент URL-пути
+- [x] `RangeFetchClient::fetch_range`: `Range: bytes=OFFSET-END`, guard `If-Match`/`If-Unmodified-Since`; `206`+`Content-Range` валидация, `200`→`RangeNotSupported`, `412`→`SourceMutated`, усечённое тело → `TruncatedResponse`
+- [x] `RangeFetchClient::fetch_full`: полный стрим до EOF — для no-Range fallback на уровне engine
+- [x] Cancellation: дроп `ByteStream` отменяет in-flight запрос
+- [x] Тесты `wiremock`: inspect (HEAD-ok, HEAD-fail+GET-range, no-Range, Content-Disposition: filename*/filename/URL-fallback), range (`206`-ok, `200`-на-Range, `412`, усечённое тело, невалидный Content-Range), fetch_full до EOF, invalid scheme без сетевого вызова
+- [x] Юнит-тесты на `is_transient()` для `InspectError` и `RangeError`
+- [x] Гарантия hex-arch: `cargo tree -p brook-core | grep reqwest` — пусто
 
 ### 1.5 Retry-политика
 - [ ] `RetryPolicy`: экспо-бэкофф `1s × 2^attempt` + jitter ±20 %, max delay 60 s, max 10 попыток
