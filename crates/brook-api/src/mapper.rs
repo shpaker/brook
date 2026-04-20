@@ -67,6 +67,9 @@ pub fn spec_from_proto(s: proto::DownloadSpec) -> Result<DownloadSpec, Status> {
         target_dir: PathBuf::from(s.target_dir),
         filename,
         workers,
+        piece_target_count: s.piece_target_count,
+        piece_size_min: s.piece_size_min,
+        piece_size_max: s.piece_size_max,
     })
 }
 
@@ -78,6 +81,9 @@ pub fn spec_to_proto(s: &DownloadSpec) -> proto::DownloadSpec {
         target_dir: s.target_dir.to_string_lossy().into_owned(),
         filename: s.filename.clone(),
         workers: s.workers,
+        piece_target_count: s.piece_target_count,
+        piece_size_min: s.piece_size_min,
+        piece_size_max: s.piece_size_max,
     }
 }
 
@@ -247,8 +253,8 @@ mod tests {
         let p = proto::DownloadSpec {
             url: "https://example.com/f".into(),
             target_dir: "/tmp".into(),
-            filename: None,
             workers: 0,
+            ..Default::default()
         };
         let s = spec_from_proto(p).unwrap();
         assert_eq!(s.url, "https://example.com/f");
@@ -260,10 +266,9 @@ mod tests {
     #[test]
     fn spec_from_proto_rejects_empty() {
         let p = proto::DownloadSpec {
-            url: String::new(),
             target_dir: "/tmp".into(),
-            filename: None,
             workers: 2,
+            ..Default::default()
         };
         assert_eq!(
             spec_from_proto(p).unwrap_err().code(),
@@ -278,9 +283,45 @@ mod tests {
             target_dir: "/tmp".into(),
             filename: Some(String::new()),
             workers: 1,
+            ..Default::default()
         };
         let s = spec_from_proto(p).unwrap();
         assert_eq!(s.filename, None);
+    }
+
+    #[test]
+    fn spec_piece_overrides_roundtrip() {
+        let p = proto::DownloadSpec {
+            url: "https://x".into(),
+            target_dir: "/tmp".into(),
+            workers: 1,
+            piece_target_count: Some(64),
+            piece_size_min: Some(8 * 1024 * 1024),
+            piece_size_max: Some(256 * 1024 * 1024),
+            ..Default::default()
+        };
+        let s = spec_from_proto(p.clone()).unwrap();
+        assert_eq!(s.piece_target_count, Some(64));
+        assert_eq!(s.piece_size_min, Some(8 * 1024 * 1024));
+        assert_eq!(s.piece_size_max, Some(256 * 1024 * 1024));
+        let back = spec_to_proto(&s);
+        assert_eq!(back.piece_target_count, p.piece_target_count);
+        assert_eq!(back.piece_size_min, p.piece_size_min);
+        assert_eq!(back.piece_size_max, p.piece_size_max);
+    }
+
+    #[test]
+    fn spec_piece_overrides_absent_by_default() {
+        let p = proto::DownloadSpec {
+            url: "https://x".into(),
+            target_dir: "/tmp".into(),
+            workers: 1,
+            ..Default::default()
+        };
+        let s = spec_from_proto(p).unwrap();
+        assert_eq!(s.piece_target_count, None);
+        assert_eq!(s.piece_size_min, None);
+        assert_eq!(s.piece_size_max, None);
     }
 
     #[test]

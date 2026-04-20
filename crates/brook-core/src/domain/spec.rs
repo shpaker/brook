@@ -21,6 +21,13 @@ pub struct DownloadSpec {
     pub filename: Option<String>,
     /// Сколько параллельных воркеров качают piece'ы этой загрузки.
     pub workers: u32,
+    /// Override целевого числа piece'ов на файл. `None` — взять дефолт
+    /// демона (`DownloadDefaults::piece_target_count`).
+    pub piece_target_count: Option<u32>,
+    /// Override нижней границы `piece_size` в байтах. `None` — дефолт.
+    pub piece_size_min: Option<u64>,
+    /// Override верхней границы `piece_size` в байтах. `None` — дефолт.
+    pub piece_size_max: Option<u64>,
 }
 
 impl DownloadSpec {
@@ -36,6 +43,9 @@ impl DownloadSpec {
             target_dir: target_dir.into(),
             filename: None,
             workers: default_workers(),
+            piece_target_count: None,
+            piece_size_min: None,
+            piece_size_max: None,
         }
     }
 }

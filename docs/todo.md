@@ -160,23 +160,26 @@
 - [x] Tracing: root-span на запрос, наследование в core
 - [x] Интеграционный тест: client ↔ server в одном процессе, все методы
 
-## 3. Конфигурация (`settings` в `brook.db`)
+## 3. Конфигурация (YAML, `./brook.yaml`)
 
-### 3.1 `SettingsRepository`
-- [ ] Миграция: `CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`
-- [ ] `SettingsRepository::open(conn)` — open/migrate
-- [ ] `SettingsRepository::seed_defaults` — вставка дефолтов при пустой таблице
-- [ ] `SettingsRepository::load_all -> HashMap<String, String>`
-- [ ] SQL-строки и `Connection` не покидают модуль
-- [ ] Юнит-тесты на миграцию, seed, load
+### 3.1 Типы и парсер
+- [x] `crates/brookd/src/config.rs`: структуры `Settings`, `DownloadSection`, `ApiSection`, `LogSection` с `serde(default)`
+- [x] Enum'ы `OnDuplicateUrl` / `OnFileExists` (`ask`/`skip`/`add`, `ask`/`rename`/`overwrite`), `serde(rename_all = "lowercase")`
+- [x] `Settings::load(path) -> Result<Settings, ConfigError>` — serde_yaml + валидация
+- [x] `Settings::write_default(path)` — YAML-шаблон с комментариями
+- [x] `Settings::load_or_init(path)` — создать файл при первом старте, прочитать на втором
+- [x] `deny_unknown_fields` — неизвестный ключ = ошибка парса (опечатки не проходят молча)
+- [x] Валидация: `pow2` для piece-границ, `min ≤ max`, `default_workers ≤ max_workers`, `api.bind` как валидный `IpAddr`
+- [x] Раскрытие `~` в путях через `directories::BaseDirs::home_dir`
+- [x] Юнит-тесты: дефолты валидны, partial-секции fill'ятся дефолтами, неизвестный ключ отклоняется, битое значение → `ConfigError` с именем ключа, запись дефолтного файла + обратный парс, `load_or_init` идемпотентен
 
-### 3.2 Типизация и применение
-- [ ] Структура `Settings` с типизированными полями (ключи — [architecture.md#конфигурация](architecture.md#конфигурация))
-- [ ] Парсер: `HashMap<String, String> → Result<Settings, InvalidKeyError>`
-- [ ] Invalid value → ошибка старта `brookd` с именем ключа в сообщении
-- [ ] Unknown key → `tracing::warn!` и игнор
-- [ ] `Settings` передаётся в `DownloadManager` и `brook-api` при старте
-- [ ] Юнит-тест: все дефолты парсятся валидно
+### 3.2 Проекции и override'ы нарезки
+- [x] `DaemonRuntime` (global-only) и `DownloadDefaults` (per-download defaults) как отдельные проекции
+- [x] `DaemonRuntime::from_settings` — раскрытие `~` и перевод MiB → байты
+- [x] `DownloadSpec` (proto + core): optional `piece_target_count`, `piece_size_min`, `piece_size_max`
+- [x] Маппер `brook-api`: round-trip новых полей
+- [x] `effective_plan_config(spec, defaults) -> Result<PiecePlanConfig, PlanConfigError>` в `storage::plan` — применение override'ов и валидация
+- [x] Юнит-тесты: override побеждает default, невалидный override → ошибка, отсутствие override → fallback на defaults
 
 ## 4. `brookd` (демон)
 
@@ -190,9 +193,10 @@
 - [ ] Юнит-тесты на каждый метод
 
 ### 4.2 Бинарь
-- [ ] `tokio::main`; порядок: lock → БД → миграции → settings → core → api
+- [ ] `tokio::main`; порядок: lock → `brook.yaml` → БД → миграции → core → api
 - [ ] Single-instance: `flock(LOCK_EX | LOCK_NB)` на `.brook.lock` в CWD; вторая копия → exit 1 с сообщением
-- [ ] Открытие `./brook.db` + прогон миграций (settings, downloads)
+- [ ] `Settings::load_or_init("./brook.yaml")` → `DaemonRuntime` + `DownloadDefaults`
+- [ ] Открытие `./brook.db` + прогон миграций (downloads)
 - [ ] `brookd` передаёт `SqliteQueueRepository` и `LocalPieceStorageFactory` в `DownloadManager`
 - [ ] Запуск `DownloadManager` + gRPC-сервера как двух `tokio::spawn`-задач
 - [ ] `session_id` xid — root-span
