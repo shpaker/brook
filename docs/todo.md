@@ -206,6 +206,34 @@
 - [ ] Шаг 5: отпустить `.brook.lock`, exit 0
 - [ ] Интеграционный тест: SIGTERM на живой загрузке → ресюм после рестарта
 
+### 4.4 gRPC smoke-прогон через grpcurl
+Ручная проверка контракта после того, как `brookd` начал слушать порт.
+Бэкенд — реальные адаптеры (`SqliteQueueRepository` + `LocalPieceStorageFactory` + `brook-http`), источник — `https://httpbin.org/bytes/<N>`.
+Рефлексия не включена — везде `-proto proto/brook/v1/brook.proto -import-path proto`.
+
+Happy-path lifecycle:
+- [ ] `List` на пустом состоянии → `{}` (пустой `downloads`)
+- [ ] `Add` с валидным `spec` (url=httpbin, target_dir=/tmp, workers=2) → возвращает `DownloadId`
+- [ ] `List` после `Add` → элемент в состоянии `QUEUED`/`RUNNING`
+- [ ] `Watch` параллельно → initial `Snapshot` + `Progress`/`StateChanged`/`Completed`
+- [ ] `Pause` активного → `StatusResponse{ok:true}`, в `Watch` — `StateChanged(PAUSED)`
+- [ ] `Resume` → `StateChanged(RUNNING)`
+- [ ] `Cancel` → `StateChanged(CANCELLED)`, файл очищен
+- [ ] `Remove` после терминального состояния → успех, `List` снова пуст
+
+Валидация и ошибки (маппинг в [mapper.rs](../crates/brook-api/src/mapper.rs)):
+- [ ] `Add` с пустым `url` → `InvalidArgument`
+- [ ] `Add` с пустым `target_dir` → `InvalidArgument`
+- [ ] `Pause`/`Resume`/`Cancel`/`Remove` без `id` → `InvalidArgument`
+- [ ] те же RPC с невалидным UUID (`"not-a-uuid"`) → `InvalidArgument`
+- [ ] `Pause` несуществующего UUID → `NotFound`
+- [ ] `Remove` активной загрузки → `FailedPrecondition` (сообщение про `active`)
+
+Bulk-операции:
+- [ ] Запустить 3 загрузки → `PauseAll` → все уходят в `PAUSED`, `Watch` шлёт 3× `StateChanged`
+- [ ] `ResumeAll` → все возвращаются в `RUNNING`/`QUEUED`
+- [ ] `List` после bulk-операций → состояния консистентны
+
 ## 5. `brook-tui` (ratatui-клиент, бинарь `brook`)
 
 ### 5.1 Каркас клиента
