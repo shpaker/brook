@@ -22,15 +22,30 @@ brook/
 
 ### Key commands
 
+Все рутинные команды проекта живут в [justfile](justfile). Агент обязан
+вызывать `just`, а не голые `cargo fmt` / `cargo clippy` / `cargo test` —
+justfile знает про nightly-rustfmt, правильные флаги clippy и состав
+проверок. Голый `cargo` допустим только когда нужного рецепта в `just`
+нет.
+
 ```sh
-cargo build                  # build all crates
-cargo build -p brookd        # build daemon
-cargo build -p brook-tui     # build TUI client
-cargo run -p brookd          # run the daemon (CWD is the working directory)
-cargo run -p brook-tui       # run the TUI client
-cargo test                   # run all tests
-cargo test -p brook-core     # core unit + integration tests (no network)
+just                         # список доступных рецептов
+just build                   # сборка всего workspace
+just run-d                   # запустить brookd (CWD = рабочая директория)
+just run-tui                 # запустить TUI-клиент
+just test                    # все тесты
+just test-p brook-core       # тесты одного крейта
+just fmt                     # nightly cargo fmt --all
+just fmt-check               # проверка форматирования без правок
+just clippy                  # clippy --all-targets -- -D warnings
+just check                   # fmt-check + clippy + test (обязательный gate перед коммитом)
+just fix                     # clippy --fix + fmt
 ```
+
+**Правило для агента**: перед коммитом прогнать `just check`.
+Валидация качества (fmt/clippy/test) всегда через `just`; прямые вызовы
+`cargo fmt`/`cargo clippy` ведут к несогласованным флагам и срабатывают
+не с тем rustfmt-тулчейном.
 
 ### Runtime artifacts in CWD
 
@@ -70,7 +85,7 @@ Per-download artefacts live next to the target file: `<name>.data.brook` (preall
 
 ## Formatting (Rust)
 
-Конфиг — [rustfmt.toml](rustfmt.toml). Автоформат: `cargo +nightly fmt` (часть опций — nightly-only).
+Конфиг — [rustfmt.toml](rustfmt.toml). Автоформат — `just fmt` (часть опций nightly-only, рецепт сам подтягивает nightly-rustfmt через `rustup which`; прямой `cargo +nightly fmt` через rustup-proxy обычно резолвится в stable и теряет unstable-правила).
 
 Жёсткие правила, которые должны соблюдаться даже при ручной правке:
 
@@ -87,7 +102,7 @@ Per-download artefacts live next to the target file: `<name>.data.brook` (preall
 - **`max_width = 100`**, отступ — 4 пробела, переводы строк — `LF`.
 - **Edition 2024** на весь workspace.
 - **Никаких `use foo::bar::*`** внутри функций/модулей (только в явных фасадах, см. выше) — конкретные имена в импортах читаются лучше.
-- Перед коммитом прогонять `cargo +nightly fmt --all` и `cargo clippy --all-targets -- -D warnings`.
+- Перед коммитом прогонять `just check` (он запускает `fmt-check` + `clippy` + `test`).
 
 ## Docs
 
