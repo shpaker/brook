@@ -160,6 +160,29 @@ impl PieceIndexRepository {
         Ok(())
     }
 
+    /// Все piece'ы раскладки, независимо от статуса — упорядочены по `idx`.
+    ///
+    /// Нужно для `LocalPieceStorage::open` при resume-ветке: чтобы
+    /// восстановить карту `piece_index → offset/size` для всех кусков,
+    /// включая уже закоммиченные.
+    pub fn all_pieces(&self) -> IndexResult<Vec<PieceLayout>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT idx, offset, size FROM pieces ORDER BY idx")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PieceLayout {
+                idx: row.get::<_, i64>(0)? as u32,
+                offset: row.get::<_, i64>(1)? as u64,
+                size: row.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Piece'ы, которые ещё не скачаны — упорядочены по `idx`.
     pub fn pending_pieces(&self) -> IndexResult<Vec<PieceLayout>> {
         let mut stmt = self.conn.prepare(
@@ -351,6 +374,18 @@ mod tests {
             repo.meta_get("etag").unwrap().as_deref(),
             Some("\"def456\"")
         );
+    }
+
+    #[test]
+    fn all_pieces_returns_every_row_regardless_of_status() {
+        let (_d, mut repo) = open_fresh();
+        repo.init("https://x", 250, 100, &sample_pieces()).unwrap();
+        repo.commit_done_batch(&[0, 2]).unwrap();
+        let all = repo.all_pieces().unwrap();
+        assert_eq!(all, sample_pieces());
+        // pending отдаёт только незавершённые, all_pieces — все.
+        assert_eq!(repo.pending_pieces().unwrap().len(), 1);
+        assert_eq!(all.len(), 3);
     }
 
     #[test]

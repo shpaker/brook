@@ -6,5 +6,6 @@
 
 pub mod fs;
 pub mod index;
+pub mod local;
 pub mod paths;
 pub mod plan;
