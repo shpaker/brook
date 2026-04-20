@@ -264,43 +264,43 @@ Bulk-операции:
 - [x] Юнит-тесты на фабрику: override=RENAME при существующем файле подбирает имя, override=OVERWRITE перезаписывает, override=UNSPECIFIED → `FileExists`
 
 ### 6.1 Каркас клиента
-- [ ] `brook-tui/Cargo.toml`: `ratatui`, `crossterm`, `tokio`, `tonic`, `brook-proto`, `anyhow`, `clap` (для `--port`)
-- [ ] `main`: парсинг `--port` (дефолт 7090) через `clap`
-- [ ] `tonic::Channel` на `127.0.0.1:<port>`; при недоступности — сообщение в stderr + exit 1 (до входа в alternate screen)
-- [ ] Раскладка через `Layout::vertical([Length(2), Min(0), Length(5), Length(1)])`; `detail` автоскрывается при высоте < 20
-- [ ] Enter/exit alternate screen, `enable_raw_mode` / `disable_raw_mode` с RAII-guard'ом (восстановление терминала на panic)
-- [ ] `q` закрывает клиент; демон не трогается
-- [ ] Минимальный терминал 60×15 — заглушка «brook needs at least 60×15» вместо рендера
+- [x] `brook-tui/Cargo.toml`: `ratatui`, `crossterm`, `tokio`, `tonic`, `brook-proto`, `anyhow`, `clap` (для `--port`)
+- [x] `main`: парсинг `--port` (дефолт 7090) через `clap`
+- [x] `tonic::Channel` на `127.0.0.1:<port>`; при недоступности — сообщение в stderr + exit 1 (до входа в alternate screen)
+- [x] Раскладка через `Layout::vertical([Length(2), Min(0), Length(5), Length(1)])`; `detail` автоскрывается при высоте < 20
+- [x] Enter/exit alternate screen, `enable_raw_mode` / `disable_raw_mode` с RAII-guard'ом (восстановление терминала на panic)
+- [x] `q` закрывает клиент; демон не трогается
+- [x] Минимальный терминал 60×15 — заглушка «brook needs at least 60×15» вместо рендера
 
 ### 6.2 Watch, ViewModel, реконнект
-- [ ] Структура `ViewModel { downloads: IndexMap<DownloadId, DownloadRow>, cursor, marked, anchor, mode, detail_visible, connection, toast }`
-- [ ] Enum `UiEvent { Key, Resize, Paste, Stream(StreamEvent), StreamLagged, StreamDisconnected, StreamConnected, CmdResult, Tick }`
-- [ ] Input-task: блокирующий `crossterm::event::read` → `mpsc<UiEvent>`
-- [ ] Watch-task: `BrookServiceClient::watch` → конвертит proto-события в `UiEvent::Stream`; при обрыве backoff 1s/2s/4s/...60s и reconnect
-- [ ] При реконнекте — полный сброс `downloads` и заливка из initial `Snapshot`'ов
-- [ ] Мутация `ViewModel` — только в UI-task
-- [ ] Tick 250 мс — пересчёт «относительного» ETA, истечение toast'ов
-- [ ] Команды (`Add`, `Pause`, ...) — `tokio::spawn`, результат как `UiEvent::CmdResult`, ошибки toast'ом
-- [ ] Сортировка: `RUNNING → RETRYING → QUEUED → PAUSED → DONE → FAILED`, `CANCELLED` скрывается; внутри — `updated_at desc`
+- [x] Структура `ViewModel { downloads: IndexMap<DownloadId, DownloadRow>, cursor, marked, anchor, mode, detail_visible, connection, toast }`
+- [x] Enum `UiEvent { Key, Resize, Paste, Stream(StreamEvent), StreamLagged, StreamDisconnected, StreamConnected, CmdResult, Tick }`
+- [x] Input-task: блокирующий `crossterm::event::read` → `mpsc<UiEvent>`
+- [x] Watch-task: `BrookServiceClient::watch` → конвертит proto-события в `UiEvent::Stream`; при обрыве backoff 1s/2s/4s/...60s и reconnect
+- [x] При реконнекте — полный сброс `downloads` и заливка из initial `Snapshot`'ов
+- [x] Мутация `ViewModel` — только в UI-task
+- [x] Tick 250 мс — пересчёт «относительного» ETA, истечение toast'ов
+- [x] Команды (`Add`, `Pause`, ...) — `tokio::spawn`, результат как `UiEvent::CmdResult`, ошибки toast'ом
+- [x] Сортировка: `RUNNING → RETRYING → QUEUED → PAUSED → DONE → FAILED`, `CANCELLED` скрывается; внутри — `updated_at desc`
 
 ### 6.3 Рендер списка и прогресс-бара
-- [ ] Две строки на загрузку + пустая строка-разделитель: шапка (маркеры + имя + правая колонка) + прогресс-бар
-- [ ] Префикс-колонки фиксированной ширины: `[cursor][select][icon]` = 3 символа
-- [ ] Правая колонка фиксированной ширины: `<bytes> / <total> · <speed> · <state/eta>`, поля правоприжаты
-- [ ] Иконки: `▶` RUNNING, `❚❚` PAUSED, `↻` RETRYING, `⏳` QUEUED, `✓` DONE, `✕` FAILED
-- [ ] Главный прогресс-бар — кастомный виджет: done (`█`) + сегменты активных воркеров (цикл палитры по `worker_id % N`) + pending (`░`); под `NO_COLOR` активные → `▓`
-- [ ] Источник сегментов — последний `WorkerUpdate` per-worker в `DownloadRow`
-- [ ] No-Range fallback (`pieces_total = 1`): бар = done + один активный сегмент
-- [ ] `ratatui::Scrollbar` справа области списка, виден только при переполнении; шаг = 1 строка
+- [x] Две строки на загрузку + пустая строка-разделитель: шапка (маркеры + имя + правая колонка) + прогресс-бар
+- [x] Префикс-колонки фиксированной ширины: `[cursor][select][icon]` = 3 символа
+- [x] Правая колонка фиксированной ширины: `<bytes> / <total> · <speed> · <state/eta>`, поля правоприжаты
+- [x] Иконки: `▶` RUNNING, `❚❚` PAUSED, `↻` RETRYING, `⏳` QUEUED, `✓` DONE, `✕` FAILED
+- [x] Главный прогресс-бар — кастомный виджет: done (`█`) + сегменты активных воркеров (цикл палитры по `worker_id % N`) + pending (`░`); под `NO_COLOR` активные → `▓`
+- [x] Источник сегментов — последний `WorkerUpdate` per-worker в `DownloadRow`
+- [x] No-Range fallback (`pieces_total = 1`): бар = done + один активный сегмент
+- [x] `ratatui::Scrollbar` справа области списка, виден только при переполнении; шаг = 1 строка
 
 ### 6.4 Статус-бар, detail-панель, hint-bar
-- [ ] Статус-бар: 2 строки. Строка 1 — `brook · ●/◐/○ 127.0.0.1:<port> [attempt N]`. Строка 2 — `active N/max · [queued K] · [paused K] · [retrying K]                ↓ <speed>`
-- [ ] Нулевые счётчики кроме `active` прячутся; `disconnected` → добавляется `· stale` в хвост
-- [ ] Адаптивное сужение: дропается `brook`, затем скорость переезжает на строку 2, затем скорость совсем исчезает
-- [ ] Detail-панель: 5 строк, `url` / `path` / `pieces`; для FAILED — `error` отдельной строкой
-- [ ] `url` — обрезка `…` по середине; `pieces` — `single-stream (no Range)` в fallback-режиме
-- [ ] Detail прячется при высоте < 20, ручной toggle `Tab`
-- [ ] Hint-bar: `a add · p pause · r resume · c cancel · o open · Tab details · ? help · q`
+- [x] Статус-бар: 2 строки. Строка 1 — `brook · ●/◐/○ 127.0.0.1:<port> [attempt N]`. Строка 2 — `active N/max · [queued K] · [paused K] · [retrying K]                ↓ <speed>`
+- [x] Нулевые счётчики кроме `active` прячутся; `disconnected` → добавляется `· stale` в хвост
+- [x] Адаптивное сужение: дропается `brook`, затем скорость переезжает на строку 2, затем скорость совсем исчезает
+- [x] Detail-панель: 5 строк, `url` / `path` / `pieces`; для FAILED — `error` отдельной строкой
+- [x] `url` — обрезка `…` по середине; `pieces` — `single-stream (no Range)` в fallback-режиме
+- [x] Detail прячется при высоте < 20, ручной toggle `Tab`
+- [x] Hint-bar: `a add · p pause · r resume · c cancel · o open · Tab details · ? help · q`
 
 ### 6.5 Навигация и выделение
 - [ ] `↑↓` / `jk` — курсор по элементам
