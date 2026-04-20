@@ -23,6 +23,9 @@ anyhow     = { workspace = true }
 thiserror  = { workspace = true }
 uuid       = { workspace = true }
 fs4        = { workspace = true }
+serde      = { workspace = true }
+serde_yaml = { workspace = true }
+directories = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

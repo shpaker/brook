@@ -15,23 +15,21 @@
 
 /// Желаемое число piece'ов на загрузку (верхняя оценка).
 ///
-/// TODO(stage 3.x): читать из `settings`; пока хардкод.
+/// Используется только как fallback в юнит-тестах. В рантайме значение
+/// приходит из `DownloadDefaults` (YAML-конфиг) и может быть перекрыто в
+/// `DownloadSpec` конкретной загрузкой — см. [`effective_plan_config`].
 pub const DEFAULT_TARGET_COUNT: u32 = 128;
 
-/// Минимальный размер piece'а — 16 MiB.
-///
-/// TODO(stage 3.x): читать из `settings`; пока хардкод.
+/// Минимальный размер piece'а — 16 MiB. См. примечание у [`DEFAULT_TARGET_COUNT`].
 pub const DEFAULT_PIECE_SIZE_MIN: u64 = 16 * 1024 * 1024;
 
-/// Максимальный размер piece'а — 128 MiB.
-///
-/// TODO(stage 3.x): читать из `settings`; пока хардкод.
+/// Максимальный размер piece'а — 128 MiB. См. примечание у [`DEFAULT_TARGET_COUNT`].
 pub const DEFAULT_PIECE_SIZE_MAX: u64 = 128 * 1024 * 1024;
 
 /// Параметры нарезки.
 ///
-/// Собран отдельной структурой, чтобы позже (этап 3.x) легко подставить
-/// значения из `Settings` — без изменения сигнатуры `plan_pieces`.
+/// В рантайме собирается из `DownloadDefaults` (дефолты демона) и
+/// опциональных override'ов в `DownloadSpec` — см. [`effective_plan_config`].
 #[derive(Debug, Clone, Copy)]
 pub struct PiecePlanConfig {
     pub target_count: u32,
@@ -112,6 +110,66 @@ fn next_pow2_u64(n: u64) -> u64 {
     // None только для очень больших n — тогда отдаём u64::MAX как «заведомо
     // больше max', clamp дальше прижмёт к piece_size_max».
     n.checked_next_power_of_two().unwrap_or(u64::MAX)
+}
+
+// ─── Per-download effective config ──────────────────────────────────────
+
+use brook_core::DownloadSpec;
+use thiserror::Error;
+
+use crate::config::DownloadDefaults;
+
+#[derive(Debug, Error)]
+pub enum PlanConfigError {
+    #[error("invalid {key}: {reason}")]
+    Invalid { key: &'static str, reason: String },
+}
+
+/// Собрать `PiecePlanConfig` для конкретной загрузки.
+///
+/// Берём дефолты из [`DownloadDefaults`] (YAML-конфиг демона) и
+/// перекрываем полями из `spec`, если они `Some`. Валидируем
+/// получившиеся значения в том же месте, где их решают применить:
+/// степень двойки, `min <= max`, `target_count >= 1`.
+pub fn effective_plan_config(
+    spec: &DownloadSpec,
+    defaults: &DownloadDefaults,
+) -> Result<PiecePlanConfig, PlanConfigError> {
+    let target_count = spec
+        .piece_target_count
+        .unwrap_or(defaults.piece_target_count);
+    let piece_size_min = spec.piece_size_min.unwrap_or(defaults.piece_size_min);
+    let piece_size_max = spec.piece_size_max.unwrap_or(defaults.piece_size_max);
+
+    if target_count == 0 {
+        return Err(PlanConfigError::Invalid {
+            key: "piece_target_count",
+            reason: "must be ≥ 1".into(),
+        });
+    }
+    if piece_size_min == 0 || !piece_size_min.is_power_of_two() {
+        return Err(PlanConfigError::Invalid {
+            key: "piece_size_min",
+            reason: format!("{piece_size_min} is not a power of two"),
+        });
+    }
+    if piece_size_max == 0 || !piece_size_max.is_power_of_two() {
+        return Err(PlanConfigError::Invalid {
+            key: "piece_size_max",
+            reason: format!("{piece_size_max} is not a power of two"),
+        });
+    }
+    if piece_size_min > piece_size_max {
+        return Err(PlanConfigError::Invalid {
+            key: "piece_size_min",
+            reason: format!("must be ≤ piece_size_max ({piece_size_min} > {piece_size_max})"),
+        });
+    }
+    Ok(PiecePlanConfig {
+        target_count,
+        piece_size_min,
+        piece_size_max,
+    })
 }
 
 #[cfg(test)]
@@ -200,6 +258,61 @@ mod tests {
         for p in &plan.pieces {
             assert_eq!(p.size, MIN);
         }
+    }
+
+    fn defaults() -> DownloadDefaults {
+        DownloadDefaults {
+            workers: 4,
+            piece_target_count: DEFAULT_TARGET_COUNT,
+            piece_size_min: MIN,
+            piece_size_max: MAX,
+        }
+    }
+
+    #[test]
+    fn effective_plan_uses_defaults_when_spec_has_no_overrides() {
+        let spec = DownloadSpec::new("https://x", "/tmp");
+        let cfg = effective_plan_config(&spec, &defaults()).unwrap();
+        assert_eq!(cfg.target_count, DEFAULT_TARGET_COUNT);
+        assert_eq!(cfg.piece_size_min, MIN);
+        assert_eq!(cfg.piece_size_max, MAX);
+    }
+
+    #[test]
+    fn effective_plan_applies_spec_overrides() {
+        let mut spec = DownloadSpec::new("https://x", "/tmp");
+        spec.piece_target_count = Some(64);
+        spec.piece_size_min = Some(8 * 1024 * 1024);
+        spec.piece_size_max = Some(256 * 1024 * 1024);
+        let cfg = effective_plan_config(&spec, &defaults()).unwrap();
+        assert_eq!(cfg.target_count, 64);
+        assert_eq!(cfg.piece_size_min, 8 * 1024 * 1024);
+        assert_eq!(cfg.piece_size_max, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn effective_plan_rejects_non_pow2_override() {
+        let mut spec = DownloadSpec::new("https://x", "/tmp");
+        spec.piece_size_min = Some(10 * 1024 * 1024); // не степень двойки
+        let err = effective_plan_config(&spec, &defaults()).unwrap_err();
+        assert!(matches!(err, PlanConfigError::Invalid { key, .. } if key == "piece_size_min"));
+    }
+
+    #[test]
+    fn effective_plan_rejects_min_above_max() {
+        let mut spec = DownloadSpec::new("https://x", "/tmp");
+        spec.piece_size_min = Some(256 * 1024 * 1024);
+        spec.piece_size_max = Some(128 * 1024 * 1024);
+        let err = effective_plan_config(&spec, &defaults()).unwrap_err();
+        assert!(matches!(err, PlanConfigError::Invalid { key, .. } if key == "piece_size_min"));
+    }
+
+    #[test]
+    fn effective_plan_rejects_zero_target_count() {
+        let mut spec = DownloadSpec::new("https://x", "/tmp");
+        spec.piece_target_count = Some(0);
+        let err = effective_plan_config(&spec, &defaults()).unwrap_err();
+        assert!(matches!(err, PlanConfigError::Invalid { key, .. } if key == "piece_target_count"));
     }
 
     #[test]

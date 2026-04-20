@@ -170,6 +170,9 @@ async fn midstream_abort_retries_and_completes() {
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
         workers: 1,
+        piece_target_count: None,
+        piece_size_min: None,
+        piece_size_max: None,
     };
     let _id = manager.add(spec).await.expect("add ok");
 
@@ -206,6 +209,9 @@ async fn server_500_retries_then_completes() {
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
         workers: 1,
+        piece_target_count: None,
+        piece_size_min: None,
+        piece_size_max: None,
     };
     manager.add(spec).await.expect("add ok");
 
@@ -240,6 +246,9 @@ async fn etag_change_fails_download() {
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
         workers: 1,
+        piece_target_count: None,
+        piece_size_min: None,
+        piece_size_max: None,
     };
     manager.add(spec).await.expect("add ok");
 
@@ -274,6 +283,9 @@ async fn no_content_length_uses_full_stream_fallback() {
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
         workers: 1,
+        piece_target_count: None,
+        piece_size_min: None,
+        piece_size_max: None,
     };
     manager.add(spec).await.expect("add ok");
 
@@ -341,6 +353,9 @@ async fn peak_rss_under_150mb_10_parallel_engines() {
             target_dir: "/tmp".into(),
             filename: Some("f.bin".into()),
             workers: 4,
+            piece_target_count: None,
+            piece_size_min: None,
+            piece_size_max: None,
         };
         manager.add(spec).await.expect("add ok");
     }

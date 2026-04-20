@@ -42,6 +42,14 @@ message DownloadSpec {
   optional string filename = 3;
   // Сколько параллельных воркеров. `0` — сервер подставит дефолт.
   uint32 workers = 4;
+
+  // Override'ы piece-параметров. `None` — брать дефолт из конфига демона.
+  // Целевое число piece'ов на файл (алгоритм нарезки, см. architecture.md).
+  optional uint32 piece_target_count = 5;
+  // Минимальный размер piece'а в байтах (должен быть степенью двойки).
+  optional uint64 piece_size_min = 6;
+  // Максимальный размер piece'а в байтах (должен быть степенью двойки).
+  optional uint64 piece_size_max = 7;
 }
 
 // Состояние загрузки.

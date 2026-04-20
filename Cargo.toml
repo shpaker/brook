@@ -40,3 +40,5 @@ wiremock           = "0.6"
 rand               = "0.8"
 fs4                = "0.13"
 tempfile           = "3"
+serde              = { version = "1", features = ["derive"] }
+serde_yaml         = "0.9"

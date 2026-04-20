@@ -12,8 +12,8 @@ fn spec(url: &str) -> proto::DownloadSpec {
     proto::DownloadSpec {
         url: url.into(),
         target_dir: "/tmp".into(),
-        filename: None,
         workers: 2,
+        ..Default::default()
     }
 }
 
