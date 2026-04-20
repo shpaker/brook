@@ -136,29 +136,29 @@
 ## 2. `brook-proto` + `brook-api`
 
 ### 2.1 Proto-контракт
-- [ ] Сервис и сообщения: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `Watch`
-- [ ] Событие `Event` с oneof (`progress`, `state_changed`, `worker_update`, `completed`, `failed`, `snapshot`)
-- [ ] `protolint` чистый
-- [ ] `cargo build -p brook-proto` генерирует без warning'ов
+- [x] Сервис и сообщения: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `Watch`
+- [x] Событие `Event` с oneof (`progress`, `state_changed`, `worker_update`, `completed`, `failed`, `snapshot`)
+- [x] `protolint` чистый (рецепт `just lint-proto`, конфиг `.protolint.yaml`)
+- [x] `cargo build -p brook-proto` генерирует без warning'ов
 
 ### 2.2 Тонкая обёртка API
-- [ ] `BrookService` — реализация tonic-сервиса поверх `DownloadManager`
-- [ ] Мапперы `proto ↔ core` в отдельном модуле (без бизнес-логики)
-- [ ] Unary: `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `List`
-- [ ] Юнит-тесты на мапперы
+- [x] `BrookService` — реализация tonic-сервиса поверх `DownloadManager`
+- [x] Мапперы `proto ↔ core` в отдельном модуле (без бизнес-логики)
+- [x] Unary: `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `List`
+- [x] Юнит-тесты на мапперы
 
 ### 2.3 Watch-стрим
-- [ ] Per-client fanout-задача: подписка на центральный `broadcast` + tonic tx
-- [ ] Initial snapshots при коннекте — по одному `Event::Snapshot` на каждую известную загрузку
-- [ ] `tx.send().await` — транспортный backpressure
-- [ ] `RecvError::Lagged(n)` → запросить у `DownloadManager` snapshot'ы активных и дослать
-- [ ] Интеграционный тест: fast producer + slow consumer → клиент догоняется
+- [x] Per-client fanout-задача: подписка на центральный `broadcast` + tonic tx
+- [x] Initial snapshots при коннекте — по одному `Event::Snapshot` на каждую известную загрузку
+- [x] `tx.send().await` — транспортный backpressure
+- [x] `RecvError::Lagged(n)` → запросить у `DownloadManager` snapshot'ы активных и дослать
+- [x] Интеграционный тест: fast producer + slow consumer → клиент догоняется
 
 ### 2.4 Транспорт и трейсинг
-- [ ] Bind `127.0.0.1:<port из settings>`
-- [ ] Metadata: `session_id`, `request_id`, при наличии — `download_id`
-- [ ] Tracing: root-span на запрос, наследование в core
-- [ ] Интеграционный тест: client ↔ server в одном процессе, все методы
+- [x] Bind `127.0.0.1:<port из settings>` — контракт фиксирован; сам bind выполняет `brookd` (§4.2). `brook-api` экспортирует `BrookServiceServer`, `BrookService::new`, `trace_interceptor`.
+- [x] Metadata: `session_id`, `request_id`, при наличии — `download_id` — интерцептор `trace::trace_interceptor` кладёт `CorrelationIds` в `Request::extensions`.
+- [x] Tracing: root-span на запрос, наследование в core
+- [x] Интеграционный тест: client ↔ server в одном процессе, все методы
 
 ## 3. Конфигурация (`settings` в `brook.db`)
 
@@ -205,6 +205,34 @@
 - [ ] Шаг 4: закрыть gRPC-сервер, `brook.db`, лог-writer
 - [ ] Шаг 5: отпустить `.brook.lock`, exit 0
 - [ ] Интеграционный тест: SIGTERM на живой загрузке → ресюм после рестарта
+
+### 4.4 gRPC smoke-прогон через grpcurl
+Ручная проверка контракта после того, как `brookd` начал слушать порт.
+Бэкенд — реальные адаптеры (`SqliteQueueRepository` + `LocalPieceStorageFactory` + `brook-http`), источник — `https://httpbin.org/bytes/<N>`.
+Рефлексия не включена — везде `-proto proto/brook/v1/brook.proto -import-path proto`.
+
+Happy-path lifecycle:
+- [ ] `List` на пустом состоянии → `{}` (пустой `downloads`)
+- [ ] `Add` с валидным `spec` (url=httpbin, target_dir=/tmp, workers=2) → возвращает `DownloadId`
+- [ ] `List` после `Add` → элемент в состоянии `QUEUED`/`RUNNING`
+- [ ] `Watch` параллельно → initial `Snapshot` + `Progress`/`StateChanged`/`Completed`
+- [ ] `Pause` активного → `StatusResponse{ok:true}`, в `Watch` — `StateChanged(PAUSED)`
+- [ ] `Resume` → `StateChanged(RUNNING)`
+- [ ] `Cancel` → `StateChanged(CANCELLED)`, файл очищен
+- [ ] `Remove` после терминального состояния → успех, `List` снова пуст
+
+Валидация и ошибки (маппинг в [mapper.rs](../crates/brook-api/src/mapper.rs)):
+- [ ] `Add` с пустым `url` → `InvalidArgument`
+- [ ] `Add` с пустым `target_dir` → `InvalidArgument`
+- [ ] `Pause`/`Resume`/`Cancel`/`Remove` без `id` → `InvalidArgument`
+- [ ] те же RPC с невалидным UUID (`"not-a-uuid"`) → `InvalidArgument`
+- [ ] `Pause` несуществующего UUID → `NotFound`
+- [ ] `Remove` активной загрузки → `FailedPrecondition` (сообщение про `active`)
+
+Bulk-операции:
+- [ ] Запустить 3 загрузки → `PauseAll` → все уходят в `PAUSED`, `Watch` шлёт 3× `StateChanged`
+- [ ] `ResumeAll` → все возвращаются в `RUNNING`/`QUEUED`
+- [ ] `List` после bulk-операций → состояния консистентны
 
 ## 5. `brook-tui` (ratatui-клиент, бинарь `brook`)
 
