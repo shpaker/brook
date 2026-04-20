@@ -16,6 +16,7 @@
 mod domain;
 mod error;
 mod ports;
+mod service;
 
 /// In-memory реализации портов для юнит-тестов. Видны только под feature
 /// `test-utils`, чтобы боевые бинари не тянули тестовый код.
@@ -47,4 +48,10 @@ pub use ports::{
     TPieceStorageFactory,
     TQueueStore,
     TRangeFetch,
+};
+pub use service::{
+    CrashLoopGuard,
+    CrashLoopState,
+    RetryDecision,
+    RetryPolicy,
 };

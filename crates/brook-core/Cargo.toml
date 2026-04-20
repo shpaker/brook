@@ -17,6 +17,7 @@ uuid         = { workspace = true }
 bytes        = { workspace = true }
 futures-core = { workspace = true }
 async-trait  = { workspace = true }
+rand         = { workspace = true }
 
 [dev-dependencies]
 # Самоссылка включает фичу `test-utils` для юнит-тестов крейта,
