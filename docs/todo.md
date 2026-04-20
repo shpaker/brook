@@ -84,14 +84,16 @@
 - [x] Юнит-тесты на каждый метод репозитория
 
 ### 1.7 `LocalPieceStorage` поверх примитивов
-- [ ] `LocalPieceStorage::new(spec)` открывает `.data.brook` (`pwrite`-handle) + `PieceIndexRepository`
-- [ ] `write_piece_bytes`: `pwrite_full` по offset'у куска
-- [ ] `commit_batch`: `fsync(.data)` → `PieceIndexRepository::commit_done_batch`
-- [ ] `pending_pieces`: делегирует в репозиторий
-- [ ] `finalize`: `fsync` → `rename .data.brook → <filename>` → удалить `.index.brook`
-- [ ] `abort`: удалить `.data.brook` и `.index.brook`
-- [ ] Сбои: `.index` или `.data` отсутствует/битый → стартовать с нуля
-- [ ] Интеграционный тест на полный цикл init → write → commit → restart → resume → finalize
+- [x] `LocalPieceStorage::open(target_dir, filename, url, total_size, plan)` открывает `.data.brook` (`pwrite`-handle) + `PieceIndexRepository` (подпись шире буквального `new(spec)` — фабрика с одним только `DownloadSpec` не считает нарезку; реализация `TPieceStorageFactory` — в 4.2)
+- [x] `write_piece_bytes`: `pwrite_full` по абсолютному offset'у куска (карта `piece_index → offset`)
+- [x] `commit_batch`: `sync_data(.data)` → `PieceIndexRepository::commit_done_batch`
+- [x] `pending_pieces`: делегирует в репозиторий
+- [x] `finalize`: `sync_all` → `rename .data.brook → <filename>` → удалить `.index.brook` (+ `-wal`/`-shm`)
+- [x] `abort`: удалить `.data.brook` и `.index.brook` (+ `-wal`/`-shm`)
+- [x] Сбои: `.index` или `.data` отсутствует/битый (или не совпадает meta url/total_size/piece_size) → стартовать с нуля
+- [x] `PieceIndexRepository::all_pieces()` — для восстановления offset-карты при resume
+- [x] Все блокирующие операции (pwrite, fsync, rusqlite) в `tokio::task::spawn_blocking`
+- [x] Интеграционный тест на полный цикл init → write → commit → restart → resume → finalize
 
 ### 1.8 `DownloadEngine` — скелет
 - [ ] Структура `DownloadEngine<S: TPieceStorage>` с mpsc команд и broadcast событий
@@ -99,7 +101,7 @@
 - [ ] Обработка `Pause` / `Resume` / `Cancel`
 - [ ] Юнит-тест: команды меняют state, эмитят `StateChanged`
 
-### 1.9 `DownloadEngine` — воркеры
+### 1.9 `DownloadEngine` — воркеры и события
 - [ ] Общий atomic-счётчик «следующий `pending` piece» (work-stealing)
 - [ ] Спаун N воркеров по `spec.workers`
 - [ ] Воркер: берёт piece → `TRangeFetch::fetch_range` → потоковый `write_piece_bytes` буфером 64–256 KB
@@ -107,16 +109,14 @@
 - [ ] Батч-коммит каждые 16 кусков → `commit_batch`
 - [ ] Коммит на `pause` / `shutdown` / перед `finalize`
 - [ ] No-Range режим (`InspectReport.accepts_ranges=false` или `RangeError::RangeNotSupported`) → один воркер, `TRangeFetch::fetch_full`, до EOF
-- [ ] Тесты с `wiremock`: нормальная загрузка, обрыв посреди куска, 500+retry
-
-### 1.10 `DownloadEngine` — события
 - [ ] Агрегация счётчиков в таймере 200 ms → один `Progress` за окно
 - [ ] State-changes — мгновенный эмит, без таймера
 - [ ] `Completed` после успешного `finalize`
 - [ ] `Failed(reason)` на терминальной ошибке
+- [ ] Тесты с `wiremock`: нормальная загрузка, обрыв посреди куска, 500+retry
 - [ ] Юнит-тест: частота `Progress` ≤ 5 Hz
 
-### 1.11 `DownloadManager`
+### 1.10 `DownloadManager`
 - [ ] Структура `DownloadManager` с реестром engines по `DownloadId`
 - [ ] Принимает `TPieceStorageFactory` + `TQueueStore` в конструкторе
 - [ ] `add(spec)` — insert в queue-store, спаун engine при наличии слота
@@ -128,7 +128,7 @@
 - [ ] Snapshot по запросу (для Watch-реконсиляции)
 - [ ] Интеграционный тест: 3 engines, `max_concurrent=2`, очередь соблюдается
 
-### 1.12 Тесты `brook-core`
+### 1.11 Тесты `brook-core`
 - [ ] Fault-injection (через `brook-http` + `wiremock`): обрыв на полуслове, `500` с ретраем, смена `ETag` → `FAILED`
 - [ ] Отсутствие `Content-Length` → fallback-режим
 - [ ] Пиковый RSS ≤ 150 MB при 10 параллельных engines (отдельный perf-тест, `ignored`)
