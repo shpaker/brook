@@ -23,6 +23,7 @@ use crate::error::{
     Result,
 };
 use crate::ports::{
+    PreparedDownload,
     TPieceStorage,
     TPieceStorageFactory,
 };
@@ -201,11 +202,17 @@ impl TPieceStorage for MemoryPieceStorage {
 /// Фабрика in-memory хранилищ.
 ///
 /// `piece_count`/`piece_size` задаются на уровне фабрики: реальный расчёт
-/// нарезки появится только в 1.7 (`LocalPieceStorage`), а сейчас для тестов
-/// удобнее явно сказать «у каждой создаваемой загрузки будет N piece'ов».
+/// нарезки для тестов движка/менеджера здесь не интересен, важно лишь
+/// получить готовый `PreparedDownload` с заданной раскладкой.
+///
+/// По умолчанию `accepts_ranges = true`, `guard = None`. Если нужен
+/// no-Range режим или явный guard — используйте `with_accepts_ranges` /
+/// `with_guard`.
 pub struct MemoryPieceStorageFactory {
     piece_count: u32,
     piece_size: u64,
+    accepts_ranges: bool,
+    guard: Option<crate::ports::RangeGuard>,
 }
 
 impl MemoryPieceStorageFactory {
@@ -213,15 +220,41 @@ impl MemoryPieceStorageFactory {
         Self {
             piece_count,
             piece_size,
+            accepts_ranges: true,
+            guard: None,
         }
+    }
+
+    pub fn with_accepts_ranges(mut self, accepts_ranges: bool) -> Self {
+        self.accepts_ranges = accepts_ranges;
+        self
+    }
+
+    pub fn with_guard(mut self, guard: Option<crate::ports::RangeGuard>) -> Self {
+        self.guard = guard;
+        self
     }
 }
 
 impl TPieceStorageFactory for MemoryPieceStorageFactory {
     type Storage = MemoryPieceStorage;
 
-    async fn create(&self, _spec: &DownloadSpec) -> Result<Self::Storage> {
-        Ok(MemoryPieceStorage::new(self.piece_count, self.piece_size))
+    async fn prepare(&self, spec: &DownloadSpec) -> Result<PreparedDownload<Self::Storage>> {
+        // Для in-memory тестов fabricated total_size = count * piece_size;
+        // расхождений с «последним куском меньше piece_size» здесь нет.
+        let total_size = self.piece_count as u64 * self.piece_size;
+        let resolved_filename = spec
+            .filename
+            .clone()
+            .unwrap_or_else(|| "memory.bin".to_owned());
+        Ok(PreparedDownload {
+            storage: MemoryPieceStorage::new(self.piece_count, self.piece_size),
+            total_size,
+            piece_size: self.piece_size,
+            accepts_ranges: self.accepts_ranges,
+            guard: self.guard.clone(),
+            resolved_filename,
+        })
     }
 }
 
@@ -315,14 +348,18 @@ mod tests {
     async fn factory_creates_independent_storages() {
         let factory = MemoryPieceStorageFactory::new(2, 3);
         let spec = DownloadSpec::new("https://example.com/a", "/tmp");
-        let a = factory.create(&spec).await.unwrap();
-        let b = factory.create(&spec).await.unwrap();
+        let a = factory.prepare(&spec).await.unwrap();
+        let b = factory.prepare(&spec).await.unwrap();
 
-        a.write_piece_bytes(0, 0, &[1, 2, 3]).await.unwrap();
-        a.commit_batch(&[0]).await.unwrap();
+        assert_eq!(a.total_size, 6);
+        assert_eq!(a.piece_size, 3);
+        assert!(a.accepts_ranges);
+
+        a.storage.write_piece_bytes(0, 0, &[1, 2, 3]).await.unwrap();
+        a.storage.commit_batch(&[0]).await.unwrap();
 
         // У `b` ничего не закоммичено — инстансы независимы.
-        assert_eq!(a.pending_pieces().await.unwrap(), vec![1]);
-        assert_eq!(b.pending_pieces().await.unwrap(), vec![0, 1]);
+        assert_eq!(a.storage.pending_pieces().await.unwrap(), vec![1]);
+        assert_eq!(b.storage.pending_pieces().await.unwrap(), vec![0, 1]);
     }
 }

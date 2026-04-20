@@ -21,6 +21,7 @@ use std::future::Future;
 
 use crate::domain::DownloadSpec;
 use crate::error::Result;
+use crate::ports::RangeGuard;
 
 /// Хранилище piece'ов **одной конкретной** загрузки.
 ///
@@ -63,15 +64,48 @@ pub trait TPieceStorage: Send + Sync {
     fn abort(&self) -> impl Future<Output = Result<()>> + Send;
 }
 
-/// Фабрика `TPieceStorage` — создаёт хранилище под конкретный spec.
+/// Результат «предстарта» загрузки: всё, что менеджеру нужно узнать об
+/// источнике и нарезке, плюс готовое хранилище piece'ов.
+///
+/// Фабрика делает inspect источника, считает раскладку и открывает
+/// storage одной операцией — `DownloadManager` видит этот бандл как
+/// единый шаг, без прямой зависимости от `THttpInspect` или `plan_pieces`.
+#[derive(Debug)]
+pub struct PreparedDownload<S: TPieceStorage> {
+    /// Открытое (init или resume) хранилище piece'ов.
+    pub storage: S,
+    /// Общий размер файла (из `Content-Length` / HEAD/GET fallback).
+    pub total_size: u64,
+    /// Размер «обычного» piece'а (последний может быть короче).
+    pub piece_size: u64,
+    /// Поддерживает ли источник Range-запросы.
+    pub accepts_ranges: bool,
+    /// ETag/Last-Modified для защиты piece'ов от мутации источника.
+    pub guard: Option<RangeGuard>,
+    /// Имя файла, которое фабрика резолвила (из spec / Content-Disposition / URL).
+    pub resolved_filename: String,
+}
+
+/// Фабрика `TPieceStorage` — инкапсулирует всё, что нужно сделать до
+/// старта движка: inspect URL, расчёт нарезки, открытие хранилища.
 ///
 /// **Почему `type Storage`, а не `Box<dyn TPieceStorage>`**: `async fn` /
 /// `impl Future` в трейте несовместимы с `dyn` (объектами-трейтами).
 /// Ассоциированный тип + `-> Self::Storage` — обходной путь: фабрика
 /// статически параметризуется, `dyn` не нужен. Для dyn-случаев есть
 /// крейт `async-trait`, но лишнюю зависимость добавлять не хочется.
+///
+/// **Зачем `prepare`, а не `create(spec) + отдельный inspect`**: движку
+/// и хранилищу нужны одни и те же метаданные источника (`total_size`,
+/// `piece_size`, `accepts_ranges`). Вычислять их дважды — лишние HEAD-ы
+/// и риск рассогласования; держать inspect-порт в ядре рядом с
+/// хранилищем — смешение ответственностей. Один метод, который отдаёт
+/// всё нужное для запуска, — самый дешёвый инвариант для менеджера.
 pub trait TPieceStorageFactory: Send + Sync {
     type Storage: TPieceStorage;
 
-    fn create(&self, spec: &DownloadSpec) -> impl Future<Output = Result<Self::Storage>> + Send;
+    fn prepare(
+        &self,
+        spec: &DownloadSpec,
+    ) -> impl Future<Output = Result<PreparedDownload<Self::Storage>>> + Send;
 }

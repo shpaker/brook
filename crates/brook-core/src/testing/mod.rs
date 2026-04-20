@@ -8,9 +8,15 @@
 
 pub mod memory_piece_storage;
 pub mod memory_queue_store;
+pub mod mock_fetch;
 
 pub use memory_piece_storage::{
     MemoryPieceStorage,
     MemoryPieceStorageFactory,
 };
 pub use memory_queue_store::MemoryTQueueStore;
+pub use mock_fetch::{
+    FetchOutcome,
+    MockRangeFetch,
+    sequential_bytes,
+};

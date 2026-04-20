@@ -16,6 +16,7 @@ thiserror    = { workspace = true }
 uuid         = { workspace = true }
 bytes        = { workspace = true }
 futures-core = { workspace = true }
+futures-util = { workspace = true }
 async-trait  = { workspace = true }
 rand         = { workspace = true }
 
@@ -23,3 +24,10 @@ rand         = { workspace = true }
 # Самоссылка включает фичу `test-utils` для юнит-тестов крейта,
 # при этом обычная сборка `brook-core` эту фичу не тянет.
 brook-core = { path = ".", features = ["test-utils"] }
+# Интеграционные тесты fault-injection используют реальный HTTP-адаптер против
+# wiremock. Попадают только в dev-профиль — normal-deps `brook-core` остаются
+# чистыми (hex-инвариант), gate `cargo tree -p brook-core | grep reqwest` проходит.
+brook-http = { path = "../brook-http" }
+wiremock   = { workspace = true }
+tempfile   = { workspace = true }
+tokio      = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
