@@ -41,6 +41,7 @@ pub use ports::{
     ByteStream,
     InspectError,
     InspectReport,
+    PreparedDownload,
     RangeError,
     RangeGuard,
     THttpInspect,
@@ -52,6 +53,12 @@ pub use ports::{
 pub use service::{
     CrashLoopGuard,
     CrashLoopState,
+    DownloadEngine,
+    DownloadManager,
+    EngineConfig,
+    EngineHandle,
+    EngineInputs,
+    ManagerConfig,
     RetryDecision,
     RetryPolicy,
 };

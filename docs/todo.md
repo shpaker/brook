@@ -28,7 +28,7 @@
 
 ### 1.2 Трейты абстракций (без реализаций)
 - [x] `TPieceStorage`: `write_piece_bytes`, `commit_batch`, `pending_pieces`, `finalize`, `abort`
-- [x] `TPieceStorageFactory`: `create(spec) -> impl TPieceStorage`
+- [x] `TPieceStorageFactory`: `prepare(spec) -> PreparedDownload { storage, total_size, piece_size, accepts_ranges, guard, resolved_filename }` (расширено в 1.10: фабрика инкапсулирует inspect+plan+open, менеджеру не нужен отдельный `THttpInspect`-порт)
 - [x] `TQueueStore`: `load_all`, `insert`, `update_state`, `remove`
 - [x] Документирующие doc-комментарии инвариантов (commit ⇒ persisted)
 
@@ -96,42 +96,42 @@
 - [x] Интеграционный тест на полный цикл init → write → commit → restart → resume → finalize
 
 ### 1.8 `DownloadEngine` — скелет
-- [ ] Структура `DownloadEngine<S: TPieceStorage>` с mpsc команд и broadcast событий
-- [ ] `spawn(spec, storage) -> (handle, events_rx)`
-- [ ] Обработка `Pause` / `Resume` / `Cancel`
-- [ ] Юнит-тест: команды меняют state, эмитят `StateChanged`
+- [x] Структура `DownloadEngine` с mpsc команд и broadcast событий
+- [x] `DownloadEngine::spawn(id, inputs, config, storage, fetch) -> (EngineHandle, events_rx)`
+- [x] Обработка `Pause` / `Resume` / `Cancel`
+- [x] Юнит-тест: команды меняют state, эмитят `StateChanged`
 
 ### 1.9 `DownloadEngine` — воркеры и события
-- [ ] Общий atomic-счётчик «следующий `pending` piece» (work-stealing)
-- [ ] Спаун N воркеров по `spec.workers`
-- [ ] Воркер: берёт piece → `TRangeFetch::fetch_range` → потоковый `write_piece_bytes` буфером 64–256 KB
-- [ ] Проверка полноты куска → либо `done`, либо обратно в `pending`
-- [ ] Батч-коммит каждые 16 кусков → `commit_batch`
-- [ ] Коммит на `pause` / `shutdown` / перед `finalize`
-- [ ] No-Range режим (`InspectReport.accepts_ranges=false` или `RangeError::RangeNotSupported`) → один воркер, `TRangeFetch::fetch_full`, до EOF
-- [ ] Агрегация счётчиков в таймере 200 ms → один `Progress` за окно
-- [ ] State-changes — мгновенный эмит, без таймера
-- [ ] `Completed` после успешного `finalize`
-- [ ] `Failed(reason)` на терминальной ошибке
-- [ ] Тесты с `wiremock`: нормальная загрузка, обрыв посреди куска, 500+retry
-- [ ] Юнит-тест: частота `Progress` ≤ 5 Hz
+- [x] Общая shared-очередь pending-piece'ов (`Arc<Mutex<VecDeque<u32>>>`) — work-stealing
+- [x] Спаун N воркеров по `spec.workers`
+- [x] Воркер: берёт piece → `TRangeFetch::fetch_range` → потоковый `write_piece_bytes` буфером 64–256 KB
+- [x] Проверка полноты куска → `PieceDone` либо усечение = транзиентная ошибка (ретрай с нуля)
+- [x] Батч-коммит каждые 16 кусков → `commit_batch`
+- [x] Финальный коммит на `pause` / `shutdown` / перед `finalize`
+- [x] No-Range режим (`InspectReport.accepts_ranges=false`) → один воркер, `TRangeFetch::fetch_full`, до EOF
+- [x] Агрегация счётчиков в таймере 200 ms → один `Progress` за окно
+- [x] State-changes — мгновенный эмит, без таймера
+- [x] `Completed` после успешного `finalize`
+- [x] `Failed(reason)` на терминальной ошибке
+- [x] Юнит-тесты на mock-`TRangeFetch`: нормальная загрузка, обрыв посреди куска, 500+retry, no-Range режим
+- [x] Юнит-тест: частота `Progress` ≤ 5 Hz
 
 ### 1.10 `DownloadManager`
-- [ ] Структура `DownloadManager` с реестром engines по `DownloadId`
-- [ ] Принимает `TPieceStorageFactory` + `TQueueStore` в конструкторе
-- [ ] `add(spec)` — insert в queue-store, спаун engine при наличии слота
-- [ ] `pause(id)` / `resume(id)` / `cancel(id)` / `remove(id)` — роутинг в нужный engine
-- [ ] `pause_all` / `resume_all`
-- [ ] `max_concurrent` — не спаунить engine сверх лимита, держать в `QUEUED`
-- [ ] Центральный `broadcast::Sender<Event>` ring 1024 — fan-in от всех engines
-- [ ] При старте: `TQueueStore::load_all` → восстановить реестр, запустить по лимиту
-- [ ] Snapshot по запросу (для Watch-реконсиляции)
-- [ ] Интеграционный тест: 3 engines, `max_concurrent=2`, очередь соблюдается
+- [x] Структура `DownloadManager` с реестром engines по `DownloadId`
+- [x] Принимает `TPieceStorageFactory` + `TQueueStore` + `TRangeFetch` в конструкторе
+- [x] `add(spec)` — insert в queue-store, спаун engine при наличии слота
+- [x] `pause(id)` / `resume(id)` / `cancel(id)` / `remove(id)` — роутинг в нужный engine
+- [x] `pause_all` / `resume_all`
+- [x] `max_concurrent` — не спаунить engine сверх лимита, держать в `Queued`
+- [x] Центральный `broadcast::Sender<Event>` ring 1024 — fan-in от всех engines
+- [x] При старте: `bootstrap()` — `TQueueStore::load_all` → восстановить реестр (Running/Retrying → Queued), запустить по лимиту
+- [x] Snapshot по запросу (для Watch-реконсиляции)
+- [x] Юнит-тесты: 3 engines с `max_concurrent=2`, bootstrap-восстановление, snapshot, fan-in, cancel до спавна, блокировка remove для активных
 
 ### 1.11 Тесты `brook-core`
-- [ ] Fault-injection (через `brook-http` + `wiremock`): обрыв на полуслове, `500` с ретраем, смена `ETag` → `FAILED`
-- [ ] Отсутствие `Content-Length` → fallback-режим
-- [ ] Пиковый RSS ≤ 150 MB при 10 параллельных engines (отдельный perf-тест, `ignored`)
+- [x] Fault-injection (через `brook-http` + `wiremock`): обрыв на полуслове (`TruncatedResponse` → ретрай), `500`×2 с ретраем, смена `ETag` (`412` → `SourceMutated` → `Failed`) — `crates/brook-core/tests/fault_injection.rs`
+- [x] Отсутствие Range-поддержки (`accepts_ranges=false`) → `fetch_full` fallback, загрузка завершается
+- [x] Пиковый RSS ≤ 150 MB при 10 параллельных engines (отдельный perf-тест, `#[ignore]`, запуск через `cargo test --test fault_injection -- --ignored`)
 
 ## 2. `brook-proto` + `brook-api`
 

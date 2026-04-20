@@ -167,13 +167,17 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "brook-core",
+ "brook-http",
  "bytes",
  "futures-core",
+ "futures-util",
  "rand 0.8.6",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

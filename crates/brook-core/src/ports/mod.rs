@@ -28,6 +28,7 @@ pub use http::{
     TRangeFetch,
 };
 pub use piece_storage::{
+    PreparedDownload,
     TPieceStorage,
     TPieceStorageFactory,
 };
