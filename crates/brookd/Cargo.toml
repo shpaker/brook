@@ -3,6 +3,10 @@ name    = "brookd"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "brookd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "brookd"
 path = "src/main.rs"
@@ -16,4 +20,9 @@ rusqlite   = { workspace = true }
 tracing    = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow     = { workspace = true }
+thiserror  = { workspace = true }
 uuid       = { workspace = true }
+fs4        = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

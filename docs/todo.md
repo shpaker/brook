@@ -63,34 +63,27 @@
 - [x] Crash-loop guard: 5 одинаковых ошибок подряд → `FAILED`
 - [x] Юнит-тесты на расчёт задержек и trigger crash-loop
 
-### 1.6 Пре-аллокация и нарезка (`LocalPieceStorage`)
-- [ ] Крейт-локация: `LocalPieceStorage` в `brookd` (реализация `TPieceStorage`)
-- [ ] `statvfs`-проверка свободного места на целевой ФС
-- [ ] `F_PREALLOCATE` + `ftruncate` для `<filename>.data.brook`
-- [ ] Path-traversal защита: целевой путь под `default_dir` или абсолютный
-- [ ] Выбор `piece_size`: `clamp(next_pow2(size / piece_target_count), piece_size_min, piece_size_max)`, дефолты 128 / 16 MiB / 128 MiB; границы читаются из `settings`; запись в `meta` `.index.brook` при создании загрузки
-- [ ] Расчёт offset'ов и числа кусков
-- [ ] Тест: пре-аллокация 100 MB файла, проверка размера
+### 1.6 FS-примитивы, нарезка и piece-index
+Подготовить всё, на чём будет собран `LocalPieceStorage`: низкоуровневые файловые операции, чистая арифметика нарезки и персистентный индекс кусков. В этом этапе ещё нет реализации `TPieceStorage` — только кирпичи.
+- [x] `pwrite_full` / `read_full` — тонкие обёртки над `FileExt::write_all_at`/`read_exact_at` (std сам обрабатывает EINTR и частичные записи); юнит-тесты round-trip и чтение за EOF
+- [x] Проверка свободного места на целевой ФС (`fs4::available_space`)
+- [x] Пре-аллокация `<filename>.data.brook` (`fs4::FileExt::allocate` — на macOS это `F_PREALLOCATE`, на Linux `fallocate`, на Windows `SetFileInformationByHandle`)
+- [x] Path-traversal защита: `validate_filename` + `resolve_target`; filename должен быть одним `Component::Normal`
+- [x] Чистая функция `plan_pieces(size, cfg) -> PiecePlan { piece_size, pieces }`: `clamp(next_pow2(size / piece_target_count), piece_size_min, piece_size_max)`, дефолты 128 / 16 MiB / 128 MiB; границы hard-coded (TODO для 3.x — читать из `settings`)
+- [x] Юнит-тесты: границы clamp, округление, последний кусок меньше `piece_size`, offset'ы непрерывны
+- [x] Интеграционный тест: пре-аллокация 100 MiB файла в tmpdir + проверка раскладки кусков
+- [x] `PieceIndexRepository`: миграция `pieces(idx INTEGER PK, offset, size, status TEXT CHECK)` + `meta(key, value)`
+- [x] SQLite WAL + `synchronous=NORMAL` при открытии `.index.brook`
+- [x] `PieceIndexRepository::open(path) -> Self` (создаёт/открывает)
+- [x] `PieceIndexRepository::init(url, total_size, piece_size, pieces)` — первая запись; `piece_size` в `meta`
+- [x] `PieceIndexRepository::pending_pieces() -> Vec<PieceLayout>`
+- [x] `PieceIndexRepository::commit_done_batch(ids)` — UPDATE + транзакция
+- [x] `PieceIndexRepository::meta_get/set` (url, etag, total_size, piece_size)
+- [x] `PieceIndexRepository::delete_all` (для abort)
+- [x] SQL-строки и `rusqlite::Connection` живут только внутри этого модуля
+- [x] Юнит-тесты на каждый метод репозитория
 
-### 1.7 `pwrite`/`read` обёртки
-- [ ] `pwrite_full`: loop до полного слива, `EINTR`-safe
-- [ ] `read_full`: аналогично
-- [ ] Прокидывает только реальные ошибки (`ENOSPC`, `EIO`)
-- [ ] Юнит-тест на частичную запись (мок)
-
-### 1.8 Piece index — `PieceIndexRepository`
-- [ ] Миграция: `pieces(idx INTEGER PK, offset, size, status TEXT CHECK)` + `meta(key, value)`
-- [ ] SQLite WAL + `synchronous=NORMAL` при открытии `.index.brook`
-- [ ] `PieceIndexRepository::open(path) -> Self` (создаёт/открывает)
-- [ ] `PieceIndexRepository::init(spec, pieces)` — первая запись
-- [ ] `PieceIndexRepository::pending_pieces() -> Vec<PieceRef>`
-- [ ] `PieceIndexRepository::commit_done_batch(ids)` — UPDATE + транзакция
-- [ ] `PieceIndexRepository::meta_get/set` (url, etag, total_size, piece_size)
-- [ ] `PieceIndexRepository::delete_all` (для abort)
-- [ ] SQL-строки и `rusqlite::Connection` живут только внутри этого модуля
-- [ ] Юнит-тесты на каждый метод
-
-### 1.9 `LocalPieceStorage` поверх репозитория
+### 1.7 `LocalPieceStorage` поверх примитивов
 - [ ] `LocalPieceStorage::new(spec)` открывает `.data.brook` (`pwrite`-handle) + `PieceIndexRepository`
 - [ ] `write_piece_bytes`: `pwrite_full` по offset'у куска
 - [ ] `commit_batch`: `fsync(.data)` → `PieceIndexRepository::commit_done_batch`
@@ -98,15 +91,15 @@
 - [ ] `finalize`: `fsync` → `rename .data.brook → <filename>` → удалить `.index.brook`
 - [ ] `abort`: удалить `.data.brook` и `.index.brook`
 - [ ] Сбои: `.index` или `.data` отсутствует/битый → стартовать с нуля
-- [ ] Интеграционный тест на полный цикл init → write → commit → finalize
+- [ ] Интеграционный тест на полный цикл init → write → commit → restart → resume → finalize
 
-### 1.10 `DownloadEngine` — скелет
+### 1.8 `DownloadEngine` — скелет
 - [ ] Структура `DownloadEngine<S: TPieceStorage>` с mpsc команд и broadcast событий
 - [ ] `spawn(spec, storage) -> (handle, events_rx)`
 - [ ] Обработка `Pause` / `Resume` / `Cancel`
 - [ ] Юнит-тест: команды меняют state, эмитят `StateChanged`
 
-### 1.11 `DownloadEngine` — воркеры
+### 1.9 `DownloadEngine` — воркеры
 - [ ] Общий atomic-счётчик «следующий `pending` piece» (work-stealing)
 - [ ] Спаун N воркеров по `spec.workers`
 - [ ] Воркер: берёт piece → `TRangeFetch::fetch_range` → потоковый `write_piece_bytes` буфером 64–256 KB
@@ -116,14 +109,14 @@
 - [ ] No-Range режим (`InspectReport.accepts_ranges=false` или `RangeError::RangeNotSupported`) → один воркер, `TRangeFetch::fetch_full`, до EOF
 - [ ] Тесты с `wiremock`: нормальная загрузка, обрыв посреди куска, 500+retry
 
-### 1.12 `DownloadEngine` — события
+### 1.10 `DownloadEngine` — события
 - [ ] Агрегация счётчиков в таймере 200 ms → один `Progress` за окно
 - [ ] State-changes — мгновенный эмит, без таймера
 - [ ] `Completed` после успешного `finalize`
 - [ ] `Failed(reason)` на терминальной ошибке
 - [ ] Юнит-тест: частота `Progress` ≤ 5 Hz
 
-### 1.13 `DownloadManager`
+### 1.11 `DownloadManager`
 - [ ] Структура `DownloadManager` с реестром engines по `DownloadId`
 - [ ] Принимает `TPieceStorageFactory` + `TQueueStore` в конструкторе
 - [ ] `add(spec)` — insert в queue-store, спаун engine при наличии слота
@@ -135,7 +128,7 @@
 - [ ] Snapshot по запросу (для Watch-реконсиляции)
 - [ ] Интеграционный тест: 3 engines, `max_concurrent=2`, очередь соблюдается
 
-### 1.14 Тесты `brook-core`
+### 1.12 Тесты `brook-core`
 - [ ] Fault-injection (через `brook-http` + `wiremock`): обрыв на полуслове, `500` с ретраем, смена `ETag` → `FAILED`
 - [ ] Отсутствие `Content-Length` → fallback-режим
 - [ ] Пиковый RSS ≤ 150 MB при 10 параллельных engines (отдельный perf-тест, `ignored`)
