@@ -299,17 +299,35 @@ async fn peak_rss_under_150mb_10_parallel_engines() {
 
     let piece_size: u64 = 1024 * 1024; // 1 MiB
     let pieces: u32 = 50; // 50 MiB
+    let total_size: u64 = piece_size * pieces as u64;
 
-    let per_piece: Vec<u8> = vec![0x5A; piece_size as usize];
+    // Обработчик парсит `Range: bytes=OFFSET-END` из запроса и отдаёт
+    // соответствующий срез + корректный `Content-Range`. Без этого
+    // `RangeFetchClient::validate_content_range` отклоняет ответ как
+    // `UnexpectedStatus { code: 206 }` — что и ловило предыдущий прогон.
     Mock::given(method("GET"))
         .and(path("/f"))
-        .respond_with(move |_req: &wiremock::Request| {
+        .respond_with(move |req: &wiremock::Request| {
+            let range = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("bytes="))
+                .and_then(|s| s.split_once('-'))
+                .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+                .expect("test mock: Range header required");
+            let (offset, end) = range;
+            let len = (end - offset + 1) as usize;
+            // Контент детерминированный, но не нулевой — чтобы утечки/коэрсы
+            // заметнее ломали сборку.
+            let body: Vec<u8> = (offset..=end).map(|i| (i % 251) as u8).collect();
+            assert_eq!(body.len(), len);
             ResponseTemplate::new(206)
                 .insert_header(
                     "content-range",
-                    format!("bytes 0-{}/{}", piece_size - 1, piece_size).as_str(),
+                    format!("bytes {offset}-{end}/{total_size}").as_str(),
                 )
-                .set_body_bytes(per_piece.clone())
+                .set_body_bytes(body)
         })
         .mount(&server)
         .await;
