@@ -153,12 +153,19 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 name = "brook-api"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "brook-core",
  "brook-proto",
+ "futures-core",
+ "prost",
+ "prost-types",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2030,6 +2037,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

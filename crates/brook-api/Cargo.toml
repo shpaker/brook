@@ -4,9 +4,19 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-brook-proto = { path = "../brook-proto" }
-brook-core  = { path = "../brook-core" }
-tonic       = { workspace = true }
-tokio       = { workspace = true }
-tracing     = { workspace = true }
-thiserror   = { workspace = true }
+brook-proto  = { path = "../brook-proto" }
+brook-core   = { path = "../brook-core" }
+tonic        = { workspace = true }
+tokio        = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
+prost        = { workspace = true }
+prost-types  = { workspace = true }
+futures-core = { workspace = true }
+async-stream = "0.3"
+uuid         = { workspace = true }
+tracing      = { workspace = true }
+thiserror    = { workspace = true }
+
+[dev-dependencies]
+brook-core = { path = "../brook-core", features = ["test-utils"] }
+tempfile   = { workspace = true }

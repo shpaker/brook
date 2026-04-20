@@ -65,6 +65,10 @@ fix:
     cargo clippy --all-targets --fix --allow-dirty --allow-staged -- -D warnings
     just fmt
 
+# Проверить proto protolint'ом (требует установленного protolint)
+lint-proto:
+    protolint lint proto
+
 # === housekeeping ===
 
 # Удалить target/

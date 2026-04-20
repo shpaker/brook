@@ -1,11 +1,10 @@
 syntax = "proto3";
 package brook.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
 // Основной сервис управления загрузками.
-service DownloadService {
+service BrookService {
   // Получить список всех загрузок.
   rpc List(ListRequest) returns (ListResponse);
   // Добавить новую загрузку.
@@ -21,11 +20,11 @@ service DownloadService {
   rpc Cancel(IdRequest) returns (StatusResponse);
 
   // Поставить все загрузки на паузу.
-  rpc PauseAll(google.protobuf.Empty) returns (StatusResponse);
+  rpc PauseAll(PauseAllRequest) returns (StatusResponse);
   // Возобновить все приостановленные загрузки.
-  rpc ResumeAll(google.protobuf.Empty) returns (StatusResponse);
+  rpc ResumeAll(ResumeAllRequest) returns (StatusResponse);
 
-  // Server-streaming: тики прогресса и изменения состояния.
+  // Server-streaming: события по всем известным загрузкам.
   rpc Watch(WatchRequest) returns (stream Event);
 }
 
@@ -37,8 +36,12 @@ message DownloadId {
 // Параметры создаваемой загрузки.
 message DownloadSpec {
   string url = 1;
-  // Абсолютный путь или префикс из конфига + имя файла.
-  string target_path = 2;
+  // Директория назначения.
+  string target_dir = 2;
+  // Явно заданное имя файла (пусто — вывести из Content-Disposition/URL).
+  optional string filename = 3;
+  // Сколько параллельных воркеров. `0` — сервер подставит дефолт.
+  uint32 workers = 4;
 }
 
 // Состояние загрузки.
@@ -47,44 +50,22 @@ enum DownloadState {
   DOWNLOAD_STATE_QUEUED = 1;
   DOWNLOAD_STATE_RUNNING = 2;
   DOWNLOAD_STATE_PAUSED = 3;
-  DOWNLOAD_STATE_DONE = 4;
-  DOWNLOAD_STATE_FAILED = 5;
-  DOWNLOAD_STATE_RETRYING = 6;
+  DOWNLOAD_STATE_RETRYING = 4;
+  DOWNLOAD_STATE_DONE = 5;
+  DOWNLOAD_STATE_FAILED = 6;
   DOWNLOAD_STATE_CANCELLED = 7;
 }
 
 // Текущий прогресс загрузки.
 message Progress {
-  uint64 downloaded_bytes = 1;
+  uint64 bytes_done = 1;
   // 0, если размер неизвестен.
-  uint64 total_bytes = 2;
-  double speed_bps = 3;
-  uint64 eta_seconds = 4;
-}
-
-// Состояние отдельного куска.
-enum PieceState {
-  PIECE_STATE_UNSPECIFIED = 0;
-  PIECE_STATE_PENDING = 1;
-  PIECE_STATE_DOWNLOADING = 2;
-  PIECE_STATE_DONE = 3;
-  PIECE_STATE_FAILED = 4;
-}
-
-// Обновление по одному куску — для чанкового прогрессбара на клиенте.
-// Размер куска известен из Download.piece_size, здесь передаём только долю.
-message PieceUpdate {
-  // Порядковый номер куска (0..piece_count).
-  uint32 index = 1;
-  PieceState state = 2;
-  // Доля загруженного в этом куске, 0.0..1.0.
-  float progress = 3;
-}
-
-// Кусок, который сейчас качается: индекс + доля загруженного 0.0..1.0.
-message PieceInProgress {
-  uint32 index = 1;
-  float progress = 2;
+  uint64 bytes_total = 2;
+  uint32 pieces_done = 3;
+  uint32 pieces_total = 4;
+  double speed_bps = 5;
+  // Отсутствует, если неизвестно.
+  optional uint64 eta_secs = 6;
 }
 
 // Полное состояние загрузки.
@@ -96,27 +77,56 @@ message Download {
   // Номер текущей попытки (с 1).
   uint32 attempt = 5;
   // Заполняется только для FAILED / RETRYING.
-  string error_message = 6;
+  optional string error = 6;
   google.protobuf.Timestamp created_at = 7;
   google.protobuf.Timestamp updated_at = 8;
-  // Общее число кусков (0, если размер ещё не известен).
-  uint32 piece_count = 9;
-  // Размер куска в байтах (последний кусок может быть меньше).
-  uint64 piece_size = 10;
-  // Индексы полностью загруженных кусков.
-  repeated uint32 completed_pieces = 11;
-  // Куски, которые качаются прямо сейчас.
-  repeated PieceInProgress in_progress_pieces = 12;
 }
 
-// Событие, отправляемое клиенту в Watch-стриме.
-message Event {
+// Тик прогресса.
+message ProgressEvent {
   DownloadId id = 1;
+  Progress progress = 2;
+}
+
+// Смена состояния.
+message StateChangedEvent {
+  DownloadId id = 1;
+  DownloadState state = 2;
+}
+
+// Обновление отдельного куска — для чанкового прогрессбара.
+message WorkerUpdateEvent {
+  DownloadId id = 1;
+  uint32 piece_index = 2;
+  // Доля скачанного в этом piece'е, 0.0..=1.0.
+  float fraction = 3;
+}
+
+// Загрузка успешно завершена.
+message CompletedEvent {
+  DownloadId id = 1;
+}
+
+// Загрузка упала окончательно.
+message FailedEvent {
+  DownloadId id = 1;
+  string error = 2;
+}
+
+// Полный снимок — initial-sync для Watch и реконсиляция после Lagged.
+message SnapshotEvent {
+  Download download = 1;
+}
+
+// Событие в Watch-стриме. Формы варьируются в `kind`.
+message Event {
   oneof kind {
-    // Полный снимок — перезаписать запись на клиенте.
-    Download snapshot = 2;
-    // Изменение состояния одного куска.
-    PieceUpdate piece_update = 3;
+    ProgressEvent progress = 1;
+    StateChangedEvent state_changed = 2;
+    WorkerUpdateEvent worker_update = 3;
+    CompletedEvent completed = 4;
+    FailedEvent failed = 5;
+    SnapshotEvent snapshot = 6;
   }
 }
 
@@ -156,4 +166,13 @@ message StatusResponse {
 
 // Параметры подписки (зарезервировано для будущих фильтров).
 message WatchRequest {
+}
+
+// Пустой запрос для массовых операций (оставлен как именованный для
+// стабильности схемы — при необходимости сюда можно добавить поля без
+// breaking change).
+message PauseAllRequest {
+}
+
+message ResumeAllRequest {
 }
