@@ -234,9 +234,11 @@ name = "brookd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "brook-api",
  "brook-core",
  "brook-http",
+ "brook-proto",
  "directories",
  "fs4",
  "rusqlite",
@@ -245,9 +247,12 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

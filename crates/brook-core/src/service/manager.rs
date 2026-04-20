@@ -41,7 +41,10 @@ use std::sync::{
     Arc,
     Mutex,
 };
-use std::time::SystemTime;
+use std::time::{
+    Duration,
+    SystemTime,
+};
 
 use tokio::sync::broadcast;
 use tracing::{
@@ -359,6 +362,53 @@ where
             let _ = self.pause(id).await;
         }
         Ok(())
+    }
+
+    /// Остановить все активные движки и дождаться, пока каждый дойдёт до
+    /// `Paused` или терминального состояния.
+    ///
+    /// Возвращает `Err(Error::Other("shutdown timeout"))`, если `deadline`
+    /// истёк раньше, чем все active-движки успели коммитнуться. Engines в
+    /// этом случае будут дропнуты владельцем — in-flight piece-пачки без
+    /// коммита перекачаются при следующем старте.
+    pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
+        let active: Vec<DownloadId> = {
+            let inner = self.shared.inner.lock().expect("mutex poisoned");
+            inner.engines.keys().copied().collect()
+        };
+        if active.is_empty() {
+            return Ok(());
+        }
+        let _ = self.pause_all().await;
+        let shared = Arc::clone(&self.shared);
+        let wait = async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let all_drained = {
+                    let inner = shared.inner.lock().expect("mutex poisoned");
+                    active.iter().all(|id| match inner.records.get(id) {
+                        Some(d) => matches!(
+                            d.state,
+                            DownloadState::Paused
+                                | DownloadState::Done
+                                | DownloadState::Failed
+                                | DownloadState::Cancelled
+                        ),
+                        None => true,
+                    })
+                };
+                if all_drained {
+                    break;
+                }
+            }
+        };
+        match tokio::time::timeout(deadline, wait).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                warn!("shutdown deadline elapsed with engines still draining");
+                Err(Error::Other("shutdown timeout".into()))
+            }
+        }
     }
 
     /// Возобновить все `Paused`.
@@ -768,6 +818,50 @@ mod tests {
         }
         let snap = mgr.snapshot();
         assert_eq!(snap.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn shutdown_pauses_active_engines() {
+        let factory = Arc::new(MemoryPieceStorageFactory::new(5, 20));
+        let queue = Arc::new(MemoryTQueueStore::new());
+        // Долгий fetch, чтобы на момент shutdown загрузки были активны.
+        let fetch = Arc::new(
+            MockRangeFetch::always_ok(sequential_bytes(100)).with_delay(Duration::from_millis(400)),
+        );
+        let cfg = ManagerConfig {
+            max_concurrent: 2,
+            events_capacity: 128,
+            engine: fast_engine_config(),
+        };
+        let mgr = DownloadManager::new(factory, queue, fetch, cfg);
+        let a = mgr.add(spec("https://t/a")).await.unwrap();
+        let b = mgr.add(spec("https://t/b")).await.unwrap();
+        // Дать engine'ам стартовать.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        mgr.shutdown(Duration::from_secs(5)).await.unwrap();
+
+        let snap = mgr.snapshot();
+        for id in [a, b] {
+            let d = snap.iter().find(|d| d.id == id).unwrap();
+            assert!(
+                matches!(
+                    d.state,
+                    DownloadState::Paused
+                        | DownloadState::Done
+                        | DownloadState::Failed
+                        | DownloadState::Cancelled
+                ),
+                "download {id} in state {:?} after shutdown",
+                d.state
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_no_engines_is_noop() {
+        let (mgr, _) = make_manager(1, 10, 0);
+        mgr.shutdown(Duration::from_millis(100)).await.unwrap();
     }
 
     #[tokio::test]
