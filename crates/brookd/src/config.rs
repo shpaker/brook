@@ -338,12 +338,8 @@ impl Settings {
                 ),
             });
         }
-        if self.api.port == 0 {
-            return Err(ConfigError::Invalid {
-                key: "api.port",
-                reason: "must be ≥ 1".into(),
-            });
-        }
+        // `api.port = 0` легально: означает «пусть ОС выберет свободный
+        // порт». Реальный адрес узнаём после bind'а в `build_runtime`.
         IpAddr::from_str(&self.api.bind).map_err(|e: AddrParseError| ConfigError::Invalid {
             key: "api.bind",
             reason: format!("not an IP address: {e}"),
@@ -518,6 +514,13 @@ mod tests {
         assert!(
             matches!(err, ConfigError::Invalid { key, .. } if key == "download.default_workers")
         );
+    }
+
+    #[test]
+    fn port_zero_is_allowed_for_ephemeral_bind() {
+        let mut s = Settings::default();
+        s.api.port = 0;
+        s.validate().unwrap();
     }
 
     #[test]

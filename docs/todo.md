@@ -184,75 +184,88 @@
 ## 4. `brookd` (демон)
 
 ### 4.1 `SqliteQueueRepository` (реализация `TQueueStore`)
-- [ ] Миграция: `downloads(id, url, target_dir, filename, state, created_at, updated_at, ...)`
-- [ ] `SqliteQueueRepository::load_all`
-- [ ] `SqliteQueueRepository::insert(download)`
-- [ ] `SqliteQueueRepository::update_state(id, state, updated_at)`
-- [ ] `SqliteQueueRepository::remove(id)`
-- [ ] SQL-строки и `Connection` не покидают модуль
-- [ ] Юнит-тесты на каждый метод
+Единственное место во всём крейте, где живут SQL и `rusqlite::Connection` по очереди загрузок (аналогично [index.rs](../crates/brookd/src/storage/index.rs)).
+- [x] Схема `downloads`: `id TEXT PK`, `url`, `target_dir`, `filename NULL`, `workers INTEGER`, `piece_target_count NULL`, `piece_size_min NULL`, `piece_size_max NULL`, `state TEXT CHECK`, `attempt INTEGER`, `error NULL`, `created_at INTEGER`, `updated_at INTEGER` (unix-секунды) — все override-поля 3.2 персистятся, иначе после рестарта теряются
+- [x] Прогресс (`bytes_done`, `pieces_done`, …) **не** хранится в `brook.db` — восстанавливается из `.index.brook` при старте engine
+- [x] Версионирование схемы через `PRAGMA user_version` (как в piece-index)
+- [x] Открытие БД: `journal_mode=WAL` + `synchronous=NORMAL`
+- [x] `SqliteQueueRepository::open(path) -> Self` (создаёт/открывает + миграции)
+- [x] `load_all` / `insert(download)` / `update_state(id, state)` / `remove(id)` — реализации трейта
+- [x] `update_state` сам обновляет `updated_at = now()`
+- [x] Все вызовы `rusqlite` через `tokio::task::spawn_blocking`
+- [x] SQL-строки и `Connection` не покидают модуль — наружу только доменные методы `TQueueStore`
+- [x] Юнит-тесты на каждый метод + round-trip insert → update_state → load_all → remove
 
-### 4.2 Бинарь
-- [ ] `tokio::main`; порядок: lock → `brook.yaml` → БД → миграции → core → api
-- [ ] Single-instance: `flock(LOCK_EX | LOCK_NB)` на `.brook.lock` в CWD; вторая копия → exit 1 с сообщением
-- [ ] `Settings::load_or_init("./brook.yaml")` → `DaemonRuntime` + `DownloadDefaults`
-- [ ] Открытие `./brook.db` + прогон миграций (downloads)
-- [ ] `brookd` передаёт `SqliteQueueRepository` и `LocalPieceStorageFactory` в `DownloadManager`
-- [ ] Запуск `DownloadManager` + gRPC-сервера как двух `tokio::spawn`-задач
-- [ ] `session_id` xid — root-span
+### 4.2 `LocalPieceStorageFactory` (реализация `TPieceStorageFactory`)
+Недостающее звено: `DownloadManager` требует фабрику, но сейчас есть только `LocalPieceStorage`.
+- [x] `brookd/src/storage/factory.rs`: `LocalPieceStorageFactory { inspect: Arc<HttpInspectClient>, defaults: DownloadDefaults }`
+- [x] `prepare(spec)`: `inspect.inspect(url)` → `effective_plan_config(spec, defaults)` → `plan_pieces` → `resolve_target` → `LocalPieceStorage::open` → `PreparedDownload`
+- [x] Имя файла: приоритет `spec.filename` → `InspectReport.filename` → fallback из URL (логика уже в [HttpInspectClient](../crates/brook-http/src))
+- [x] Политика `on_file_exists` (rename/overwrite/ask) в MVP — не здесь: фабрика ошибается `FileExists`, решение принимает слой выше (TUI-модалка, §6.6)
+- [x] Юнит-тест: мок `THttpInspect` → проверка, что overrides из spec побеждают defaults
+- [x] Интеграционный тест на `wiremock`: полный `prepare` с реальным `HttpInspectClient`
 
-### 4.3 Graceful shutdown
-- [ ] Сигналы: `SIGTERM`, `SIGINT`
-- [ ] Шаг 1: перестать принимать новые gRPC-запросы
-- [ ] Шаг 2: `pause_all` engines — каждый доводит in-flight до batch-границы
-- [ ] Шаг 3: финальный `commit_batch` для активных загрузок
-- [ ] Шаг 4: закрыть gRPC-сервер, `brook.db`, лог-writer
-- [ ] Шаг 5: отпустить `.brook.lock`, exit 0
-- [ ] Интеграционный тест: SIGTERM на живой загрузке → ресюм после рестарта
+### 4.3 Бинарь `brookd`
+- [x] `#[tokio::main]`; порядок старта: `.brook.lock` → tracing (stderr) → `brook.yaml` → `brook.db` + миграции → shared `reqwest::Client` (`HttpClientBuilder`) → `HttpInspectClient` + `RangeFetchClient` → `LocalPieceStorageFactory` → `DownloadManager::new` + `bootstrap()` → tonic `Server` с `BrookServiceServer` + `trace_interceptor`
+- [x] Single-instance: `fs4::FileExt::try_lock_exclusive` на `.brook.lock` в CWD; вторая копия → exit 1 с понятным сообщением; `File` держится в `main` до exit
+- [x] `Settings::load_or_init("./brook.yaml")` → `DaemonRuntime` + `DownloadDefaults`
+- [x] `ManagerConfig.max_concurrent` = `runtime.max_concurrent`
+- [x] Bind gRPC на `SocketAddr::new(runtime.api_bind, runtime.api_port)`
+- [x] `session_id = xid::new()` → root-span `info_span!("brookd", %session_id)` оборачивает всё содержимое `main`
+- [x] Tracing в этом этапе — минимальный stderr (JSON-форматтер + файловый sink вынесены в §7)
 
-### 4.4 gRPC smoke-прогон через grpcurl
+### 4.4 Graceful shutdown
+- [x] Ожидание `SIGTERM` / `SIGINT` через `tokio::signal` + `select!` с `server.await`
+- [x] `tonic::transport::Server::serve_with_shutdown(addr, shutdown_signal)` — перестаём принимать новые RPC при получении сигнала
+- [x] `DownloadManager::shutdown(deadline: Duration)`: `pause_all` + дождаться `StateChanged(Paused)` / `Completed` / `Failed` / `Cancelled` от каждого активного engine через `subscribe()`; при таймауте (30 s) — drop handle'ов, логировать `warn`
+- [x] После возврата `shutdown()`: engines сами делают финальный `commit_batch` перед эмитом `Paused` (инвариант из 1.9)
+- [x] Закрыть `brook.db` (drop `SqliteQueueRepository`), затем flush tracing
+- [x] `.brook.lock` освобождается автоматически при drop `File` на выходе из `main`
+- [x] Интеграционный тест: старт brookd в tokio-тесте → `Add` живой загрузки (wiremock-источник) → shutdown-сигнал → рестарт → `load_all` возвращает запись в `Queued`, ресюм докачивает остаток
+
+## 5. gRPC smoke-прогон через grpcurl
 Ручная проверка контракта после того, как `brookd` начал слушать порт.
 Бэкенд — реальные адаптеры (`SqliteQueueRepository` + `LocalPieceStorageFactory` + `brook-http`), источник — `https://httpbin.org/bytes/<N>`.
 Рефлексия не включена — везде `-proto proto/brook/v1/brook.proto -import-path proto`.
 
 Happy-path lifecycle:
-- [ ] `List` на пустом состоянии → `{}` (пустой `downloads`)
-- [ ] `Add` с валидным `spec` (url=httpbin, target_dir=/tmp, workers=2) → возвращает `DownloadId`
-- [ ] `List` после `Add` → элемент в состоянии `QUEUED`/`RUNNING`
-- [ ] `Watch` параллельно → initial `Snapshot` + `Progress`/`StateChanged`/`Completed`
-- [ ] `Pause` активного → `StatusResponse{ok:true}`, в `Watch` — `StateChanged(PAUSED)`
-- [ ] `Resume` → `StateChanged(RUNNING)`
-- [ ] `Cancel` → `StateChanged(CANCELLED)`, файл очищен
-- [ ] `Remove` после терминального состояния → успех, `List` снова пуст
+- [x] `List` на пустом состоянии → `{}` (пустой `downloads`)
+- [x] `Add` с валидным `spec` (url=httpbin, target_dir=/tmp, workers=2) → возвращает `DownloadId`
+- [x] `List` после `Add` → элемент в состоянии `QUEUED`/`RUNNING`
+- [x] `Watch` параллельно → initial `Snapshot` + `Progress`/`StateChanged`/`Completed`
+- [x] `Pause` активного → `StatusResponse{ok:true}`, в `Watch` — `StateChanged(PAUSED)`
+- [x] `Resume` → `StateChanged(RUNNING)`
+- [x] `Cancel` → `StateChanged(CANCELLED)`, файл очищен
+- [x] `Remove` после терминального состояния → успех, `List` снова пуст
 
 Валидация и ошибки (маппинг в [mapper.rs](../crates/brook-api/src/mapper.rs)):
-- [ ] `Add` с пустым `url` → `InvalidArgument`
-- [ ] `Add` с пустым `target_dir` → `InvalidArgument`
-- [ ] `Pause`/`Resume`/`Cancel`/`Remove` без `id` → `InvalidArgument`
-- [ ] те же RPC с невалидным UUID (`"not-a-uuid"`) → `InvalidArgument`
-- [ ] `Pause` несуществующего UUID → `NotFound`
-- [ ] `Remove` активной загрузки → `FailedPrecondition` (сообщение про `active`)
+- [x] `Add` с пустым `url` → `InvalidArgument`
+- [x] `Add` с пустым `target_dir` → `InvalidArgument`
+- [x] `Pause`/`Resume`/`Cancel`/`Remove` без `id` → `InvalidArgument`
+- [x] те же RPC с невалидным UUID (`"not-a-uuid"`) → `InvalidArgument`
+- [x] `Pause` несуществующего UUID → `NotFound`
+- [x] `Remove` активной загрузки → `FailedPrecondition` (сообщение про `active`)
 
 Bulk-операции:
-- [ ] Запустить 3 загрузки → `PauseAll` → все уходят в `PAUSED`, `Watch` шлёт 3× `StateChanged`
-- [ ] `ResumeAll` → все возвращаются в `RUNNING`/`QUEUED`
-- [ ] `List` после bulk-операций → состояния консистентны
+- [x] Запустить 3 загрузки → `PauseAll` → все уходят в `PAUSED`, `Watch` шлёт 3× `StateChanged`
+- [x] `ResumeAll` → все возвращаются в `RUNNING`/`QUEUED`
+- [x] `List` после bulk-операций → состояния консистентны
 
-## 5. `brook-tui` (ratatui-клиент, бинарь `brook`)
+## 6. `brook-tui` (ratatui-клиент, бинарь `brook`)
 
-### 5.1 Каркас клиента
+### 6.1 Каркас клиента
 - [ ] `main`: парсинг `--port` (дефолт 7090)
 - [ ] `tonic::Channel` на `127.0.0.1:<port>`; при недоступности — сообщение + exit 1
 - [ ] UI-loop `crossterm` + `ratatui`
 - [ ] `q` закрывает клиент; демон не трогается
 
-### 5.2 View-model и подписка
+### 6.2 View-model и подписка
 - [ ] Структура `ViewModel` с списком загрузок
 - [ ] Фоновая задача: `Watch` → применяет события к `ViewModel` через канал
 - [ ] Мутация `ViewModel` — только из этой задачи
 - [ ] Сортировка: `RUNNING` → `RETRYING` → `QUEUED` → `PAUSED` → `DONE` → `FAILED` → `CANCELLED`, внутри — по `updated_at`
 
-### 5.3 Рендер списка
+### 6.3 Рендер списка
 - [ ] Колонки: имя, прогресс-бар, скорость, ETA, иконки `▶` / `❚❚` / `✓` / `✕`
 - [ ] Статус-бар сверху: активные / очередь / суммарная скорость
 - [ ] Хинт-бар снизу
@@ -261,14 +274,14 @@ Bulk-операции:
 - [ ] `NO_COLOR` — рендер без ANSI-цветов
 - [ ] Минимальный терминал 60×15 + заглушка ниже
 
-### 5.4 Навигация и выбор
+### 6.4 Навигация и выбор
 - [ ] `↑↓` и `jk` — курсор
 - [ ] `gG` — в начало/конец
 - [ ] `Enter` — разворот карточки (детали загрузки)
 - [ ] `Space` — toggle select
 - [ ] `Shift+↑↓` / `Shift+JK` — расширение выбора
 
-### 5.5 Команды
+### 6.5 Команды
 - [ ] `a` — модалка добавления (prefill из clipboard)
 - [ ] `p` — pause выбранных
 - [ ] `r` — resume выбранных
@@ -278,12 +291,12 @@ Bulk-операции:
 - [ ] `Esc` — закрыть модалки/фильтр
 - [ ] `?` — help overlay на один экран
 
-### 5.6 Модалки конфликтов
+### 6.6 Модалки конфликтов
 - [ ] URL-дубликат в очереди (`ask` / `skip` / `add` по политике)
 - [ ] Файл уже существует (`ask` / `rename` / `overwrite` по политике)
 - [ ] Мышь игнорируется
 
-## 6. Наблюдаемость
+## 7. Наблюдаемость
 - [ ] `tracing-subscriber` с JSON-форматтером во всех крейтах
 - [ ] `session_id` xid в root-span процесса
 - [ ] `download_id` в span'ах core-операций над загрузкой
@@ -292,7 +305,7 @@ Bulk-операции:
 - [ ] Stderr sink при запуске из терминала
 - [ ] Ротация: 10 файлов × 50 MB, по размеру
 
-## 7. Quality gate (ручная прогонка)
+## 8. Quality gate (ручная прогонка)
 Сценарии из [open-questions.md](open-questions.md):
 - [ ] Файл >1 GB + пауза + рестарт `brookd` → ресюм
 - [ ] TUI переподключается к работающему демону после `q` и повторного запуска — состояние совпадает
