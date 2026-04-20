@@ -41,6 +41,39 @@ where
     F: TRangeFetch + Send + Sync + 'static,
 {
     manager: Arc<DownloadManager<PF, QS, F>>,
+    settings: ApiSettings,
+}
+
+/// Рантайм-снимок `brook.yaml` + `DownloadDefaults`, которым обслуживается
+/// `GetSettings`. `brookd` собирает его из `DaemonRuntime` на старте; в
+/// тестах `default()` даёт разумные значения.
+#[derive(Debug, Clone)]
+pub struct ApiSettings {
+    pub default_dir: String,
+    pub default_workers: u32,
+    pub max_workers: u32,
+    pub max_concurrent: u32,
+    pub piece_target_count: u32,
+    pub piece_size_min: u64,
+    pub piece_size_max: u64,
+    pub on_duplicate_url: proto::OnDuplicateUrlPolicy,
+    pub on_file_exists: proto::OnFileExistsPolicy,
+}
+
+impl Default for ApiSettings {
+    fn default() -> Self {
+        Self {
+            default_dir: String::new(),
+            default_workers: 4,
+            max_workers: 16,
+            max_concurrent: 3,
+            piece_target_count: 128,
+            piece_size_min: 16 * 1024 * 1024,
+            piece_size_max: 128 * 1024 * 1024,
+            on_duplicate_url: proto::OnDuplicateUrlPolicy::Ask,
+            on_file_exists: proto::OnFileExistsPolicy::Ask,
+        }
+    }
 }
 
 impl<PF, QS, F> BrookService<PF, QS, F>
@@ -50,8 +83,8 @@ where
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
 {
-    pub fn new(manager: Arc<DownloadManager<PF, QS, F>>) -> Self {
-        Self { manager }
+    pub fn new(manager: Arc<DownloadManager<PF, QS, F>>, settings: ApiSettings) -> Self {
+        Self { manager, settings }
     }
 }
 
@@ -170,6 +203,24 @@ where
             .await
             .map_err(mapper::core_err_to_status)?;
         Ok(ok_status())
+    }
+
+    async fn get_settings(
+        &self,
+        _req: Request<proto::GetSettingsRequest>,
+    ) -> Result<Response<proto::GetSettingsResponse>, Status> {
+        let s = &self.settings;
+        Ok(Response::new(proto::GetSettingsResponse {
+            default_dir: s.default_dir.clone(),
+            default_workers: s.default_workers,
+            max_workers: s.max_workers,
+            max_concurrent: s.max_concurrent,
+            piece_target_count: s.piece_target_count,
+            piece_size_min: s.piece_size_min,
+            piece_size_max: s.piece_size_max,
+            on_duplicate_url: s.on_duplicate_url as i32,
+            on_file_exists: s.on_file_exists as i32,
+        }))
     }
 
     type WatchStream = Pin<Box<dyn Stream<Item = Result<ProtoEvent, Status>> + Send>>;

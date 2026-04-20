@@ -253,48 +253,83 @@ Bulk-операции:
 
 ## 6. `brook-tui` (ratatui-клиент, бинарь `brook`)
 
+Дизайн — [ux.md](ux.md). Раскладка: `status(2) · list(Min) · detail(5) · hint(1)`, alternate screen, автоматический resize. Панель деталей **всегда снизу** (не Enter-разворот). Фильтра `/` в MVP нет.
+
+### 6.0 Дополнения API под нужды TUI
+- [x] `brook-proto`: unary RPC `GetSettings` → `SettingsResponse { default_dir, default_workers, max_workers, max_concurrent, piece_target_count, piece_size_min, piece_size_max, on_duplicate_url, on_file_exists }`
+- [x] `brook-proto`: enum `OnFileExistsOverride { UNSPECIFIED, RENAME, OVERWRITE }` + поле `on_file_exists_override` в `DownloadSpec`
+- [x] `brook-api`: реализация `GetSettings` (читает из прокинутого `ApiSettings`-снимка)
+- [x] `brookd`: прокинуть `DaemonRuntime` + `DownloadDefaults` в `BrookService::new` через `ApiSettings`
+- [x] `brookd`: `LocalPieceStorageFactory::prepare` учитывает `on_file_exists_override` — `RENAME` подбирает `<name> (1).<ext>`, `<name> (2).<ext>`, ...; `OVERWRITE` сносит существующий файл до `LocalPieceStorage::open`
+- [x] Юнит-тесты на фабрику: override=RENAME при существующем файле подбирает имя, override=OVERWRITE перезаписывает, override=UNSPECIFIED → `FileExists`
+
 ### 6.1 Каркас клиента
-- [ ] `main`: парсинг `--port` (дефолт 7090)
-- [ ] `tonic::Channel` на `127.0.0.1:<port>`; при недоступности — сообщение + exit 1
-- [ ] UI-loop `crossterm` + `ratatui`
+- [ ] `brook-tui/Cargo.toml`: `ratatui`, `crossterm`, `tokio`, `tonic`, `brook-proto`, `anyhow`, `clap` (для `--port`)
+- [ ] `main`: парсинг `--port` (дефолт 7090) через `clap`
+- [ ] `tonic::Channel` на `127.0.0.1:<port>`; при недоступности — сообщение в stderr + exit 1 (до входа в alternate screen)
+- [ ] Раскладка через `Layout::vertical([Length(2), Min(0), Length(5), Length(1)])`; `detail` автоскрывается при высоте < 20
+- [ ] Enter/exit alternate screen, `enable_raw_mode` / `disable_raw_mode` с RAII-guard'ом (восстановление терминала на panic)
 - [ ] `q` закрывает клиент; демон не трогается
+- [ ] Минимальный терминал 60×15 — заглушка «brook needs at least 60×15» вместо рендера
 
-### 6.2 View-model и подписка
-- [ ] Структура `ViewModel` с списком загрузок
-- [ ] Фоновая задача: `Watch` → применяет события к `ViewModel` через канал
-- [ ] Мутация `ViewModel` — только из этой задачи
-- [ ] Сортировка: `RUNNING` → `RETRYING` → `QUEUED` → `PAUSED` → `DONE` → `FAILED` → `CANCELLED`, внутри — по `updated_at`
+### 6.2 Watch, ViewModel, реконнект
+- [ ] Структура `ViewModel { downloads: IndexMap<DownloadId, DownloadRow>, cursor, marked, anchor, mode, detail_visible, connection, toast }`
+- [ ] Enum `UiEvent { Key, Resize, Paste, Stream(StreamEvent), StreamLagged, StreamDisconnected, StreamConnected, CmdResult, Tick }`
+- [ ] Input-task: блокирующий `crossterm::event::read` → `mpsc<UiEvent>`
+- [ ] Watch-task: `BrookServiceClient::watch` → конвертит proto-события в `UiEvent::Stream`; при обрыве backoff 1s/2s/4s/...60s и reconnect
+- [ ] При реконнекте — полный сброс `downloads` и заливка из initial `Snapshot`'ов
+- [ ] Мутация `ViewModel` — только в UI-task
+- [ ] Tick 250 мс — пересчёт «относительного» ETA, истечение toast'ов
+- [ ] Команды (`Add`, `Pause`, ...) — `tokio::spawn`, результат как `UiEvent::CmdResult`, ошибки toast'ом
+- [ ] Сортировка: `RUNNING → RETRYING → QUEUED → PAUSED → DONE → FAILED`, `CANCELLED` скрывается; внутри — `updated_at desc`
 
-### 6.3 Рендер списка
-- [ ] Колонки: имя, прогресс-бар, скорость, ETA, иконки `▶` / `❚❚` / `✓` / `✕`
-- [ ] Статус-бар сверху: активные / очередь / суммарная скорость
-- [ ] Хинт-бар снизу
-- [ ] Форматирование байт (`1.5 MB`, `532 KB`)
-- [ ] Форматирование ETA (`2h 15m`, `15m 30s`, `<1s`)
-- [ ] `NO_COLOR` — рендер без ANSI-цветов
-- [ ] Минимальный терминал 60×15 + заглушка ниже
+### 6.3 Рендер списка и прогресс-бара
+- [ ] Две строки на загрузку + пустая строка-разделитель: шапка (маркеры + имя + правая колонка) + прогресс-бар
+- [ ] Префикс-колонки фиксированной ширины: `[cursor][select][icon]` = 3 символа
+- [ ] Правая колонка фиксированной ширины: `<bytes> / <total> · <speed> · <state/eta>`, поля правоприжаты
+- [ ] Иконки: `▶` RUNNING, `❚❚` PAUSED, `↻` RETRYING, `⏳` QUEUED, `✓` DONE, `✕` FAILED
+- [ ] Главный прогресс-бар — кастомный виджет: done (`█`) + сегменты активных воркеров (цикл палитры по `worker_id % N`) + pending (`░`); под `NO_COLOR` активные → `▓`
+- [ ] Источник сегментов — последний `WorkerUpdate` per-worker в `DownloadRow`
+- [ ] No-Range fallback (`pieces_total = 1`): бар = done + один активный сегмент
+- [ ] `ratatui::Scrollbar` справа области списка, виден только при переполнении; шаг = 1 строка
 
-### 6.4 Навигация и выбор
-- [ ] `↑↓` и `jk` — курсор
-- [ ] `gG` — в начало/конец
-- [ ] `Enter` — разворот карточки (детали загрузки)
-- [ ] `Space` — toggle select
-- [ ] `Shift+↑↓` / `Shift+JK` — расширение выбора
+### 6.4 Статус-бар, detail-панель, hint-bar
+- [ ] Статус-бар: 2 строки. Строка 1 — `brook · ●/◐/○ 127.0.0.1:<port> [attempt N]`. Строка 2 — `active N/max · [queued K] · [paused K] · [retrying K]                ↓ <speed>`
+- [ ] Нулевые счётчики кроме `active` прячутся; `disconnected` → добавляется `· stale` в хвост
+- [ ] Адаптивное сужение: дропается `brook`, затем скорость переезжает на строку 2, затем скорость совсем исчезает
+- [ ] Detail-панель: 5 строк, `url` / `path` / `pieces`; для FAILED — `error` отдельной строкой
+- [ ] `url` — обрезка `…` по середине; `pieces` — `single-stream (no Range)` в fallback-режиме
+- [ ] Detail прячется при высоте < 20, ручной toggle `Tab`
+- [ ] Hint-bar: `a add · p pause · r resume · c cancel · o open · Tab details · ? help · q`
 
-### 6.5 Команды
-- [ ] `a` — модалка добавления (prefill из clipboard)
-- [ ] `p` — pause выбранных
-- [ ] `r` — resume выбранных
-- [ ] `c` — cancel с confirm-модалкой
-- [ ] `o` — open в Finder
-- [ ] `/` — фильтр по имени
-- [ ] `Esc` — закрыть модалки/фильтр
-- [ ] `?` — help overlay на один экран
+### 6.5 Навигация и выделение
+- [ ] `↑↓` / `jk` — курсор по элементам
+- [ ] `gG` — в начало / конец
+- [ ] `Space` — toggle выделения строки под курсором (anchor = текущая)
+- [ ] `Shift+↑↓` / `Shift+JK` — расширение диапазона от `anchor`
+- [ ] Курсор автоматически прилипает к существующему элементу при исчезновении выбранной строки (Remove / Cancel)
 
-### 6.6 Модалки конфликтов
-- [ ] URL-дубликат в очереди (`ask` / `skip` / `add` по политике)
-- [ ] Файл уже существует (`ask` / `rename` / `overwrite` по политике)
-- [ ] Мышь игнорируется
+### 6.6 Команды и модалки
+- [ ] Общая инфраструктура модалки: центрированный `Clear` + `Block` поверх UI, `Esc` закрывает, мышь игнорируется, paste через `Event::Paste`
+- [ ] `a` — Add-модалка: поля `url` (префилл из clipboard, если `http(s)://`) и `folder` (префилл из `GetSettings.default_dir`); `Tab` — переключение, `Enter` — submit, `Esc` — cancel
+- [ ] Клиентская проверка URL-дубля по `ViewModel` → модалка «duplicate url» (`open existing` / `add anyway` / `Esc`)
+- [ ] Серверная ошибка `FileExists` на `Add` → модалка «file exists» (`rename` / `overwrite` / `Esc`), повторный `Add` с `on_file_exists_override`
+- [ ] `p` / `r` — pause / resume выделенных (или под курсором); шлём bulk через `N × Pause` unary
+- [ ] `c` — модалка подтверждения; `y` / `n` или кнопки; при multi-select — сводное сообщение
+- [ ] `o` — `open` на macOS: если DONE — `open <path>`, иначе `open <target_dir>`
+- [ ] Серверные ошибки команд → toast внизу над hint-bar на 3 секунды
+
+### 6.7 Help overlay
+- [ ] `?` открывает полноэкранный overlay с группами `navigation` / `actions` / `view` / `misc`
+- [ ] Закрывается **любой клавишей** без выполнения команды
+- [ ] При высоте терминала < 25 — overlay скроллируется `↑↓`, закрытие только `Esc`/`q`/`?`
+
+### 6.8 Полировка
+- [ ] `NO_COLOR` — отключает все цвета, рендер полагается на символы
+- [ ] Форматирование байт: humansize (`1.5 MB`, `532 KB`, `15 B`); скорость — `1.2 MB/s`
+- [ ] Форматирование ETA: `2h 15m`, `15m 30s`, `45s`, `<1s`
+- [ ] Обрезка длинных имён файлов с `…` справа
+- [ ] Обработка SIGINT/SIGTERM клиента: чисто выйти из alternate screen, не убить терминал
 
 ## 7. Наблюдаемость
 - [ ] `tracing-subscriber` с JSON-форматтером во всех крейтах

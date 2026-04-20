@@ -25,6 +25,13 @@ pub enum Error {
     #[error("not found")]
     NotFound,
 
+    /// Целевой файл уже существует на диске, и клиент не указал, что с
+    /// ним делать (`OnFileExistsOverride::Unspecified`). Решение —
+    /// задача слоя выше (TUI-модалка): повторный `Add` с выставленным
+    /// override.
+    #[error("target file already exists: {path}")]
+    FileExists { path: std::path::PathBuf },
+
     /// Запасной вариант: ошибка, которую ещё не выделили в отдельный вариант.
     /// По мере взросления кода такие места заменяются на типизированные варианты.
     #[error("{0}")]

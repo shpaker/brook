@@ -26,6 +26,9 @@ service BrookService {
 
   // Server-streaming: события по всем известным загрузкам.
   rpc Watch(WatchRequest) returns (stream Event);
+
+  // Настройки демона — дефолты и политики — для префилла модалок клиента.
+  rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
 }
 
 // Уникальный идентификатор загрузки (UUID в виде строки).
@@ -50,6 +53,21 @@ message DownloadSpec {
   optional uint64 piece_size_min = 6;
   // Максимальный размер piece'а в байтах (должен быть степенью двойки).
   optional uint64 piece_size_max = 7;
+
+  // Что делать, если целевой файл уже существует. `UNSPECIFIED` —
+  // поведение по умолчанию сервера (`FileExists`-ошибка, решение
+  // принимает клиент). `RENAME` — сервер подбирает `<name> (N).<ext>`.
+  // `OVERWRITE` — сервер удаляет существующий файл перед стартом.
+  OnFileExistsOverride on_file_exists_override = 8;
+}
+
+// Политика для клиента: что делать, когда `Add` упирается в существующий
+// файл на диске. Клиент получает `UNSPECIFIED`-ошибку, показывает модалку,
+// и повторяет `Add` с явно выставленным override.
+enum OnFileExistsOverride {
+  ON_FILE_EXISTS_OVERRIDE_UNSPECIFIED = 0;
+  ON_FILE_EXISTS_OVERRIDE_RENAME = 1;
+  ON_FILE_EXISTS_OVERRIDE_OVERWRITE = 2;
 }
 
 // Состояние загрузки.
@@ -183,4 +201,40 @@ message PauseAllRequest {
 }
 
 message ResumeAllRequest {
+}
+
+message GetSettingsRequest {
+}
+
+// Политики конфликтов, живущие в `brook.yaml`. Клиент может использовать
+// для решения, показывать ли модалку `ask` или сразу применить политику.
+enum OnDuplicateUrlPolicy {
+  ON_DUPLICATE_URL_POLICY_UNSPECIFIED = 0;
+  ON_DUPLICATE_URL_POLICY_ASK = 1;
+  ON_DUPLICATE_URL_POLICY_SKIP = 2;
+  ON_DUPLICATE_URL_POLICY_ADD = 3;
+}
+
+enum OnFileExistsPolicy {
+  ON_FILE_EXISTS_POLICY_UNSPECIFIED = 0;
+  ON_FILE_EXISTS_POLICY_ASK = 1;
+  ON_FILE_EXISTS_POLICY_RENAME = 2;
+  ON_FILE_EXISTS_POLICY_OVERWRITE = 3;
+}
+
+message GetSettingsResponse {
+  // Дефолты для префилла Add-модалки (`target_dir` / `workers`).
+  string default_dir = 1;
+  uint32 default_workers = 2;
+  uint32 max_workers = 3;
+  uint32 max_concurrent = 4;
+
+  // Дефолты нарезки (для справочного отображения; TUI в MVP их не меняет).
+  uint32 piece_target_count = 5;
+  uint64 piece_size_min = 6;
+  uint64 piece_size_max = 7;
+
+  // Политики конфликтов из `brook.yaml`.
+  OnDuplicateUrlPolicy on_duplicate_url = 8;
+  OnFileExistsPolicy on_file_exists = 9;
 }

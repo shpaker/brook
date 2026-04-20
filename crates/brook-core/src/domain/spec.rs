@@ -28,6 +28,26 @@ pub struct DownloadSpec {
     pub piece_size_min: Option<u64>,
     /// Override верхней границы `piece_size` в байтах. `None` — дефолт.
     pub piece_size_max: Option<u64>,
+    /// Что делать, если целевой файл уже существует. Транзиентный
+    /// request-time hint: при rename/overwrite фабрика разрешает
+    /// конфликт, после чего значение не используется и в очереди не
+    /// персистится (после рестарта считается `Unspecified`).
+    pub on_file_exists_override: OnFileExistsOverride,
+}
+
+/// Что делать, если целевой файл `<target_dir>/<filename>` уже существует
+/// в момент `Add`.
+///
+/// `Unspecified` — фабрика упирается в `Error::FileExists`; решение
+/// принимает клиент (TUI-модалка §6.6). `Rename` — фабрика подбирает
+/// свободное имя `<stem> (N).<ext>`. `Overwrite` — удаляет существующий
+/// файл до инициализации `.data.brook`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OnFileExistsOverride {
+    #[default]
+    Unspecified,
+    Rename,
+    Overwrite,
 }
 
 impl DownloadSpec {
@@ -46,6 +66,7 @@ impl DownloadSpec {
             piece_target_count: None,
             piece_size_min: None,
             piece_size_max: None,
+            on_file_exists_override: OnFileExistsOverride::Unspecified,
         }
     }
 }
