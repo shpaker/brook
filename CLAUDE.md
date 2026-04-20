@@ -60,7 +60,7 @@ Per-download artefacts live next to the target file: `<name>.data.brook` (preall
 
 - Never push to `main` directly. Never force-push shared branches without explicit user ask.
 
-- **Before every `git push`, update [docs/todo.md](docs/todo.md) to match reality.** Tick off completed bullets, reword bullets that drifted from what actually landed, add new items discovered during the work. The todo is source of truth for project progress — it must not lag behind the code. If nothing in the todo changed, include a sentence in the PR description saying so explicitly.
+- **Before pushing code changes, update [docs/todo.md](docs/todo.md) to match reality.** Tick off completed bullets, reword bullets that drifted from what actually landed, add new items discovered during the work. The todo is source of truth for MVP progress — it must not lag behind the code. Does not apply to pushes that only change docs.
 
 ## Coding conventions
 
