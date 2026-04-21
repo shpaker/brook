@@ -1,7 +1,7 @@
-//! Запуск unary-команд (`Add`, `Pause`, `Resume`, `Cancel`, `Remove`)
-//! из UI-task'а. Каждая команда крутится в `tokio::spawn`, результат
-//! возвращается в UI как `UiEvent::CmdResult` — ошибки показываются
-//! toast'ом, `FileExists` на `Add` поднимает модалку выбора политики.
+//! Запуск unary-команд (`Add`, `Pause`, `Resume`, `Remove`) из UI-task'а.
+//! Каждая команда крутится в `tokio::spawn`, результат возвращается в UI
+//! как `UiEvent::CmdResult` — ошибки показываются toast'ом, `FileExists`
+//! на `Add` поднимает модалку выбора политики.
 
 use brook_proto::brook::v1::brook_service_client::BrookServiceClient;
 use brook_proto::brook::v1::{
@@ -10,6 +10,7 @@ use brook_proto::brook::v1::{
     DownloadSpec,
     IdRequest,
     OnFileExistsOverride,
+    RemoveRequest,
     ShutdownRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -85,9 +86,34 @@ pub fn resume(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
     });
 }
 
-pub fn cancel(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
-    run_bulk(ch, tx, ids, "cancel", |mut client, req| {
-        Box::pin(async move { client.cancel(req).await.map(|_| ()) })
+/// Remove идемпотентен на стороне демона (см. `manager::remove`): ghost
+/// id даст `Ok`. Успешно обработанные id отдаём UI, чтобы тот дропнул
+/// их из ViewModel — событий по удалению демон не генерит.
+pub fn remove(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
+    tokio::spawn(async move {
+        let mut removed: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for id in &ids {
+            let mut client = BrookServiceClient::new(ch.clone());
+            let req = RemoveRequest {
+                id: Some(DownloadId { value: id.clone() }),
+            };
+            match client.remove(req).await {
+                Ok(_) => removed.push(id.clone()),
+                Err(st) => errors.push(format!("{}: {}", short_id(id), st.message())),
+            }
+        }
+        if !removed.is_empty() {
+            send(&tx, CmdOutcome::Removed { ids: removed });
+        }
+        if !errors.is_empty() {
+            send(
+                &tx,
+                CmdOutcome::Error(format!("delete failed — {}", errors.join("; "))),
+            );
+        } else if ids.is_empty() {
+            send(&tx, CmdOutcome::Ok);
+        }
     });
 }
 
@@ -105,43 +131,36 @@ fn run_bulk(
     call: BulkFn,
 ) {
     tokio::spawn(async move {
+        let mut not_found: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         for id in &ids {
             let client = BrookServiceClient::new(ch.clone());
             let req = id_request(id);
             if let Err(st) = call(client, req).await {
-                errors.push(format!("{}: {}", short_id(id), st.message()));
+                if st.code() == Code::NotFound {
+                    not_found.push(id.clone());
+                } else {
+                    errors.push(format!("{}: {}", short_id(id), st.message()));
+                }
             }
         }
-        if errors.is_empty() {
-            send(&tx, CmdOutcome::Ok);
-        } else {
+        let had_not_found = !not_found.is_empty();
+        if had_not_found {
+            send(&tx, CmdOutcome::NotFound { ids: not_found });
+        }
+        if !errors.is_empty() {
             send(
                 &tx,
                 CmdOutcome::Error(format!("{op} failed — {}", errors.join("; "))),
             );
+        } else if !had_not_found {
+            send(&tx, CmdOutcome::Ok);
         }
     });
 }
 
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
-}
-
-/// Открытие файла/папки — `open` на macOS. Ошибки не критичны, их
-/// отдаём toast'ом.
-pub fn open_path(tx: UnboundedSender<UiEvent>, path: String) {
-    tokio::spawn(async move {
-        match tokio::process::Command::new("open")
-            .arg(&path)
-            .status()
-            .await
-        {
-            Ok(s) if s.success() => send(&tx, CmdOutcome::Ok),
-            Ok(s) => send(&tx, CmdOutcome::Error(format!("open exited with {s}"))),
-            Err(e) => send(&tx, CmdOutcome::Error(format!("open failed: {e}"))),
-        }
-    });
 }
 
 /// Послать `Shutdown` RPC и по завершении (успех или ошибка) отправить

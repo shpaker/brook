@@ -55,8 +55,11 @@ pub async fn run(
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
 
+    // Поток ввода специально не джойним на выходе: crossterm::event::read()
+    // блокирующий, без следующей клавиши он не отпустит. Раз нам нечего
+    // флашить из этого потока — отпускаем его жить до конца процесса.
     let input_tx = tx.clone();
-    let input_handle = std::thread::spawn(move || input_loop(input_tx));
+    std::thread::spawn(move || input_loop(input_tx));
 
     let watch_handle = watch::spawn(channel.clone(), tx.clone());
 
@@ -107,7 +110,6 @@ pub async fn run(
     tick_handle.abort();
     signal_handle.abort();
     drop(rx);
-    let _ = input_handle.join();
 
     Ok(())
 }
@@ -179,6 +181,19 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
         CmdOutcome::AddFileExists { form } => {
             vm.mode = Mode::FileExists { form };
         }
+        CmdOutcome::Removed { ids } => {
+            vm.drop_rows(&ids);
+        }
+        CmdOutcome::NotFound { ids } => {
+            // Не перетираем другую модалку (напр., Add) — в этом случае
+            // просто тост, без алерта: призраки всплывают только по
+            // нормальным pause/resume, где Mode::Normal.
+            if matches!(vm.mode, Mode::Normal) {
+                vm.mode = Mode::Ghost { ids };
+            } else {
+                vm.set_toast("download not found on daemon");
+            }
+        }
     }
 }
 
@@ -207,8 +222,12 @@ fn handle_key(
             handle_key_file_exists(vm, k, channel.clone(), tx.clone());
             false
         }
-        Mode::ConfirmCancel { .. } => {
+        Mode::ConfirmDelete { .. } => {
             handle_key_confirm(vm, k, channel.clone(), tx.clone());
+            false
+        }
+        Mode::Ghost { .. } => {
+            handle_key_ghost(vm, k, channel.clone(), tx.clone());
             false
         }
         Mode::Help { .. } => {
@@ -229,13 +248,9 @@ fn handle_key_normal(
     let visible_len = vm.visible_ids().len();
     match k.code {
         KeyCode::Char('q') => {
-            if vm.spawned_daemon {
-                vm.mode = Mode::QuitConfirm;
-                return false;
-            }
-            return true;
+            vm.mode = Mode::QuitConfirm;
+            return false;
         }
-        KeyCode::Tab => vm.detail_visible = !vm.detail_visible,
         KeyCode::Char('?') => vm.mode = Mode::Help { scroll: 0 },
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
             vm.cursor = vm.cursor.saturating_sub(1);
@@ -262,25 +277,23 @@ fn handle_key_normal(
         }
         KeyCode::Char('p') => {
             let ids = vm.action_targets();
-            if !ids.is_empty() {
-                command::pause(channel.clone(), tx.clone(), ids);
+            let (to_resume, to_pause): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
+                vm.downloads
+                    .get(id)
+                    .map(|r| r.state == brook_proto::brook::v1::DownloadState::Paused)
+                    .unwrap_or(false)
+            });
+            if !to_resume.is_empty() {
+                command::resume(channel.clone(), tx.clone(), to_resume);
+            }
+            if !to_pause.is_empty() {
+                command::pause(channel.clone(), tx.clone(), to_pause);
             }
         }
-        KeyCode::Char('r') => {
+        KeyCode::Char('d') => {
             let ids = vm.action_targets();
             if !ids.is_empty() {
-                command::resume(channel.clone(), tx.clone(), ids);
-            }
-        }
-        KeyCode::Char('c') => {
-            let ids = vm.action_targets();
-            if !ids.is_empty() {
-                vm.mode = Mode::ConfirmCancel { ids };
-            }
-        }
-        KeyCode::Char('o') => {
-            if let Some(path) = vm.open_target() {
-                command::open_path(tx.clone(), path);
+                vm.mode = Mode::ConfirmDelete { ids };
             }
         }
         _ => {}
@@ -391,7 +404,7 @@ fn handle_key_confirm(
     channel: Channel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::ConfirmCancel { ids } = &vm.mode else {
+    let Mode::ConfirmDelete { ids } = &vm.mode else {
         return;
     };
     let ids = ids.clone();
@@ -399,7 +412,54 @@ fn handle_key_confirm(
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
         KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             vm.mode = Mode::Normal;
-            command::cancel(channel, tx, ids);
+            command::remove(channel, tx, ids);
+        }
+        _ => {}
+    }
+}
+
+fn handle_key_ghost(
+    vm: &mut ViewModel,
+    k: KeyEvent,
+    channel: Channel,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) {
+    let Mode::Ghost { ids } = &vm.mode else {
+        return;
+    };
+    let ids = ids.clone();
+    match k.code {
+        KeyCode::Esc => vm.mode = Mode::Normal,
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            // Выкинуть призраки из ViewModel + дёрнуть Remove (идемпотентен,
+            // если запись уже не числится — просто подчищает очередь на
+            // стороне демона).
+            vm.drop_rows(&ids);
+            vm.mode = Mode::Normal;
+            command::remove(channel, tx, ids);
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            // Пере-загрузка: снимаем призраков, перезапускаем Add по
+            // сохранённым url/folder. Делаем по всем id из алерта — если
+            // их несколько, улетит пачка Add'ов.
+            let forms: Vec<AddForm> = ids
+                .iter()
+                .filter_map(|id| vm.downloads.get(id))
+                .map(|row| AddForm {
+                    url: row.url.clone(),
+                    folder: row.target_dir.clone(),
+                })
+                .collect();
+            vm.drop_rows(&ids);
+            vm.mode = Mode::Normal;
+            for form in forms {
+                command::add(
+                    channel.clone(),
+                    tx.clone(),
+                    form,
+                    OnFileExistsOverride::Unspecified,
+                );
+            }
         }
         _ => {}
     }
@@ -416,17 +476,28 @@ fn handle_key_quit_confirm(
             vm.mode = Mode::Normal;
             false
         }
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            // Сам RPC уходит в фон; по его завершении в канал падает
-            // `UiEvent::Quit` и мы выйдем из цикла. Даже если Shutdown
-            // ответил ошибкой — закрываемся, чтобы не зависнуть в
-            // модалке; демон всё равно уже получил сигнал или не
-            // получил — но TUI здесь бесполезен.
-            command::shutdown_daemon(channel, tx);
-            vm.mode = Mode::Normal;
-            false
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if vm.spawned_daemon {
+                // Сам RPC уходит в фон; по его завершении в канал падает
+                // `UiEvent::Quit` и мы выйдем из цикла. Даже если Shutdown
+                // ответил ошибкой — закрываемся, чтобы не зависнуть в
+                // модалке; демон всё равно уже получил сигнал или не
+                // получил — но TUI здесь бесполезен.
+                command::shutdown_daemon(channel, tx);
+                vm.mode = Mode::Normal;
+                false
+            } else {
+                true
+            }
         }
-        KeyCode::Char('n') | KeyCode::Char('N') => true,
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            if vm.spawned_daemon {
+                true
+            } else {
+                vm.mode = Mode::Normal;
+                false
+            }
+        }
         _ => false,
     }
 }

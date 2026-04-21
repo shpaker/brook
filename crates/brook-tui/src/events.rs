@@ -62,6 +62,15 @@ pub enum CmdOutcome {
     AddFileExists { form: AddForm },
     /// Сервер успешно принял `Add` — вернул новый `DownloadId`.
     AddAccepted,
+    /// `Remove` прошёл успешно (или же демон ответил `NotFound`, но
+    /// `Remove` идемпотентен — см. `manager::remove`). UI должен выкинуть
+    /// перечисленные id из ViewModel, потому что демон про них больше
+    /// событий слать не будет.
+    Removed { ids: Vec<String> },
+    /// Pause/Resume упёрлись в ghost-запись: id есть в ViewModel, но
+    /// демон отвечает `NotFound`. UI открывает алерт с предложением
+    /// пере-загрузить или удалить призрак.
+    NotFound { ids: Vec<String> },
 }
 
 /// Форма Add-модалки. Используется и при первом `Add`, и при повторе

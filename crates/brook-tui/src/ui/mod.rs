@@ -28,8 +28,6 @@ mod status;
 /// Минимальный размер терминала. Меньше — заглушка без попыток рендера.
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 15;
-/// Порог авто-скрытия detail-панели.
-const DETAIL_AUTO_HIDE_HEIGHT: u16 = 20;
 
 pub fn draw(f: &mut Frame, vm: &ViewModel) {
     let area = f.area();
@@ -39,38 +37,20 @@ pub fn draw(f: &mut Frame, vm: &ViewModel) {
     }
     let no_color = std::env::var_os("NO_COLOR").is_some();
 
-    // Detail скрывается автоматически при height < 20, но toggle
-    // (`Tab`) работает поверх — пользователь может и раскрыть, и закрыть.
-    let show_detail = vm.detail_visible && area.height >= DETAIL_AUTO_HIDE_HEIGHT;
-
-    let constraints: Vec<Constraint> = if show_detail {
-        vec![
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![
             Constraint::Length(2), // status
             Constraint::Min(0),    // list
             Constraint::Length(5), // detail
             Constraint::Length(1), // hint
-        ]
-    } else {
-        vec![
-            Constraint::Length(2),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ]
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
+        ])
         .split(area);
 
     status::draw(f, chunks[0], vm, no_color);
     list::draw(f, chunks[1], vm, no_color);
-    if show_detail {
-        detail::draw(f, chunks[2], vm, no_color);
-        hint::draw(f, chunks[3], no_color);
-    } else {
-        hint::draw(f, chunks[2], no_color);
-    }
+    detail::draw(f, chunks[2], vm, no_color);
+    hint::draw(f, chunks[3], no_color);
 
     modal::draw_overlay(f, vm, no_color);
 

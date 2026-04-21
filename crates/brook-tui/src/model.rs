@@ -108,7 +108,13 @@ pub enum Mode {
     FileExists {
         form: AddForm,
     },
-    ConfirmCancel {
+    ConfirmDelete {
+        ids: Vec<String>,
+    },
+    /// Демон не знает id, по которому TUI пытался pause/resume. Предлагаем
+    /// либо пере-загрузить (re-add по сохранённым URL/folder), либо
+    /// удалить призрак из локального ViewModel.
+    Ghost {
         ids: Vec<String>,
     },
     Help {
@@ -183,7 +189,6 @@ pub struct ViewModel {
     pub anchor: Option<usize>,
     /// Id выделенных строк (stable при переупорядочивании списка).
     pub selected: HashSet<String>,
-    pub detail_visible: bool,
     pub connection: ConnectionState,
     pub toast: Option<Toast>,
     pub port: u16,
@@ -201,7 +206,6 @@ impl ViewModel {
             cursor: 0,
             anchor: None,
             selected: HashSet::new(),
-            detail_visible: true,
             connection: ConnectionState::Reconnecting { attempt: 1 },
             toast: None,
             port,
@@ -313,19 +317,16 @@ impl ViewModel {
         visible.get(idx).cloned().into_iter().collect()
     }
 
-    /// `open`-таргет: если DONE → полный путь к файлу; иначе — target_dir.
-    pub fn open_target(&self) -> Option<String> {
-        let visible = self.visible_ids();
-        let idx = self.cursor.min(visible.len().saturating_sub(1));
-        let id = visible.get(idx)?;
-        let row = self.downloads.get(id)?;
-        if row.state == proto::DownloadState::Done && !row.filename.is_empty() {
-            let mut p = std::path::PathBuf::from(&row.target_dir);
-            p.push(&row.filename);
-            Some(p.display().to_string())
-        } else {
-            Some(row.target_dir.clone())
+    /// Выкинуть строки из ViewModel локально. Нужно, когда удаление
+    /// произошло на стороне демона (или по ghost-алерту): демон не
+    /// шлёт явного `Removed`-события, и без ручной чистки запись висит.
+    pub fn drop_rows(&mut self, ids: &[String]) {
+        for id in ids {
+            self.downloads.shift_remove(id);
+            self.selected.remove(id);
         }
+        let visible_len = self.visible_ids().len();
+        self.clamp_cursor(visible_len);
     }
 
     pub fn set_toast(&mut self, msg: impl Into<String>) {
