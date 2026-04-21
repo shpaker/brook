@@ -10,7 +10,7 @@
 //! build_runtime(paths)
 //!     ├── .brook.lock (flock)
 //!     ├── Settings::load_or_init
-//!     ├── SqliteQueueRepository::open + миграции
+//!     ├── SharedDb::open + миграции + SqliteFileRepository
 //!     ├── HttpClientBuilder (один reqwest::Client → inspect + range)
 //!     ├── LocalPieceStorageFactory
 //!     └── DownloadManager::new + bootstrap()
@@ -65,8 +65,10 @@ use crate::config::{
     OnFileExists,
     Settings,
 };
+use crate::storage::db::SharedDb;
 use crate::storage::factory::LocalPieceStorageFactory;
-use crate::storage::queue::SqliteQueueRepository;
+use crate::storage::files::SqliteFileRepository;
+use crate::storage::pieces::SqlitePieceRepository;
 
 /// Имя lock-файла в CWD (гарантирует single-instance).
 pub const LOCK_FILENAME: &str = ".brook.lock";
@@ -78,7 +80,7 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 /// Конкретные типы адаптеров, с которыми параметризуется менеджер в
 /// проде и интеграционных тестах.
 pub type ProdFactory = LocalPieceStorageFactory<HttpInspectClient>;
-pub type ProdQueue = SqliteQueueRepository;
+pub type ProdQueue = SqliteFileRepository;
 pub type ProdFetch = RangeFetchClient;
 pub type ProdManager = DownloadManager<ProdFactory, ProdQueue, ProdFetch>;
 pub type ProdService = BrookService<ProdFactory, ProdQueue, ProdFetch>;
@@ -143,8 +145,11 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         .with_context(|| format!("load config {}", paths.config.display()))?;
     let daemon = DaemonRuntime::from_settings(&settings).context("derive daemon runtime")?;
 
-    // 3. Queue.
-    let queue = Arc::new(SqliteQueueRepository::open(&paths.db).context("open queue database")?);
+    // 3. Repositories (поверх общего `brook.db`).
+    let shared_db = SharedDb::open(&paths.db).context("open brook.db")?;
+    let files_repo = Arc::new(SqliteFileRepository::new(shared_db.clone()));
+    let pieces_repo = Arc::new(SqlitePieceRepository::new(shared_db));
+    let queue = Arc::clone(&files_repo);
 
     // 4. HTTP-стек (один reqwest::Client на inspect + range).
     let http_client = HttpClientBuilder::new().build();
@@ -155,6 +160,8 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
     let factory = Arc::new(LocalPieceStorageFactory::new(
         Arc::clone(&inspect),
         daemon.defaults,
+        pieces_repo,
+        Arc::clone(&files_repo),
     ));
 
     // 6. Manager + bootstrap.

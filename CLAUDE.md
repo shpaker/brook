@@ -54,7 +54,7 @@ just fix                     # clippy --fix + fmt
 | `brook.db` | Config (`settings` table) + global download queue (SQLite) |
 | `.brook.lock` | Single-instance flock (held by `brookd`) |
 
-Per-download artefacts live next to the target file: `<name>.data.brook` (preallocated) + `<name>.index.brook` (piece index, SQLite WAL).
+Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to the target file. The piece index, per-download settings and state history are rows in the shared `./brook.db` (tables `files`, `file_settings`, `state_changes`, `pieces` — see [docs/schema.dbml](docs/schema.dbml)).
 
 ## Git
 
@@ -81,7 +81,7 @@ Per-download artefacts live next to the target file: `<name>.data.brook` (preall
 
 - **Trait names** — prefix with `T`: `TPieceStorage`, `TQueueStore`, `TPieceStorageFactory`. Applies to all traits in every crate of this workspace.
 - **`brook-core` layout — Hexagonal (Ports & Adapters).** New domain types go into `crates/brook-core/src/domain/` (pure, no I/O, no external-world dependencies). New outbound traits — into `crates/brook-core/src/ports/`. Application services (coordinators like `DownloadManager`, `DownloadEngine`) — into `crates/brook-core/src/service/` (to be created at stage 1.3). Concrete adapters (SQLite, HTTP clients, gRPC) **never** live in `brook-core` — they belong in `brookd`, `brook-http`, `brook-api`, or other dedicated adapter crates. `brook-core` must not depend on `reqwest`, `rusqlite`, or any other I/O library; enforced by `cargo tree -p brook-core`. The public API of `brook-core` stays flat (`brook_core::DownloadId`, `brook_core::TPieceStorage`) — internal folders exist to keep layers from mixing, not to nest the API.
-- **DB access — only through repository structs.** Any SQLite manipulation (`brook.db`, `.index.brook`) lives inside a dedicated repository struct. SQL strings and `rusqlite::Connection` usage never leak past the repository boundary — callers get domain methods, not queries.
+- **DB access — only through repository structs.** Any SQLite manipulation in `brook.db` lives inside a dedicated repository struct. SQL strings and `rusqlite::Connection` usage never leak past the repository boundary — callers get domain methods, not queries.
 
 ## Formatting (Rust)
 

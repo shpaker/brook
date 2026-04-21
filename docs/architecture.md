@@ -89,7 +89,7 @@ brook/                            # workspace root
 
 | Реализация | Где живёт | Назначение |
 |---|---|---|
-| `LocalPieceStorage` | `brookd` | Основная: `pwrite` в `.data.brook` + `.index.brook` (SQLite WAL) |
+| `LocalPieceStorage` | `brookd` | Основная: `pwrite` в `.data.brook`; карта piece'ов — в общей `brook.db` (таблица `pieces`) |
 | `MemoryPieceStorage` | `brook-core` (test utils) | In-memory, для юнит-тестов без диска |
 | `S3PieceStorage` | внешний крейт | S3 multipart upload; локальный SQLite хранит ETag и part number |
 
@@ -103,19 +103,19 @@ brook/                            # workspace root
 
 | Реализация | Где живёт | Назначение |
 |---|---|---|
-| `SqliteTQueueStore` | `brookd` | Основная: таблица `downloads` в `./brook.db` |
+| `SqliteFileRepository` | `brookd` | Основная: таблицы `files` / `file_settings` / `state_changes` в `./brook.db` (см. [Схема `brook.db`](#схема-brookdb)) |
 | `MemoryTQueueStore` | `brook-core` (test utils) | In-memory, для юнит-тестов без диска |
 
 ## Раскладка на диске
 
-> Этот раздел описывает детали `LocalPieceStorage` — реализации `TPieceStorage` по умолчанию в `brook-core`. Другие реализации (S3 и т. д.) используют тот же трейт, но хранят данные иначе.
+> Этот раздел описывает детали `LocalPieceStorage` — реализации `TPieceStorage` по умолчанию. Другие реализации (S3 и т. д.) используют тот же трейт, но хранят данные иначе.
 
-На каждую активную загрузку — **два артефакта** рядом в целевой папке.
+На каждую активную загрузку — **один артефакт** рядом в целевой папке и строки в общей `./brook.db`.
 
 ### Артефакты
 
 1. **`<filename>.data.brook`** — пре-аллоцированный файл полного финального размера. На macOS — `F_PREALLOCATE` (реальная резервация физических блоков) + `ftruncate` до целевого размера, без явного обнуления. Куски пишутся прямо сюда через `pwrite` по своим offset'ам.
-2. **`<filename>.index.brook`** — SQLite-база рядом (WAL-режим, `synchronous=NORMAL`). Хранит: URL, общий размер, размер куска, число кусков, статус каждого куска (`pending` / `done`), кастомные заголовки, отметки времени.
+2. **Строки в `./brook.db`** (таблицы `files` / `file_settings` / `state_changes` / `pieces`) — URL, целевая папка, `total_size`, `piece_size`, история переходов состояний, статус каждого piece'а (`pending` / `done`). Подробнее — [Схема `brook.db`](#схема-brookdb).
 
 ### Кусок vs буфер записи vs воркер
 
@@ -125,7 +125,7 @@ brook/                            # workspace root
 
 ### Выбор `piece_size`
 
-При создании загрузки `piece_size` подбирается адаптивно под общий размер файла и фиксируется на весь жизненный цикл — пишется в таблицу `meta` внутри `.index.brook` и при ресюме читается оттуда, а не пересчитывается.
+При создании загрузки `piece_size` подбирается адаптивно под общий размер файла и фиксируется на весь жизненный цикл — пишется в `file_settings` в `./brook.db` и при ресюме читается оттуда, а не пересчитывается.
 
 Алгоритм: делим общий размер файла на целевое число кусков (`piece_target_count`, дефолт 128), округляем вверх до ближайшей степени двойки, клампим в диапазон `[piece_size_min, piece_size_max]` (дефолты 16 MiB и 128 MiB). Дефолты всех трёх параметров живут в `brook.yaml` (см. [Конфигурация](#конфигурация)), а `DownloadSpec` может прислать override на конкретную загрузку — это позволяет сместить баланс в сторону более точного ресюма (меньшие границы) или меньшего числа Range-запросов (большие границы).
 
@@ -141,7 +141,7 @@ brook/                            # workspace root
 2. **`piece_size ≥ piece_size_min` (дефолт 16 MiB).** Амортизация TLS handshake и Range-заголовков на каждом запросе. Кратность 4 KiB получается автоматически — `pwrite` ложится на страницы ФС без read-modify-write.
 3. **`piece_size ≤ piece_size_max` (дефолт 128 MiB).** Ограничивает стоимость ретрая при обрыве соединения и объём теряемого трафика при `kill -9` (см. [Батчевый коммит](#батчевый-коммит)).
 4. **Целевое число кусков `N ≤ piece_target_count` (дефолт 128).** CDN-friendly: сотни Range-запросов с одного IP не выглядят как сканер. На файлах крупнее `piece_target_count × piece_size_max` потолок размыкается — `piece_size_max` побеждает.
-5. **`piece_size` фиксируется при создании загрузки** и хранится в `meta` таблице `.index.brook`. Ресюм детерминирован даже при смене настроек в `brook.yaml` между запусками.
+5. **`piece_size` фиксируется при создании загрузки** и хранится в `file_settings` в `./brook.db`. Ресюм детерминирован даже при смене настроек в `brook.yaml` между запусками.
 6. **Число воркеров — независимый параметр** (`download.default_workers`, `download.max_workers`). `piece_size` не зависит от числа воркеров и наоборот.
 7. **Неизвестный `Content-Length`** (chunked, нет заголовка) — `piece_size` не применяется, работает single-stream fallback (см. [Range-загрузка и fallback](#range-загрузка-и-fallback)).
 
@@ -166,15 +166,27 @@ brook/                            # workspace root
 Когда все куски `done`:
 1. Финальный `fsync(.data.brook)`.
 2. `rename` `<filename>.data.brook` → `<filename>`.
-3. `<filename>.index.brook` удаляется.
+3. Piece-строки загрузки в `brook.db` удаляются (`DELETE FROM pieces WHERE file_id = ?`); переход в `done` пишет `DownloadEngine` через `TQueueStore::update_state`.
 
 ### Ресюм и сбои (`LocalPieceStorage`)
 
-Реализация `pending_pieces()`:
+Реализация `pending_pieces()` читает статусы из таблицы `pieces` в `./brook.db`:
 
-- **Чистый перезапуск процесса**: читаем `.index.brook`, докачиваем все `pending`-куски.
-- **`.index.brook` повреждён или удалён**: доверять `.data.brook` нечем (часть `done`-кусков могла быть только в page cache и не долететь). Удаляем `.data.brook`, пересоздаём индекс, стартуем с нуля.
-- **`.data.brook` удалён, индекс цел**: симметрично — удаляем индекс, стартуем с нуля.
+- **Чистый перезапуск процесса**: читаем `pieces` для `file_id`, докачиваем всё, что не `done`. Runtime-статус `in_progress` не персистится — после рестарта трактуется как `pending`.
+- **`.data.brook` удалён или inspect-поля в `file_settings` не совпали с текущими заголовками источника** (сменился `total_size`, `etag`, `last_modified` или число строк в `pieces` не равно ожидаемому `piece_count`): доверять `.data.brook` нечем. `LocalPieceStorage::open` вычищает piece-строки загрузки (`delete_all(id)`), пересоздаёт `.data.brook`, заново преаллоцирует и инициализирует piece-таблицу.
+- **`brook.db` повреждена**: это провал уровня демона, а не одной загрузки — `brookd` не поднимется, чиним БД отдельно.
+
+## Схема `brook.db`
+
+Вся persisted-метаинформация демона живёт в одном SQLite-файле `./brook.db` (WAL, `synchronous=NORMAL`, `foreign_keys=ON`). Полный DDL — [schema.dbml](schema.dbml); здесь — смысл таблиц и инварианты, которые нельзя выразить SQL-уровнем:
+
+- **`files`** — одна строка на загрузку: URL, целевая папка, имя файла, текущее состояние (`state_id` → `states.name`).
+- **`file_settings`** (1:1 к `files`) — per-download настройки (воркеры, параметры нарезки) и inspect-поля (`total_size`, `piece_size`, `etag`, `last_modified`). Inspect-поля заполняются в `prepare` до первого перехода в `running`.
+- **`state_changes`** — история переходов состояний (append-only). При переходе в `failed` поле `reason_code_id` обязательно (ссылается в справочник `reason_codes`); `reason_message` — свободный текст деталей.
+- **`pieces`** — карта piece'ов всех активных загрузок; скоуп по `file_id`. В БД живут только `pending` и `done` — runtime-состояние `in_progress` на диск не попадает (после рестарта трактуется как `pending`).
+- **`states`**, **`reason_codes`** — справочники с natural-key. Сидятся при миграции `user_version = 1` через `INSERT OR IGNORE`.
+
+Все дочерние таблицы каскадно удаляются при удалении строки из `files` (`ON DELETE CASCADE` на FK). SQL за пределы адаптерного слоя (`SqliteFileRepository`, `SqlitePieceRepository` в `brookd`) не утекает: `brook-core` видит только порты `TQueueStore` / `TPieceStorage`, а `cargo tree -p brook-core` не тянет `rusqlite`.
 
 ## Сеть и устойчивость
 
@@ -221,7 +233,7 @@ brook/                            # workspace root
 `SIGTERM` / `SIGINT` в `brookd`:
 1. Прекращаем приём новых команд через gRPC.
 2. Пауза всех `DownloadEngine` — каждый доводит in-flight куски до batch-границы.
-3. Финальный `fsync(.data.brook)` + batch-коммит `.index.brook` для каждой активной загрузки.
+3. Финальный `fsync(.data.brook)` + batch-коммит piece-строк в `brook.db` для каждой активной загрузки.
 4. Закрываем gRPC-сервер, `./brook.db`, лог-writer, отпускаем `.brook.lock`.
 5. Exit 0.
 

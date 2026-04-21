@@ -1,13 +1,14 @@
 //! Абстракция над хранилищем piece'ов одной загрузки.
 //!
-//! Концепция: каждая загрузка пишется в два файла рядом с целевым:
-//! - `<name>.data.brook` — преаллокация на полный размер, в неё воркеры
-//!   пишут байты по offset'ам (`pwrite`).
-//! - `<name>.index.brook` — SQLite (WAL) с картой piece'ов: какой готов,
-//!   какой нет. Нужен для докачки после падения демона.
+//! Концепция: рядом с целевым именем живёт `<name>.data.brook` —
+//! преаллоцированный контейнер на полный размер, в который воркеры пишут
+//! байты по offset'ам (`pwrite`). Карта готовых piece'ов и вся
+//! persisted-метаинформация лежат в общей `./brook.db` (см.
+//! [`crate::ports::TQueueStore`] и адаптерный слой в `brookd`); трейт про
+//! это знать не обязан — он оперирует номерами piece'ов.
 //!
-//! Контракт этого трейта — **отдельный от** его реализаций. В 1.2 у нас
-//! только контракт; конкретные реализации появятся в 1.9–1.10.
+//! Контракт этого трейта — **отдельный от** его реализаций. Конкретные
+//! реализации (`LocalPieceStorage` и его фабрика) живут в `brookd`.
 //!
 //! ### Почему `-> impl Future + Send`, а не `async fn`
 //! В edition 2024 `async fn` в трейте компилируется, но **не добавляет
@@ -19,7 +20,10 @@
 
 use std::future::Future;
 
-use crate::domain::DownloadSpec;
+use crate::domain::{
+    DownloadId,
+    DownloadSpec,
+};
 use crate::error::Result;
 use crate::ports::RangeGuard;
 
@@ -56,11 +60,11 @@ pub trait TPieceStorage: Send + Sync {
     fn pending_pieces(&self) -> impl Future<Output = Result<Vec<u32>>> + Send;
 
     /// Финализация успешной загрузки: переименовать `<name>.data.brook → <name>`,
-    /// удалить `<name>.index.brook`.
+    /// очистить piece-строки загрузки в `brook.db`.
     fn finalize(&self) -> impl Future<Output = Result<()>> + Send;
 
-    /// Отмена: удалить `*.data.brook` и `*.index.brook`. Целевой файл, если
-    /// уже существовал до старта, не трогается.
+    /// Отмена: удалить `<name>.data.brook` и стереть piece-строки загрузки
+    /// в `brook.db`. Целевой файл, если уже существовал до старта, не трогается.
     fn abort(&self) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -104,8 +108,17 @@ pub struct PreparedDownload<S: TPieceStorage> {
 pub trait TPieceStorageFactory: Send + Sync {
     type Storage: TPieceStorage;
 
+    /// Подготовить piece-хранилище.
+    ///
+    /// `id` нужен фабрике, чтобы связать persisted-state загрузки
+    /// в `brook.db` (строку в `files`/`file_settings`, а начиная
+    /// со stage 4 — и piece-таблицу) с конкретным открытым
+    /// хранилищем. Без id фабрика не смогла бы писать
+    /// inspect-поля в `file_settings` или делать resume
+    /// через общий `SharedDb`.
     fn prepare(
         &self,
+        id: DownloadId,
         spec: &DownloadSpec,
     ) -> impl Future<Output = Result<PreparedDownload<Self::Storage>>> + Send;
 }

@@ -24,7 +24,9 @@ use brookd::app::{
     build_runtime,
     serve,
 };
-use brookd::storage::queue::SqliteQueueRepository;
+use brookd::storage::db::SharedDb;
+use brookd::storage::files::SqliteFileRepository;
+use rusqlite::params;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tonic::transport::Channel;
@@ -172,7 +174,8 @@ async fn shutdown_persists_and_restart_resumes() {
 
     // ── после shutdown: очередь читаема, состояние нормализовано ──────
     {
-        let queue = Arc::new(SqliteQueueRepository::open(&paths.db).expect("reopen queue"));
+        let db = SharedDb::open(&paths.db).expect("reopen brook.db");
+        let queue = Arc::new(SqliteFileRepository::new(db.clone()));
         let all: Vec<Download> = queue.load_all().await.expect("load_all");
         assert_eq!(all.len(), 1, "queue must contain one entry");
         assert_eq!(all[0].id.to_string(), id.value);
@@ -190,6 +193,47 @@ async fn shutdown_persists_and_restart_resumes() {
             "unexpected state: {:?}",
             all[0].state
         );
+
+        // Stage 9 E2E — наблюдаемости после shutdown:
+        //   - на диске рядом с таргетом только `.data.brook` или уже
+        //     финализированный `f.bin` (если успели докачать до SIGTERM);
+        //     sidecar `.index.brook` не должен появиться никогда.
+        //   - в `brook.db` есть piece-строки (`pending`/`done`) пока
+        //     загрузка не финализирована, и `state_changes` содержит
+        //     хотя бы один переход.
+        let dl = downloads.path();
+        assert!(
+            !dl.join("f.bin.index.brook").exists(),
+            "sidecar index file must not exist"
+        );
+        let data_brook = dl.join("f.bin.data.brook");
+        let target = dl.join("f.bin");
+        assert!(
+            data_brook.exists() || target.exists(),
+            "expected .data.brook or finalized target next to the download"
+        );
+
+        let id_str = all[0].id.to_string();
+        let (pieces_total, state_changes): (i64, i64) = db
+            .with_conn(move |c| {
+                let pieces: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM pieces WHERE file_id = ?",
+                    params![id_str.clone()],
+                    |r| r.get(0),
+                )?;
+                let changes: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM state_changes WHERE file_id = ?",
+                    params![id_str],
+                    |r| r.get(0),
+                )?;
+                Ok((pieces, changes))
+            })
+            .await
+            .expect("brook.db readback");
+        assert!(state_changes >= 1, "state_changes must record transitions");
+        if all[0].state != DownloadState::Done {
+            assert!(pieces_total >= 1, "pieces must be populated until finalize");
+        }
     }
 
     // ── round 2: рестарт → bootstrap нормализует в Queued ─────────────
@@ -225,6 +269,52 @@ async fn shutdown_persists_and_restart_resumes() {
         "bootstrap must normalize Running/Retrying, got {:?}",
         snap[0].state
     );
+
+    // Дождаться финализации: `.data.brook` исчезает, таргет появляется,
+    // piece-строки подчищены. Движок досылает последние куски и делает
+    // `rename`. 4 с с запасом для 1 MiB на wiremock'е.
+    let mut finalized = false;
+    for _ in 0..160 {
+        let snap = manager2.snapshot();
+        if snap.iter().any(|d| d.state == DownloadState::Done) {
+            finalized = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(finalized, "download did not reach Done after restart");
+
+    let dl = downloads.path();
+    assert!(dl.join("f.bin").exists(), "target file must exist");
+    assert!(
+        !dl.join("f.bin.data.brook").exists(),
+        ".data.brook must be removed after finalize"
+    );
+
+    {
+        let db = SharedDb::open(&paths.db).expect("reopen brook.db");
+        let id_str = id.value.clone();
+        let (pieces_total, final_state): (i64, String) = db
+            .with_conn(move |c| {
+                let pieces: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM pieces WHERE file_id = ?",
+                    params![id_str.clone()],
+                    |r| r.get(0),
+                )?;
+                let last: String = c.query_row(
+                    "SELECT state_id FROM state_changes
+                      WHERE file_id = ?
+                      ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    params![id_str],
+                    |r| r.get(0),
+                )?;
+                Ok((pieces, last))
+            })
+            .await
+            .expect("final brook.db readback");
+        assert_eq!(pieces_total, 0, "pieces must be cleared after finalize");
+        assert_eq!(final_state, "done", "last state_changes entry must be done");
+    }
 
     tx2.send(()).unwrap();
     serve_task2

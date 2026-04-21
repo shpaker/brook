@@ -14,6 +14,7 @@ use crate::domain::{
     Download,
     DownloadId,
     DownloadState,
+    FailureReason,
 };
 use crate::error::{
     Error,
@@ -63,11 +64,22 @@ impl TQueueStore for MemoryTQueueStore {
         Ok(())
     }
 
-    async fn update_state(&self, id: DownloadId, state: DownloadState) -> Result<()> {
+    async fn update_state(
+        &self,
+        id: DownloadId,
+        state: DownloadState,
+        reason: Option<FailureReason>,
+    ) -> Result<()> {
         let mut inner = self.inner.lock().expect("mutex poisoned");
         let entry = inner.get_mut(&id).ok_or(Error::NotFound)?;
         entry.state = state;
         entry.updated_at = SystemTime::now();
+        // Для удобства юнит-тестов: если reason пришёл, отражаем
+        // его в `Download.error` (эта колонка и так пишется
+        // боевым SqliteQueueRepository при переходе в Failed).
+        if let Some(r) = reason {
+            entry.error = Some(r.to_string());
+        }
         Ok(())
     }
 
@@ -108,7 +120,7 @@ mod tests {
         // SystemTime::now() на macOS имеет разрешение не хуже микросекунды,
         // спать не нужно — разные вызовы now() гарантированно различаются.
         store
-            .update_state(a.id, DownloadState::Running)
+            .update_state(a.id, DownloadState::Running, None)
             .await
             .unwrap();
         let after_list = store.load_all().await.unwrap();
@@ -136,7 +148,9 @@ mod tests {
         let store = MemoryTQueueStore::new();
         let missing = DownloadId::new();
         assert!(matches!(
-            store.update_state(missing, DownloadState::Paused).await,
+            store
+                .update_state(missing, DownloadState::Paused, None)
+                .await,
             Err(Error::NotFound)
         ));
     }

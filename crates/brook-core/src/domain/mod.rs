@@ -22,6 +22,7 @@ pub mod download;
 pub mod event;
 pub mod id;
 pub mod progress;
+pub mod reason;
 pub mod spec;
 pub mod state;
 
@@ -30,6 +31,10 @@ pub use download::Download;
 pub use event::DownloadEvent;
 pub use id::DownloadId;
 pub use progress::Progress;
+pub use reason::{
+    FailureReason,
+    ReasonCode,
+};
 pub use spec::{
     DownloadSpec,
     OnFileExistsOverride,

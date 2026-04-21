@@ -30,8 +30,10 @@ pub use domain::{
     DownloadId,
     DownloadSpec,
     DownloadState,
+    FailureReason,
     OnFileExistsOverride,
     Progress,
+    ReasonCode,
     default_workers,
 };
 pub use error::{

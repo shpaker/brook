@@ -58,6 +58,8 @@ use crate::domain::{
     DownloadId,
     DownloadSpec,
     DownloadState,
+    FailureReason,
+    ReasonCode,
 };
 use crate::error::{
     Error,
@@ -213,7 +215,7 @@ where
             }
         }
         for (id, state) in to_fix {
-            if let Err(e) = self.shared.queue.update_state(id, state).await {
+            if let Err(e) = self.shared.queue.update_state(id, state, None).await {
                 warn!(%id, error = %e, "bootstrap: failed to persist normalized state");
             }
         }
@@ -297,7 +299,7 @@ where
             }
         }
         if let Some(state) = persist {
-            self.shared.queue.update_state(id, state).await?;
+            self.shared.queue.update_state(id, state, None).await?;
         }
         Ok(())
     }
@@ -332,7 +334,7 @@ where
             }
         }
         if let Some(state) = persist {
-            self.shared.queue.update_state(id, state).await?;
+            self.shared.queue.update_state(id, state, None).await?;
         }
         self.try_spawn_next().await;
         Ok(())
@@ -362,7 +364,11 @@ where
         if should_persist {
             self.shared
                 .queue
-                .update_state(id, DownloadState::Cancelled)
+                .update_state(
+                    id,
+                    DownloadState::Cancelled,
+                    Some(FailureReason::new(ReasonCode::CancelledByUser)),
+                )
                 .await?;
         }
         Ok(())
@@ -470,6 +476,7 @@ where
             let Some(id) = next else { return };
             if let Err(e) = self.spawn_engine(id).await {
                 warn!(%id, error = %e, "failed to spawn engine");
+                let reason = FailureReason::from_error(&e);
                 {
                     let mut inner = self.shared.inner.lock().expect("mutex poisoned");
                     if let Some(record) = inner.records.get_mut(&id) {
@@ -481,7 +488,7 @@ where
                 let _ = self
                     .shared
                     .queue
-                    .update_state(id, DownloadState::Failed)
+                    .update_state(id, DownloadState::Failed, Some(reason))
                     .await;
                 let _ = self.shared.events_tx.send(DownloadEvent::Failed {
                     id,
@@ -502,7 +509,7 @@ where
             inner.records.get(&id).map(|d| d.spec.clone())
         };
         let spec = maybe_spec.ok_or(Error::NotFound)?;
-        let prepared = shared.factory.prepare(&spec).await?;
+        let prepared = shared.factory.prepare(id, &spec).await?;
         let inputs = EngineInputs {
             spec,
             total_size: prepared.total_size,
@@ -551,6 +558,7 @@ async fn fan_in_events<PF, QS, F>(
             Err(broadcast::error::RecvError::Closed) => break,
         };
         let mut state_to_persist: Option<DownloadState> = None;
+        let mut reason_to_persist: Option<FailureReason> = None;
         {
             let mut inner = shared.inner.lock().expect("mutex poisoned");
             if let Some(record) = inner.records.get_mut(&id) {
@@ -578,6 +586,14 @@ async fn fan_in_events<PF, QS, F>(
                         record.error = Some(error.clone());
                         record.updated_at = SystemTime::now();
                         state_to_persist = Some(DownloadState::Failed);
+                        // У engine нет типизированного Error — только строка.
+                        // Stage 3+ поднимет ReasonCode в DownloadEvent::Failed;
+                        // пока маппим свободный текст в Unknown и сохраняем его
+                        // в сообщении, чтобы причина не терялась.
+                        reason_to_persist = Some(FailureReason::with_message(
+                            ReasonCode::Unknown,
+                            error.clone(),
+                        ));
                     }
                     DownloadEvent::WorkerUpdate { .. } | DownloadEvent::Snapshot { .. } => {}
                 }
@@ -585,7 +601,10 @@ async fn fan_in_events<PF, QS, F>(
         }
         let _ = shared.events_tx.send(ev);
         if let Some(state) = state_to_persist
-            && let Err(e) = shared.queue.update_state(id, state).await
+            && let Err(e) = shared
+                .queue
+                .update_state(id, state, reason_to_persist)
+                .await
         {
             warn!(%id, %state, error = %e, "failed to persist state change");
         }
