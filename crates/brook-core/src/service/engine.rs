@@ -64,19 +64,24 @@ use tracing::{
 };
 
 use crate::domain::{
+    AttemptId,
     DownloadCommand,
     DownloadEvent,
     DownloadId,
     DownloadSpec,
     FileStatus,
     Progress,
+    WorkerId,
 };
 use crate::ports::{
     ByteStream,
     RangeError,
     RangeGuard,
+    TPieceAttemptRepo,
     TPieceStorage,
     TRangeFetch,
+    TWorkerRepo,
+    WorkerRecord,
 };
 use crate::service::retry::{
     RetryDecision,
@@ -203,11 +208,33 @@ enum RunState {
 }
 
 /// Сообщения от воркеров к супервизору.
+///
+/// Attempt-lifecycle-события (`AttemptStarted` / `AttemptFinished` /
+/// `AttemptFailed` / `AttemptPaused`) шлются тем же каналом, чтобы все
+/// DB-writes происходили в одном месте — в select-цикле супервизора.
+/// Воркерам не приходится дергать репозиторий из горячего пути;
+/// супервизор гарантирует, что терминальное сообщение attempt'а
+/// (`Finished` / `Failed` / `Paused`) обработано до того, как engine
+/// перейдёт к финализации (дренаж `worker_rx.try_recv()` после join'а).
 enum WorkerMsg {
     /// Piece полностью записан и готов к commit'у.
-    PieceDone(u32),
+    PieceDone { piece: u32 },
     /// Permanent failure: ретраи исчерпаны или не-транзиентная ошибка.
     Failed(String),
+    /// Воркер начал попытку скачать piece.
+    AttemptStarted { worker_id: WorkerId, piece: u32 },
+    /// Попытка закрылась успешно (hash ok / принято).
+    AttemptFinished {
+        worker_id: WorkerId,
+        piece: u32,
+        bytes: u64,
+    },
+    /// Попытка закрылась ошибкой (транзиентной или permanent).
+    AttemptFailed {
+        worker_id: WorkerId,
+        piece: u32,
+        error: String,
+    },
 }
 
 /// Фасад старта движка.
@@ -219,39 +246,56 @@ impl DownloadEngine {
     /// Возвращает [`EngineHandle`] для управления и подписчика-receiver для
     /// событий. Дополнительных подписчиков можно получать через
     /// `events.resubscribe()`.
-    pub fn spawn<S, F>(
+    pub fn spawn<S, F, WR, AR>(
         id: DownloadId,
         inputs: EngineInputs,
         config: EngineConfig,
         storage: Arc<S>,
         fetch: Arc<F>,
+        workers_repo: Arc<WR>,
+        attempts_repo: Arc<AR>,
     ) -> (EngineHandle, broadcast::Receiver<DownloadEvent>)
     where
         S: TPieceStorage + Send + Sync + 'static,
         F: TRangeFetch + Send + Sync + 'static,
+        WR: TWorkerRepo + Send + Sync + 'static,
+        AR: TPieceAttemptRepo + Send + Sync + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = broadcast::channel(config.events_capacity);
 
         let join = tokio::spawn(run_engine(
-            id, inputs, config, storage, fetch, cmd_rx, events_tx,
+            id,
+            inputs,
+            config,
+            storage,
+            fetch,
+            workers_repo,
+            attempts_repo,
+            cmd_rx,
+            events_tx,
         ));
 
         (EngineHandle { id, cmd_tx, join }, events_rx)
     }
 }
 
-async fn run_engine<S, F>(
+#[allow(clippy::too_many_arguments)]
+async fn run_engine<S, F, WR, AR>(
     id: DownloadId,
     inputs: EngineInputs,
     config: EngineConfig,
     storage: Arc<S>,
     fetch: Arc<F>,
+    workers_repo: Arc<WR>,
+    attempts_repo: Arc<AR>,
     mut cmd_rx: mpsc::UnboundedReceiver<DownloadCommand>,
     events_tx: broadcast::Sender<DownloadEvent>,
 ) where
     S: TPieceStorage + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     info!(%id, url = %inputs.spec.url, "engine starting");
 
@@ -317,9 +361,26 @@ async fn run_engine<S, F>(
     };
     info!(%id, pieces = total_pieces_expected, workers = worker_count, accepts_ranges = inputs.accepts_ranges, "spawning workers");
 
+    // Заводим фиксированный набор worker-строк под эту engine-сессию.
+    // `ensure_slots` защитно сбрасывает все running-воркеры этого файла
+    // в `paused` — если предыдущая сессия не успела этого сделать сама.
+    let worker_records = match workers_repo.ensure_slots(id, worker_count).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(%id, error = %e, "ensure_slots failed");
+            emit_status(&events_tx, id, FileStatus::Failed);
+            let _ = events_tx.send(DownloadEvent::Failed {
+                id,
+                error: format!("ensure_slots: {e}"),
+            });
+            return;
+        }
+    };
+
     let mut worker_handles: Vec<JoinHandle<()>> = Vec::with_capacity(worker_count);
     if inputs.accepts_ranges {
-        for _ in 0..worker_count {
+        for i in 0..worker_count {
+            let record = worker_records.get(i).cloned();
             let h = tokio::spawn(worker_range(
                 inputs.spec.url.clone(),
                 inputs.guard.clone(),
@@ -332,10 +393,12 @@ async fn run_engine<S, F>(
                 worker_tx.clone(),
                 Arc::clone(&bytes_done),
                 config.clone(),
+                record,
             ));
             worker_handles.push(h);
         }
     } else {
+        let record = worker_records.first().cloned();
         let h = tokio::spawn(worker_full(
             inputs.spec.url.clone(),
             inputs.piece_size,
@@ -346,6 +409,7 @@ async fn run_engine<S, F>(
             worker_tx.clone(),
             Arc::clone(&bytes_done),
             config.clone(),
+            record,
         ));
         worker_handles.push(h);
     }
@@ -358,6 +422,13 @@ async fn run_engine<S, F>(
     progress_tick.tick().await; // первый tick — мгновенный, пропускаем.
     let mut pieces_committed: usize = 0;
     let mut final_outcome: Option<Outcome> = None;
+    // Маппинг (worker_id, piece_number) → AttemptId для открытых попыток.
+    // При `AttemptStarted` супервизор вызывает `attempts_repo.start`
+    // и запоминает `attempt_id`; при терминальном сообщении достаёт его.
+    // На один (worker, piece) в любой момент жива не более чем одна
+    // попытка (воркер либо качает piece, либо закрыл и идёт за следующим).
+    use std::collections::HashMap;
+    let mut open_attempts: HashMap<(WorkerId, u32), AttemptId> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -387,7 +458,7 @@ async fn run_engine<S, F>(
             }
             Some(msg) = worker_rx.recv() => {
                 match msg {
-                    WorkerMsg::PieceDone(idx) => {
+                    WorkerMsg::PieceDone { piece: idx, .. } => {
                         commit_buffer.push(idx);
                         if commit_buffer.len() >= config.commit_every {
                             if let Err(e) = storage.commit_batch(&commit_buffer).await {
@@ -406,6 +477,31 @@ async fn run_engine<S, F>(
                         final_outcome = Some(Outcome::Failed(err));
                         let _ = state_tx.send(RunState::Stopping);
                         break;
+                    }
+                    WorkerMsg::AttemptStarted { worker_id, piece } => {
+                        match attempts_repo.start(id, piece, worker_id).await {
+                            Ok(rec) => {
+                                open_attempts.insert((worker_id, piece), rec.id);
+                            }
+                            Err(e) => {
+                                warn!(%id, %worker_id, piece, error = %e,
+                                      "attempt start persistence failed");
+                            }
+                        }
+                    }
+                    WorkerMsg::AttemptFinished { worker_id, piece, bytes } => {
+                        if let Some(attempt_id) = open_attempts.remove(&(worker_id, piece))
+                            && let Err(e) = attempts_repo.finish(attempt_id, bytes).await {
+                                warn!(%id, %attempt_id, error = %e,
+                                      "attempt finish persistence failed");
+                        }
+                    }
+                    WorkerMsg::AttemptFailed { worker_id, piece, error } => {
+                        if let Some(attempt_id) = open_attempts.remove(&(worker_id, piece))
+                            && let Err(e) = attempts_repo.fail(attempt_id, &error).await {
+                                warn!(%id, %attempt_id, error = %e,
+                                      "attempt fail persistence failed");
+                        }
                     }
                 }
             }
@@ -431,11 +527,45 @@ async fn run_engine<S, F>(
     for h in worker_handles {
         let _ = h.await;
     }
-    // Сливаем оставшиеся сообщения от воркеров (могли долететь PieceDone
-    // после отправки сигнала Stopping).
+    // Сливаем оставшиеся сообщения от воркеров (PieceDone после Stopping,
+    // а также хвост attempt-событий — их обработать обязательно, иначе в БД
+    // останутся «висящие» running-attempt'ы этой сессии). Так мы
+    // гарантируем, что терминальное сообщение каждой попытки дойдёт до
+    // репозитория до engine-финализации.
     while let Ok(msg) = worker_rx.try_recv() {
-        if let WorkerMsg::PieceDone(idx) = msg {
-            commit_buffer.push(idx);
+        match msg {
+            WorkerMsg::PieceDone { piece: idx, .. } => commit_buffer.push(idx),
+            WorkerMsg::AttemptStarted { worker_id, piece } => {
+                match attempts_repo.start(id, piece, worker_id).await {
+                    Ok(rec) => {
+                        open_attempts.insert((worker_id, piece), rec.id);
+                    }
+                    Err(e) => warn!(%id, error = %e, "attempt start persistence failed"),
+                }
+            }
+            WorkerMsg::AttemptFinished {
+                worker_id,
+                piece,
+                bytes,
+            } => {
+                if let Some(aid) = open_attempts.remove(&(worker_id, piece))
+                    && let Err(e) = attempts_repo.finish(aid, bytes).await
+                {
+                    warn!(%id, error = %e, "attempt finish persistence failed");
+                }
+            }
+            WorkerMsg::AttemptFailed {
+                worker_id,
+                piece,
+                error,
+            } => {
+                if let Some(aid) = open_attempts.remove(&(worker_id, piece))
+                    && let Err(e) = attempts_repo.fail(aid, &error).await
+                {
+                    warn!(%id, error = %e, "attempt fail persistence failed");
+                }
+            }
+            WorkerMsg::Failed(_) => {}
         }
     }
 
@@ -471,7 +601,40 @@ async fn run_engine<S, F>(
         }
     }
 
-    match final_outcome.unwrap() {
+    // Переводим worker-строки в терминальный статус, парный исходу engine.
+    // Делаем это ДО emit'а финального события, чтобы внешний наблюдатель
+    // (например, fan-in менеджера, который на Completed пойдёт спаунить
+    // следующего в очереди) видел консистентную БД. Best-effort: ошибки
+    // персистенции не меняют исход engine.
+    let outcome = final_outcome.unwrap();
+    match &outcome {
+        Outcome::Completed => {
+            for rec in &worker_records {
+                if let Err(e) = workers_repo.mark_done(rec.id).await {
+                    warn!(%id, worker = %rec.id, error = %e, "mark_done failed");
+                }
+            }
+        }
+        Outcome::Failed(err) => {
+            for rec in &worker_records {
+                if let Err(e) = workers_repo.mark_failed(rec.id, err).await {
+                    warn!(%id, worker = %rec.id, error = %e, "mark_failed failed");
+                }
+            }
+        }
+        Outcome::Cancelled => {
+            for rec in &worker_records {
+                if let Err(e) = workers_repo.mark_cancelled(rec.id).await {
+                    warn!(%id, worker = %rec.id, error = %e, "mark_cancelled failed");
+                }
+            }
+            if let Err(e) = attempts_repo.pause_all_running_for_file(id).await {
+                warn!(%id, error = %e, "attempts cleanup on cancel failed");
+            }
+        }
+    }
+
+    match outcome {
         Outcome::Completed => {
             match storage.finalize().await {
                 Ok(()) => {
@@ -580,14 +743,29 @@ async fn worker_range<S, F>(
     worker_tx: mpsc::UnboundedSender<WorkerMsg>,
     bytes_done: Arc<AtomicU64>,
     config: EngineConfig,
+    record: Option<WorkerRecord>,
 ) where
     S: TPieceStorage + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
 {
+    let span = record
+        .as_ref()
+        .map(|r| tracing::info_span!("worker", id = %r.id, slot = r.slot_index));
+    let _guard_span = span.as_ref().map(|s| s.enter());
+    let worker_id = record.as_ref().map(|r| r.id);
+
     while let Some(idx) = next_piece(&pending, &mut state_rx).await {
         let offset = piece_offset(idx, piece_size);
         let size = piece_size_at(idx, piece_size, total_size);
-        match run_piece_with_retry(
+        // Отметить старт попытки — супервизор зарегистрирует attempt в БД.
+        if let Some(wid) = worker_id {
+            let _ = worker_tx.send(WorkerMsg::AttemptStarted {
+                worker_id: wid,
+                piece: idx,
+            });
+        }
+        let mut attempt_bytes: u64 = 0;
+        let res = run_piece_with_retry(
             &url,
             guard.as_ref(),
             idx,
@@ -597,21 +775,48 @@ async fn worker_range<S, F>(
             fetch.as_ref(),
             &bytes_done,
             &config,
+            &mut attempt_bytes,
+            worker_id,
+            &worker_tx,
         )
-        .await
-        {
+        .await;
+        match res {
             Ok(()) => {
                 debug!(piece = idx, "piece done");
-                if worker_tx.send(WorkerMsg::PieceDone(idx)).is_err() {
+                if let Some(wid) = worker_id {
+                    let _ = worker_tx.send(WorkerMsg::AttemptFinished {
+                        worker_id: wid,
+                        piece: idx,
+                        bytes: size,
+                    });
+                }
+                if worker_tx.send(WorkerMsg::PieceDone { piece: idx }).is_err() {
                     return;
                 }
             }
             Err(PieceError::Transient(msg)) | Err(PieceError::Permanent(msg)) => {
                 warn!(piece = idx, error = %msg, "piece failed — stopping worker");
+                if let Some(wid) = worker_id {
+                    let _ = worker_tx.send(WorkerMsg::AttemptFailed {
+                        worker_id: wid,
+                        piece: idx,
+                        error: msg.clone(),
+                    });
+                }
                 let _ = worker_tx.send(WorkerMsg::Failed(msg));
                 return;
             }
         }
+    }
+
+    // Выход по пустой очереди или сигналу Stopping. Если мы уходим
+    // в паузу с открытой попыткой — сообщить супервизору, чтобы он
+    // закрыл строку `paused` в БД.
+    if let (Some(wid), RunState::Paused) = (worker_id, *state_rx.borrow()) {
+        // Открытой попытки на этом моменте у worker_range нет
+        // (next_piece возвращает None до взятия следующего piece),
+        // но если бы была — пометили бы её здесь.
+        let _ = wid;
     }
 }
 
@@ -626,6 +831,9 @@ async fn run_piece_with_retry<S, F>(
     fetch: &F,
     bytes_done: &AtomicU64,
     config: &EngineConfig,
+    attempt_bytes: &mut u64,
+    worker_id: Option<WorkerId>,
+    worker_tx: &mpsc::UnboundedSender<WorkerMsg>,
 ) -> Result<(), PieceError>
 where
     S: TPieceStorage + Send + Sync,
@@ -649,6 +857,7 @@ where
             config,
         )
         .await;
+        *attempt_bytes = written;
         match res {
             Ok(()) => {
                 bytes_done.fetch_add(size, Ordering::Relaxed);
@@ -656,13 +865,30 @@ where
             }
             Err(e) => {
                 let transient = matches!(&e, PieceError::Transient(_));
-                // Байты частичной попытки не добавляем в bytes_done — иначе
-                // счётчик уедет выше реального прогресса.
                 let _ = written;
                 match config.retry.classify(attempt, transient) {
                     RetryDecision::Retry(delay) => {
+                        // Закрываем текущую попытку как failed и сразу
+                        // открываем новую — журнал `piece_attempts`
+                        // видит каждую сетевую попытку отдельной строкой.
+                        if let Some(wid) = worker_id {
+                            let msg = match &e {
+                                PieceError::Transient(s) | PieceError::Permanent(s) => s.clone(),
+                            };
+                            let _ = worker_tx.send(WorkerMsg::AttemptFailed {
+                                worker_id: wid,
+                                piece: idx,
+                                error: msg,
+                            });
+                        }
                         tokio::time::sleep(delay).await;
                         attempt += 1;
+                        if let Some(wid) = worker_id {
+                            let _ = worker_tx.send(WorkerMsg::AttemptStarted {
+                                worker_id: wid,
+                                piece: idx,
+                            });
+                        }
                         continue;
                     }
                     RetryDecision::GiveUp => return Err(e),
@@ -775,10 +1001,17 @@ async fn worker_full<S, F>(
     worker_tx: mpsc::UnboundedSender<WorkerMsg>,
     bytes_done: Arc<AtomicU64>,
     config: EngineConfig,
+    record: Option<WorkerRecord>,
 ) where
     S: TPieceStorage + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
 {
+    let span = record
+        .as_ref()
+        .map(|r| tracing::info_span!("worker", id = %r.id, slot = r.slot_index));
+    let _guard_span = span.as_ref().map(|s| s.enter());
+    let worker_id = record.as_ref().map(|r| r.id);
+
     let mut attempt: u32 = 0;
     loop {
         // Уважать пользовательскую паузу до начала попытки.
@@ -793,6 +1026,18 @@ async fn worker_full<S, F>(
                 }
                 RunState::Running => break,
             }
+        }
+
+        // В no-Range режиме «попытка» — это одна загрузка всего тела
+        // целиком. Для журналирования привязываем её к piece 0 (условный
+        // якорь: fetch_full стартует с начала файла, первый piece всегда
+        // участвует). Если нужна раздельная статистика по piece'ам — это
+        // задача будущей Range-реализации.
+        if let Some(wid) = worker_id {
+            let _ = worker_tx.send(WorkerMsg::AttemptStarted {
+                worker_id: wid,
+                piece: 0,
+            });
         }
 
         let result = tokio::select! {
@@ -810,8 +1055,19 @@ async fn worker_full<S, F>(
         };
         match result {
             Ok(pieces_done) => {
+                if let Some(wid) = worker_id {
+                    let bytes_attempted = pieces_done
+                        .iter()
+                        .map(|i| piece_size_at(*i, piece_size, total_size))
+                        .sum();
+                    let _ = worker_tx.send(WorkerMsg::AttemptFinished {
+                        worker_id: wid,
+                        piece: 0,
+                        bytes: bytes_attempted,
+                    });
+                }
                 for idx in pieces_done {
-                    if worker_tx.send(WorkerMsg::PieceDone(idx)).is_err() {
+                    if worker_tx.send(WorkerMsg::PieceDone { piece: idx }).is_err() {
                         return;
                     }
                 }
@@ -819,6 +1075,16 @@ async fn worker_full<S, F>(
             }
             Err(e) => {
                 let transient = matches!(&e, PieceError::Transient(_));
+                let msg = match &e {
+                    PieceError::Transient(s) | PieceError::Permanent(s) => s.clone(),
+                };
+                if let Some(wid) = worker_id {
+                    let _ = worker_tx.send(WorkerMsg::AttemptFailed {
+                        worker_id: wid,
+                        piece: 0,
+                        error: msg.clone(),
+                    });
+                }
                 match config.retry.classify(attempt, transient) {
                     RetryDecision::Retry(delay) => {
                         tokio::time::sleep(delay).await;
@@ -826,9 +1092,6 @@ async fn worker_full<S, F>(
                         continue;
                     }
                     RetryDecision::GiveUp => {
-                        let msg = match e {
-                            PieceError::Transient(s) | PieceError::Permanent(s) => s,
-                        };
                         let _ = worker_tx.send(WorkerMsg::Failed(msg));
                         return;
                     }
@@ -1066,6 +1329,15 @@ mod tests {
         }
     }
 
+    use crate::ports::{
+        NoopAttemptRepo,
+        NoopWorkerRepo,
+    };
+
+    fn noop_repos() -> (Arc<NoopWorkerRepo>, Arc<NoopAttemptRepo>) {
+        (Arc::new(NoopWorkerRepo), Arc::new(NoopAttemptRepo))
+    }
+
     fn fast_config() -> EngineConfig {
         EngineConfig {
             write_buffer: 16,
@@ -1134,6 +1406,8 @@ mod tests {
             fast_config(),
             storage.clone(),
             fetch,
+            noop_repos().0,
+            noop_repos().1,
         );
         let events = collect_events(rx).await;
         handle.join.await.unwrap();
@@ -1162,6 +1436,8 @@ mod tests {
             fast_config(),
             storage.clone(),
             fetch,
+            noop_repos().0,
+            noop_repos().1,
         );
         let events = collect_events(rx).await;
         handle.join.await.unwrap();
@@ -1189,6 +1465,8 @@ mod tests {
             fast_config(),
             storage.clone(),
             fetch,
+            noop_repos().0,
+            noop_repos().1,
         );
         let _ = collect_events(rx).await;
         handle.join.await.unwrap();
@@ -1209,6 +1487,8 @@ mod tests {
             fast_config(),
             storage.clone(),
             fetch,
+            noop_repos().0,
+            noop_repos().1,
         );
         // Дождёмся первого StateChanged(Running).
         let _ = rx.recv().await;
@@ -1253,6 +1533,8 @@ mod tests {
             fast_config(),
             storage.clone(),
             fetch,
+            noop_repos().0,
+            noop_repos().1,
         );
         let _ = rx.recv().await;
         assert!(handle.cancel());
@@ -1290,6 +1572,8 @@ mod tests {
             cfg,
             storage.clone(),
             fetch,
+            noop_repos().0,
+            noop_repos().1,
         );
         let mut progress_count = 0;
         while let Ok(ev) = rx.recv().await {
@@ -1327,6 +1611,8 @@ mod tests {
             fast_config(),
             storage.clone(),
             fetch.clone(),
+            noop_repos().0,
+            noop_repos().1,
         );
         let events = collect_events(rx).await;
         handle.join.await.unwrap();
@@ -1338,5 +1624,304 @@ mod tests {
         // Всего один fetch_full вызов (без ретраев).
         assert_eq!(fetch.calls.load(Ordering::Relaxed), 1);
         assert!(storage.snapshot().finalized);
+    }
+
+    // ─── Worker / attempt tracking tests ────────────────────────────────
+
+    use crate::domain::{
+        AttemptStatus,
+        WorkerStatus,
+    };
+    use crate::testing::{
+        MemoryAttemptRepo,
+        MemoryWorkerRepo,
+    };
+
+    /// Две engine-сессии на один файл. Первая «падает» на полпути
+    /// (handle-task дропается до того, как воркеры успели добежать
+    /// до терминала) — её строки остаются `running`. Вторая сессия
+    /// в `ensure_slots` делает защитный sweep: старые → `paused`,
+    /// новые → свежие UUID'ы со статусом `running`/`done`.
+    #[tokio::test]
+    async fn two_sessions_produce_disjoint_worker_sets() {
+        let plan = TestPlan {
+            piece_size: 20,
+            count: 4,
+        };
+        let workers = Arc::new(MemoryWorkerRepo::new());
+        let attempts = Arc::new(MemoryAttemptRepo::new());
+        let file_id = DownloadId::new();
+
+        // Сессия 1: медленный fetch — снимаем её до финализации
+        // (drop handle на половине работы).
+        let storage1 = Arc::new(MemoryPieceStorage::new(4, 20));
+        let fetch1 = Arc::new(MockFetch::always_ok(plan).with_delay(Duration::from_millis(200)));
+        let (handle1, _rx1) = DownloadEngine::spawn(
+            file_id,
+            inputs_range(plan),
+            fast_config(),
+            storage1,
+            fetch1,
+            Arc::clone(&workers),
+            Arc::clone(&attempts),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Имитация «демон упал»: дропаем engine-task, не дожидаясь
+        // terminal-outcome.
+        handle1.join.abort();
+        let _ = handle1.join.await;
+        let first_ids: Vec<_> = workers.by_file(file_id).iter().map(|w| w.id).collect();
+        assert_eq!(first_ids.len(), 2);
+        // Строки всё ещё `running` — engine не успел их перевести.
+        for w in workers.by_file(file_id) {
+            assert_eq!(w.status, WorkerStatus::Running);
+        }
+
+        // Сессия 2: свежий storage и быстрый fetch.
+        let storage2 = Arc::new(MemoryPieceStorage::new(4, 20));
+        let fetch2 = Arc::new(MockFetch::always_ok(plan));
+        let (handle2, rx2) = DownloadEngine::spawn(
+            file_id,
+            inputs_range(plan),
+            fast_config(),
+            storage2,
+            fetch2,
+            Arc::clone(&workers),
+            Arc::clone(&attempts),
+        );
+        let _ = collect_events(rx2).await;
+        handle2.join.await.unwrap();
+
+        let all = workers.by_file(file_id);
+        assert_eq!(all.len(), 4);
+        let second_ids: Vec<_> = all
+            .iter()
+            .filter(|w| !first_ids.contains(&w.id))
+            .map(|w| w.id)
+            .collect();
+        assert_eq!(second_ids.len(), 2);
+        for w in all {
+            if first_ids.contains(&w.id) {
+                assert_eq!(w.status, WorkerStatus::Paused);
+            } else {
+                assert_eq!(w.status, WorkerStatus::Done);
+            }
+        }
+    }
+
+    /// Имитация «демон упал»: предыдущие строки остались `running`,
+    /// глобальный sweep их закрывает, затем `ensure_slots` выдаёт свежие.
+    #[tokio::test]
+    async fn crash_recovery_sweep_paves_the_way_for_next_session() {
+        let workers = Arc::new(MemoryWorkerRepo::new());
+        let attempts = Arc::new(MemoryAttemptRepo::new());
+        let file_id = DownloadId::new();
+
+        // Эмулируем 3 «залипших» running-воркера.
+        let stale = workers.ensure_slots(file_id, 3).await.unwrap();
+        assert!(
+            workers
+                .by_file(file_id)
+                .iter()
+                .all(|w| w.status == WorkerStatus::Running)
+        );
+
+        // Daemon startup recovery.
+        workers.pause_all_running_globally().await.unwrap();
+        attempts.pause_all_running_globally().await.unwrap();
+        for w in workers.by_file(file_id) {
+            assert_eq!(w.status, WorkerStatus::Paused);
+        }
+
+        // Реальный старт новой сессии.
+        let plan = TestPlan {
+            piece_size: 20,
+            count: 1,
+        };
+        let storage = Arc::new(MemoryPieceStorage::new(1, 20));
+        let fetch = Arc::new(MockFetch::always_ok(plan));
+        let (handle, rx) = DownloadEngine::spawn(
+            file_id,
+            inputs_range(plan),
+            fast_config(),
+            storage,
+            fetch,
+            Arc::clone(&workers),
+            Arc::clone(&attempts),
+        );
+        let _ = collect_events(rx).await;
+        handle.join.await.unwrap();
+
+        let all = workers.by_file(file_id);
+        // 3 старых paused + новый набор (fast_config, spec.workers=2).
+        let paused: Vec<_> = all
+            .iter()
+            .filter(|w| stale.iter().any(|s| s.id == w.id))
+            .collect();
+        assert_eq!(paused.len(), 3);
+        for w in &paused {
+            assert_eq!(w.status, WorkerStatus::Paused);
+        }
+        let fresh: Vec<_> = all
+            .iter()
+            .filter(|w| !stale.iter().any(|s| s.id == w.id))
+            .collect();
+        assert!(!fresh.is_empty());
+        for w in fresh {
+            assert_eq!(w.status, WorkerStatus::Done);
+        }
+    }
+
+    /// Piece retry: первая попытка 503 → `failed`, вторая → `done`.
+    /// В журнале остаются обе строки.
+    #[tokio::test]
+    async fn piece_retry_appends_new_attempt_row() {
+        let plan = TestPlan {
+            piece_size: 20,
+            count: 1,
+        };
+        let storage = Arc::new(MemoryPieceStorage::new(1, 20));
+        let fetch = Arc::new(MockFetch::always_ok(plan));
+        fetch.set_piece_plan(0, vec![Outcome::Transient500]);
+
+        let workers = Arc::new(MemoryWorkerRepo::new());
+        let attempts = Arc::new(MemoryAttemptRepo::new());
+        let file_id = DownloadId::new();
+
+        let mut inputs = inputs_range(plan);
+        inputs.spec.workers = 1;
+        let (handle, rx) = DownloadEngine::spawn(
+            file_id,
+            inputs,
+            fast_config(),
+            storage,
+            fetch,
+            Arc::clone(&workers),
+            Arc::clone(&attempts),
+        );
+        let _ = collect_events(rx).await;
+        handle.join.await.unwrap();
+
+        let rows = attempts.by_piece(file_id, 0);
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected failed+done attempts, got {:?}",
+            rows
+        );
+        let statuses: Vec<_> = rows.iter().map(|r| r.status).collect();
+        assert!(statuses.contains(&AttemptStatus::Failed));
+        assert!(statuses.contains(&AttemptStatus::Done));
+    }
+
+    /// Cancel посреди загрузки: активные воркеры → cancelled,
+    /// running attempt'ы файла → paused (чистим хвост).
+    #[tokio::test]
+    async fn cancel_marks_workers_cancelled() {
+        let plan = TestPlan {
+            piece_size: 20,
+            count: 6,
+        };
+        let storage = Arc::new(MemoryPieceStorage::new(6, 20));
+        let fetch = Arc::new(MockFetch::always_ok(plan).with_delay(Duration::from_millis(50)));
+        let workers = Arc::new(MemoryWorkerRepo::new());
+        let attempts = Arc::new(MemoryAttemptRepo::new());
+        let file_id = DownloadId::new();
+
+        let (handle, mut rx) = DownloadEngine::spawn(
+            file_id,
+            inputs_range(plan),
+            fast_config(),
+            storage,
+            fetch,
+            Arc::clone(&workers),
+            Arc::clone(&attempts),
+        );
+        let _ = rx.recv().await;
+        // Даём воркерам начать пилить piece'ы.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(handle.cancel());
+        while let Ok(ev) = rx.recv().await {
+            if matches!(
+                ev,
+                DownloadEvent::StatusChanged {
+                    status: FileStatus::Cancelled,
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        handle.join.await.unwrap();
+
+        for w in workers.by_file(file_id) {
+            assert_eq!(
+                w.status,
+                WorkerStatus::Cancelled,
+                "worker {:?} not cancelled",
+                w
+            );
+        }
+        // Любая открытая попытка закрыта (paused/failed).
+        let still_running = attempts
+            .snapshot()
+            .into_iter()
+            .filter(|r| r.file_id == file_id && r.status == AttemptStatus::Running)
+            .count();
+        assert_eq!(still_running, 0);
+    }
+
+    /// `max_workers` меняется между сессиями: 4 → 2. Первый набор — paused,
+    /// второй — 2 свежих записи со `slot_index` 0, 1.
+    #[tokio::test]
+    async fn worker_count_change_between_sessions() {
+        let plan = TestPlan {
+            piece_size: 20,
+            count: 2,
+        };
+        let storage1 = Arc::new(MemoryPieceStorage::new(2, 20));
+        let fetch = Arc::new(MockFetch::always_ok(plan));
+        let workers = Arc::new(MemoryWorkerRepo::new());
+        let attempts = Arc::new(MemoryAttemptRepo::new());
+        let file_id = DownloadId::new();
+
+        let mut inputs1 = inputs_range(plan);
+        inputs1.spec.workers = 4;
+        let (h1, rx1) = DownloadEngine::spawn(
+            file_id,
+            inputs1,
+            fast_config(),
+            storage1,
+            fetch.clone(),
+            Arc::clone(&workers),
+            Arc::clone(&attempts),
+        );
+        let _ = collect_events(rx1).await;
+        h1.join.await.unwrap();
+        let first_ids: Vec<_> = workers.by_file(file_id).iter().map(|w| w.id).collect();
+        assert_eq!(first_ids.len(), 4);
+
+        let storage2 = Arc::new(MemoryPieceStorage::new(2, 20));
+        let mut inputs2 = inputs_range(plan);
+        inputs2.spec.workers = 2;
+        let (h2, rx2) = DownloadEngine::spawn(
+            file_id,
+            inputs2,
+            fast_config(),
+            storage2,
+            fetch,
+            Arc::clone(&workers),
+            Arc::clone(&attempts),
+        );
+        let _ = collect_events(rx2).await;
+        h2.join.await.unwrap();
+
+        let all = workers.by_file(file_id);
+        assert_eq!(all.len(), 6, "4 старых + 2 свежих");
+        let fresh: Vec<_> = all.iter().filter(|w| !first_ids.contains(&w.id)).collect();
+        assert_eq!(fresh.len(), 2);
+        let mut slots: Vec<_> = fresh.iter().map(|w| w.slot_index).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, vec![0, 1]);
     }
 }

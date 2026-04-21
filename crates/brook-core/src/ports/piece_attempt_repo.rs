@@ -33,9 +33,13 @@ pub struct AttemptRecord {
 pub trait TPieceAttemptRepo: Send + Sync {
     /// Стартовать новую попытку: строка со статусом `running`,
     /// `started_at = now`.
+    ///
+    /// Адаптер сам резолвит `piece_id` по паре `(file_id, piece_number)` —
+    /// engine-слою ядра неоткуда знать DB-UUID piece'а, да и незачем.
     fn start(
         &self,
-        piece_id: &str,
+        file_id: DownloadId,
+        piece_number: u32,
         worker_id: WorkerId,
     ) -> impl Future<Output = Result<AttemptRecord>> + Send;
 

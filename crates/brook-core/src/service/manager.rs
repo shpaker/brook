@@ -66,9 +66,13 @@ use crate::error::{
     Result,
 };
 use crate::ports::{
+    NoopAttemptRepo,
+    NoopWorkerRepo,
+    TPieceAttemptRepo,
     TPieceStorageFactory,
     TQueueStore,
     TRangeFetch,
+    TWorkerRepo,
 };
 use crate::service::engine::{
     DownloadEngine,
@@ -100,22 +104,31 @@ impl Default for ManagerConfig {
 }
 
 /// Верхний координатор загрузок. Клонируется дёшево (внутри `Arc`).
-pub struct DownloadManager<PF, QS, F>
+///
+/// `WR`/`AR` — репозитории воркеров и попыток piece'ов. Дефолты
+/// ([`NoopWorkerRepo`] / [`NoopAttemptRepo`]) — для тестов и кейсов,
+/// где аналитика журнала не нужна; prod-подключение (brookd)
+/// подставляет SQLite-адаптеры явно через [`DownloadManager::with_tracking`].
+pub struct DownloadManager<PF, QS, F, WR = NoopWorkerRepo, AR = NoopAttemptRepo>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
-    shared: Arc<Shared<PF, QS, F>>,
+    shared: Arc<Shared<PF, QS, F, WR, AR>>,
 }
 
-impl<PF, QS, F> Clone for DownloadManager<PF, QS, F>
+impl<PF, QS, F, WR, AR> Clone for DownloadManager<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -124,16 +137,20 @@ where
     }
 }
 
-struct Shared<PF, QS, F>
+struct Shared<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     factory: Arc<PF>,
     queue: Arc<QS>,
     fetch: Arc<F>,
+    workers_repo: Arc<WR>,
+    attempts_repo: Arc<AR>,
     inner: Mutex<Inner>,
     events_tx: broadcast::Sender<DownloadEvent>,
     config: ManagerConfig,
@@ -148,20 +165,55 @@ struct Inner {
     waiting: VecDeque<DownloadId>,
 }
 
-impl<PF, QS, F> DownloadManager<PF, QS, F>
+impl<PF, QS, F> DownloadManager<PF, QS, F, NoopWorkerRepo, NoopAttemptRepo>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
 {
+    /// Собрать менеджер без аналитики воркеров/попыток (no-op репозитории).
+    /// Используется в юнит-тестах ядра и in-memory harness'ах.
     pub fn new(factory: Arc<PF>, queue: Arc<QS>, fetch: Arc<F>, config: ManagerConfig) -> Self {
+        Self::with_tracking(
+            factory,
+            queue,
+            fetch,
+            Arc::new(NoopWorkerRepo),
+            Arc::new(NoopAttemptRepo),
+            config,
+        )
+    }
+}
+
+impl<PF, QS, F, WR, AR> DownloadManager<PF, QS, F, WR, AR>
+where
+    PF: TPieceStorageFactory + Send + Sync + 'static,
+    PF::Storage: Send + Sync + 'static,
+    QS: TQueueStore + Send + Sync + 'static,
+    F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
+{
+    /// Собрать менеджер с явными репозиториями воркеров и попыток —
+    /// prod-путь brookd, где `workers` и `piece_attempts` пишутся в
+    /// общую `brook.db`.
+    pub fn with_tracking(
+        factory: Arc<PF>,
+        queue: Arc<QS>,
+        fetch: Arc<F>,
+        workers_repo: Arc<WR>,
+        attempts_repo: Arc<AR>,
+        config: ManagerConfig,
+    ) -> Self {
         let (events_tx, _) = broadcast::channel(config.events_capacity);
         Self {
             shared: Arc::new(Shared {
                 factory,
                 queue,
                 fetch,
+                workers_repo,
+                attempts_repo,
                 inner: Mutex::new(Inner {
                     records: HashMap::new(),
                     engines: HashMap::new(),
@@ -503,7 +555,10 @@ where
         async move { Self::spawn_engine_impl(shared, id).await }
     }
 
-    async fn spawn_engine_impl(shared: Arc<Shared<PF, QS, F>>, id: DownloadId) -> Result<()> {
+    async fn spawn_engine_impl(
+        shared: Arc<Shared<PF, QS, F, WR, AR>>,
+        id: DownloadId,
+    ) -> Result<()> {
         let maybe_spec = {
             let inner = shared.inner.lock().expect("mutex poisoned");
             inner.records.get(&id).map(|d| d.spec.clone())
@@ -524,6 +579,8 @@ where
             shared.config.engine.clone(),
             storage,
             Arc::clone(&shared.fetch),
+            Arc::clone(&shared.workers_repo),
+            Arc::clone(&shared.attempts_repo),
         );
         {
             let mut inner = shared.inner.lock().expect("mutex poisoned");
@@ -534,8 +591,8 @@ where
     }
 }
 
-async fn fan_in_events<PF, QS, F>(
-    shared: Arc<Shared<PF, QS, F>>,
+async fn fan_in_events<PF, QS, F, WR, AR>(
+    shared: Arc<Shared<PF, QS, F, WR, AR>>,
     id: DownloadId,
     mut rx: broadcast::Receiver<DownloadEvent>,
 ) where
@@ -543,6 +600,8 @@ async fn fan_in_events<PF, QS, F>(
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     // Выходим из цикла только когда канал событий движка закрылся
     // (движок завершил таск и уронил свой `Sender`). До этого момента
@@ -623,12 +682,14 @@ async fn fan_in_events<PF, QS, F>(
 /// Попытаться поднять следующий движок после завершения предыдущего.
 /// Вынесено как свободная функция, чтобы не тянуть `DownloadManager` в
 /// сигнатуру fan-in task (он бы создал больше генериков).
-async fn advance_queue<PF, QS, F>(shared: Arc<Shared<PF, QS, F>>)
+async fn advance_queue<PF, QS, F, WR, AR>(shared: Arc<Shared<PF, QS, F, WR, AR>>)
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     let manager = DownloadManager { shared };
     manager.try_spawn_next().await;

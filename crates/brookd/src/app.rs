@@ -86,8 +86,12 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 pub type ProdFactory = LocalPieceStorageFactory<HttpInspectClient>;
 pub type ProdQueue = SqliteFileRepository;
 pub type ProdFetch = RangeFetchClient;
-pub type ProdManager = DownloadManager<ProdFactory, ProdQueue, ProdFetch>;
-pub type ProdService = BrookService<ProdFactory, ProdQueue, ProdFetch>;
+pub type ProdWorkerRepo = SqliteWorkerRepository;
+pub type ProdAttemptRepo = SqlitePieceAttemptRepository;
+pub type ProdManager =
+    DownloadManager<ProdFactory, ProdQueue, ProdFetch, ProdWorkerRepo, ProdAttemptRepo>;
+pub type ProdService =
+    BrookService<ProdFactory, ProdQueue, ProdFetch, ProdWorkerRepo, ProdAttemptRepo>;
 
 /// Пути к артефактам демона (БД, lock, конфиг). В проде всё в CWD; в
 /// интеграционных тестах — в tempdir.
@@ -188,7 +192,14 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         max_concurrent: daemon.max_concurrent,
         ..Default::default()
     };
-    let manager = Arc::new(DownloadManager::new(factory, queue, fetch, manager_cfg));
+    let manager = Arc::new(DownloadManager::with_tracking(
+        factory,
+        queue,
+        fetch,
+        Arc::clone(&workers_repo),
+        Arc::clone(&attempts_repo),
+        manager_cfg,
+    ));
     manager.bootstrap().await.context("manager bootstrap")?;
 
     let bind_addr = SocketAddr::new(daemon.api_bind, daemon.api_port);

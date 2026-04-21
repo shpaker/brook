@@ -8,6 +8,7 @@
 
 pub mod memory_piece_storage;
 pub mod memory_queue_store;
+pub mod memory_tracking;
 pub mod mock_fetch;
 
 pub use memory_piece_storage::{
@@ -15,6 +16,12 @@ pub use memory_piece_storage::{
     MemoryPieceStorageFactory,
 };
 pub use memory_queue_store::MemoryTQueueStore;
+pub use memory_tracking::{
+    MemoryAttemptRepo,
+    MemoryAttemptRow,
+    MemoryWorkerRepo,
+    MemoryWorkerRow,
+};
 pub use mock_fetch::{
     FetchOutcome,
     MockRangeFetch,

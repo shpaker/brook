@@ -17,6 +17,7 @@
 //! Никаких `impl for ...` конкретных бэкендов в ядре нет и быть не должно.
 
 pub mod http;
+pub mod noop_repos;
 pub mod piece_attempt_repo;
 pub mod piece_storage;
 pub mod queue_store;
@@ -30,6 +31,10 @@ pub use http::{
     RangeGuard,
     THttpInspect,
     TRangeFetch,
+};
+pub use noop_repos::{
+    NoopAttemptRepo,
+    NoopWorkerRepo,
 };
 pub use piece_attempt_repo::{
     AttemptRecord,

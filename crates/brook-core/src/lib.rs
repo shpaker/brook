@@ -50,6 +50,8 @@ pub use ports::{
     ByteStream,
     InspectError,
     InspectReport,
+    NoopAttemptRepo,
+    NoopWorkerRepo,
     PreparedDownload,
     RangeError,
     RangeGuard,

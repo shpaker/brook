@@ -200,8 +200,19 @@ sidecar-индекс `<name>.index.brook`. Рядом с таргетом ост
 - [x] Startup recovery в `brookd::app::build_runtime`: под `.brook.lock`
       ровно один раз зовём `pause_all_running_globally` у обоих
       репозиториев до bootstrap'а менеджера.
-- [ ] Прошить `workers_repo` / `attempts_repo` через `DownloadManager`
-      и `DownloadEngine` (start/finish/fail/pause на каждый piece,
-      ensure_slots на старте engine-сессии). Следующая итерация —
-      трогает генерики менеджера и тесты, в текущем PR оставлено
-      за скобками, чтобы не раздувать diff.
+- [x] `workers_repo` / `attempts_repo` прошиты через `DownloadManager`
+      и `DownloadEngine`: `ensure_slots` на старте engine-сессии,
+      `start` / `finish` / `fail` на каждый piece (через `worker_tx`
+      в супервизор, чтобы не звать БД из горячего пути воркера),
+      `mark_done` / `mark_failed` / `mark_cancelled` на финализации.
+      Manager получил дефолтные generic-параметры `NoopWorkerRepo` /
+      `NoopAttemptRepo`, чтобы тесты ядра и in-memory harness'ы
+      оставались без изменений; brookd собирает `DownloadManager`
+      через `with_tracking` с SQLite-репозиториями.
+- [x] Engine-тесты покрывают: две сессии на один файл (первый набор
+      воркеров → paused, второй → done); crash-recovery sweep перед
+      новой сессией; piece retry создаёт вторую attempt-строку; cancel
+      переводит worker-строки в cancelled и закрывает running-попытки;
+      смена `max_workers` между сессиями (4 → 2) даёт свежий набор
+      со `slot_index` 0, 1. In-memory `MemoryWorkerRepo` /
+      `MemoryAttemptRepo` добавлены в `brook-core::testing`.

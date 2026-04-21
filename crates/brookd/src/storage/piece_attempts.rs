@@ -45,12 +45,17 @@ impl SqlitePieceAttemptRepository {
 impl TPieceAttemptRepo for SqlitePieceAttemptRepository {
     fn start(
         &self,
-        piece_id: &str,
+        file_id: DownloadId,
+        piece_number: u32,
         worker_id: WorkerId,
     ) -> impl std::future::Future<Output = CoreResult<AttemptRecord>> + Send {
         let db = self.db.clone();
-        let piece = piece_id.to_owned();
-        async move { run(&db, move |c| start_impl(c, &piece, worker_id)).await }
+        async move {
+            run(&db, move |c| {
+                start_impl(c, file_id, piece_number, worker_id)
+            })
+            .await
+        }
     }
 
     fn finish(
@@ -138,11 +143,20 @@ where
 
 fn start_impl(
     conn: &mut Connection,
-    piece_id: &str,
+    file_id: DownloadId,
+    piece_number: u32,
     worker_id: WorkerId,
 ) -> CoreResult<AttemptRecord> {
     let now = unix_secs(SystemTime::now());
     let id = AttemptId::new();
+    // Резолвим DB-uuid piece'а по натуральному ключу (file_id, number).
+    let piece_id: String = conn
+        .query_row(
+            "SELECT id FROM pieces WHERE file_id = ? AND number = ?",
+            params![file_id.to_string(), piece_number as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|e| Error::Other(format!("piece_attempts: lookup piece: {e}")))?;
     conn.execute(
         "INSERT INTO piece_attempts
            (id, piece_id, worker_id, status_id, started_at, bytes)
@@ -152,7 +166,7 @@ fn start_impl(
     .map_err(|e| Error::Other(format!("piece_attempts: {e}")))?;
     Ok(AttemptRecord {
         id,
-        piece_id: piece_id.to_owned(),
+        piece_id,
         worker_id,
         started_at: now,
         finished_at: None,
@@ -238,7 +252,6 @@ mod tests {
         SqlitePieceAttemptRepository,
         SqliteWorkerRepository,
         DownloadId,
-        String, // piece_id
     ) {
         let db = SharedDb::open_in_memory().unwrap();
         let files = SqliteFileRepository::new(db.clone());
@@ -259,32 +272,19 @@ mod tests {
         let file_id = d.id;
         files.insert(&d).await.unwrap();
         pieces.init(file_id, 3).await.unwrap();
-        let id_str = file_id.to_string();
-        let piece_id: String = db
-            .with_conn(move |c| {
-                c.query_row(
-                    "SELECT id FROM pieces WHERE file_id = ? AND number = 0",
-                    params![id_str],
-                    |r| r.get::<_, String>(0),
-                )
-                .map_err(Into::into)
-            })
-            .await
-            .unwrap();
         (
             db.clone(),
             SqlitePieceAttemptRepository::new(db.clone()),
             SqliteWorkerRepository::new(db),
             file_id,
-            piece_id,
         )
     }
 
     #[tokio::test]
     async fn start_then_finish_updates_status_and_bytes() {
-        let (db, attempts, workers, file_id, piece_id) = fresh().await;
+        let (db, attempts, workers, file_id) = fresh().await;
         let slot = &workers.ensure_slots(file_id, 1).await.unwrap()[0];
-        let a = attempts.start(&piece_id, slot.id).await.unwrap();
+        let a = attempts.start(file_id, 0, slot.id).await.unwrap();
         attempts.finish(a.id, 1234).await.unwrap();
 
         let (status, bytes): (String, i64) = db
@@ -304,9 +304,9 @@ mod tests {
 
     #[tokio::test]
     async fn pause_all_running_globally_sweeps() {
-        let (db, attempts, workers, file_id, piece_id) = fresh().await;
+        let (db, attempts, workers, file_id) = fresh().await;
         let slot = &workers.ensure_slots(file_id, 1).await.unwrap()[0];
-        let a = attempts.start(&piece_id, slot.id).await.unwrap();
+        let a = attempts.start(file_id, 0, slot.id).await.unwrap();
         attempts.pause_all_running_globally().await.unwrap();
         let status: String = db
             .with_conn(move |c| {

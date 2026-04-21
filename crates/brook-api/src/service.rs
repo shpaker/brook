@@ -9,9 +9,13 @@ use std::sync::Arc;
 
 use brook_core::{
     DownloadManager,
+    NoopAttemptRepo,
+    NoopWorkerRepo,
+    TPieceAttemptRepo,
     TPieceStorageFactory,
     TQueueStore,
     TRangeFetch,
+    TWorkerRepo,
 };
 use brook_proto::brook::v1 as proto;
 use brook_proto::brook::v1::Event as ProtoEvent;
@@ -34,14 +38,16 @@ use crate::mapper;
 /// Generics совпадают с `DownloadManager` ради zero-cost: никакого
 /// `dyn`-диспатча, конкретный тип фабрики/очереди/fetch'а известен в
 /// месте сборки (в `brookd` или в тестах).
-pub struct BrookService<PF, QS, F>
+pub struct BrookService<PF, QS, F, WR = NoopWorkerRepo, AR = NoopAttemptRepo>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
-    manager: Arc<DownloadManager<PF, QS, F>>,
+    manager: Arc<DownloadManager<PF, QS, F, WR, AR>>,
     settings: ApiSettings,
     // Сюда уходит «тик» от `Shutdown` RPC. `brookd` получает его через
     // парный `Receiver` и встраивает в select с SIGTERM/SIGINT. Broadcast
@@ -82,15 +88,17 @@ impl Default for ApiSettings {
     }
 }
 
-impl<PF, QS, F> BrookService<PF, QS, F>
+impl<PF, QS, F, WR, AR> BrookService<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     pub fn new(
-        manager: Arc<DownloadManager<PF, QS, F>>,
+        manager: Arc<DownloadManager<PF, QS, F, WR, AR>>,
         settings: ApiSettings,
         shutdown_tx: broadcast::Sender<()>,
     ) -> Self {
@@ -110,12 +118,14 @@ fn ok_status() -> Response<proto::StatusResponse> {
 }
 
 #[tonic::async_trait]
-impl<PF, QS, F> BrookServiceTrait for BrookService<PF, QS, F>
+impl<PF, QS, F, WR, AR> BrookServiceTrait for BrookService<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     async fn list(
         &self,
