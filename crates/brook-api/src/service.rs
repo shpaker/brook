@@ -17,6 +17,7 @@ use brook_proto::brook::v1 as proto;
 use brook_proto::brook::v1::Event as ProtoEvent;
 use brook_proto::brook::v1::brook_service_server::BrookService as BrookServiceTrait;
 use futures_core::Stream;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tonic::{
@@ -42,6 +43,11 @@ where
 {
     manager: Arc<DownloadManager<PF, QS, F>>,
     settings: ApiSettings,
+    // Сюда уходит «тик» от `Shutdown` RPC. `brookd` получает его через
+    // парный `Receiver` и встраивает в select с SIGTERM/SIGINT. Broadcast
+    // выбран ради `Sender::send` без ownership'а — в сервисе только
+    // клонируемый `Sender`, состояние канала остаётся у демона.
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 /// Рантайм-снимок `brook.yaml` + `DownloadDefaults`, которым обслуживается
@@ -83,8 +89,16 @@ where
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
 {
-    pub fn new(manager: Arc<DownloadManager<PF, QS, F>>, settings: ApiSettings) -> Self {
-        Self { manager, settings }
+    pub fn new(
+        manager: Arc<DownloadManager<PF, QS, F>>,
+        settings: ApiSettings,
+        shutdown_tx: broadcast::Sender<()>,
+    ) -> Self {
+        Self {
+            manager,
+            settings,
+            shutdown_tx,
+        }
     }
 }
 
@@ -221,6 +235,16 @@ where
             on_duplicate_url: s.on_duplicate_url as i32,
             on_file_exists: s.on_file_exists as i32,
         }))
+    }
+
+    async fn shutdown(
+        &self,
+        _req: Request<proto::ShutdownRequest>,
+    ) -> Result<Response<proto::StatusResponse>, Status> {
+        // Err от `send` значит, что ресиверов больше нет — демон уже в
+        // процессе завершения. Для клиента это не ошибка: цель достигнута.
+        let _ = self.shutdown_tx.send(());
+        Ok(ok_status())
     }
 
     type WatchStream = Pin<Box<dyn Stream<Item = Result<ProtoEvent, Status>> + Send>>;

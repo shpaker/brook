@@ -45,3 +45,4 @@ serde_yaml         = "0.9"
 clap               = { version = "4", features = ["derive"] }
 indexmap           = "2"
 tokio-stream       = "0.1"
+arboard            = { version = "3", default-features = false }

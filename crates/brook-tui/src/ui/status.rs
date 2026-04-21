@@ -22,20 +22,25 @@ use crate::model::{
     ViewModel,
 };
 
-pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel) {
+pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
     let width = area.width as usize;
-    let line1 = line_identity(vm, width);
+    let line1 = line_identity(vm, width, no_color);
     let line2 = line_counters(vm, width);
     f.render_widget(Paragraph::new(vec![line1, line2]), area);
 }
 
-fn line_identity(vm: &ViewModel, width: usize) -> Line<'static> {
+fn line_identity(vm: &ViewModel, width: usize, no_color: bool) -> Line<'static> {
     let (glyph, color, attempt_suffix) = match &vm.connection {
         ConnectionState::Connected => ("●", Color::Green, String::new()),
         ConnectionState::Reconnecting { attempt } => {
             ("◐", Color::Yellow, format!(" [attempt {attempt}]"))
         }
         ConnectionState::Disconnected { .. } => ("○", Color::Red, String::new()),
+    };
+    let glyph_style = if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(color)
     };
     let addr = format!("127.0.0.1:{}", vm.port);
     let right = format!("{glyph} {addr}{attempt_suffix}");
@@ -46,7 +51,7 @@ fn line_identity(vm: &ViewModel, width: usize) -> Line<'static> {
     if header.len() + right.len() <= width {
         spans.push(Span::raw(header));
     }
-    spans.push(Span::styled(glyph.to_string(), Style::default().fg(color)));
+    spans.push(Span::styled(glyph.to_string(), glyph_style));
     spans.push(Span::raw(format!(" {addr}{attempt_suffix}")));
     Line::from(spans)
 }

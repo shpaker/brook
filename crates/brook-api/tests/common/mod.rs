@@ -114,7 +114,8 @@ impl HarnessBuilder {
             engine: fast_engine_config(),
         };
         let manager = Arc::new(DownloadManager::new(factory, queue, fetch, cfg));
-        let service = BrookService::new(Arc::clone(&manager), ApiSettings::default());
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let service = BrookService::new(Arc::clone(&manager), ApiSettings::default(), shutdown_tx);
         let server = BrookServiceServer::new(service);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

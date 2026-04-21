@@ -25,7 +25,7 @@ use crate::model::{
     ViewModel,
 };
 
-pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel) {
+pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, _no_color: bool) {
     let block = Block::default().borders(Borders::TOP);
     let inner = block.inner(area);
     f.render_widget(block, area);

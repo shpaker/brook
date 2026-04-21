@@ -51,6 +51,7 @@ use brook_http::{
 };
 use fs4::fs_std::FileExt;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::TcpListenerStream;
 use tracing::{
     info,
@@ -116,6 +117,9 @@ pub struct Runtime {
     /// раньше сервера и чтобы интеграционные тесты могли запросить
     /// ephemeral-порт (через `api.port = 0` в конфиге).
     pub listener: TcpListener,
+    /// Ресивер от `Shutdown` RPC. `serve` селектит его с внешним
+    /// `shutdown`-фьючей (в проде — `SIGTERM`/`SIGINT`).
+    pub rpc_shutdown_rx: broadcast::Receiver<()>,
 }
 
 pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
@@ -166,7 +170,8 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         .await
         .with_context(|| format!("bind gRPC listener on {bind_addr}"))?;
     let addr = listener.local_addr().context("local_addr")?;
-    let svc = BrookService::new(Arc::clone(&manager), api_settings(&daemon));
+    let (rpc_shutdown_tx, rpc_shutdown_rx) = broadcast::channel(1);
+    let svc = BrookService::new(Arc::clone(&manager), api_settings(&daemon), rpc_shutdown_tx);
 
     Ok(Runtime {
         lock,
@@ -175,6 +180,7 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         addr,
         svc,
         listener,
+        rpc_shutdown_rx,
     })
 }
 
@@ -190,13 +196,27 @@ pub async fn serve(runtime: Runtime, shutdown: impl Future<Output = ()> + Send) 
         addr,
         svc,
         listener,
+        mut rpc_shutdown_rx,
         ..
     } = runtime;
+
+    // Объединяем внешний shutdown (сигналы в проде) с RPC-триггером.
+    // `recv()` на broadcast-ресивере может вернуть Lagged, но у нас
+    // единственный sender и канал ёмкостью 1 — любое событие валидно
+    // трактуется как «пора гаситься».
+    let combined_shutdown = async move {
+        tokio::select! {
+            _ = shutdown => {}
+            _ = rpc_shutdown_rx.recv() => {
+                info!("received Shutdown RPC");
+            }
+        }
+    };
 
     let incoming = TcpListenerStream::new(listener);
     let server = tonic::transport::Server::builder()
         .add_service(BrookServiceServer::with_interceptor(svc, trace_interceptor))
-        .serve_with_incoming_shutdown(incoming, shutdown);
+        .serve_with_incoming_shutdown(incoming, combined_shutdown);
 
     info!(%addr, "brookd listening");
     server.await.context("grpc server")?;

@@ -37,11 +37,10 @@ const PREFIX_WIDTH: u16 = 4;
 /// Фиксированная ширина правой метрика-колонки.
 const RIGHT_COL_WIDTH: u16 = 34;
 
-pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel) {
+pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
     if area.width < PREFIX_WIDTH + 10 || area.height == 0 {
         return;
     }
-    let no_color = std::env::var_os("NO_COLOR").is_some();
 
     let ids = vm.visible_ids();
     let visible_len = ids.len();
@@ -84,6 +83,7 @@ pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel) {
             },
             row,
             i == cursor,
+            vm.selected.contains(id),
             no_color,
         );
     }
@@ -116,10 +116,17 @@ fn compute_scroll(cursor: usize, viewport: u16, total: u16) -> u16 {
     desired.min(max_offset)
 }
 
-fn draw_entry(f: &mut Frame, area: Rect, row: &DownloadRow, is_cursor: bool, no_color: bool) {
+fn draw_entry(
+    f: &mut Frame,
+    area: Rect,
+    row: &DownloadRow,
+    is_cursor: bool,
+    is_selected: bool,
+    no_color: bool,
+) {
     // Строка 1 — шапка.
     if area.height >= 1 {
-        let header = header_line(row, is_cursor, area.width);
+        let header = header_line(row, is_cursor, is_selected, area.width);
         f.render_widget(
             Paragraph::new(header),
             Rect {
@@ -176,9 +183,9 @@ fn draw_entry(f: &mut Frame, area: Rect, row: &DownloadRow, is_cursor: bool, no_
     // Строка 3 — пустой разделитель (само собой, просто ничего не рисуем).
 }
 
-fn header_line(row: &DownloadRow, is_cursor: bool, width: u16) -> Line<'static> {
+fn header_line(row: &DownloadRow, is_cursor: bool, is_selected: bool, width: u16) -> Line<'static> {
     let cursor_ch = if is_cursor { '›' } else { ' ' };
-    let select_ch = ' '; // multi-select появится в §6.5
+    let select_ch = if is_selected { '*' } else { ' ' };
     let icon = state_icon(row.state);
 
     let prefix = format!("{cursor_ch} {select_ch} {icon} ");
