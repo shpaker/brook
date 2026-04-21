@@ -4,7 +4,7 @@
 //! Скроллинг — попиксельный (по строкам буфера), а не «по элементам».
 //! Scrollbar справа появляется только при переполнении.
 
-use brook_proto::brook::v1::DownloadState;
+use brook_proto::brook::v1::DownloadStatus;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{
@@ -186,7 +186,7 @@ fn draw_entry(
 fn header_line(row: &DownloadRow, is_cursor: bool, is_selected: bool, width: u16) -> Line<'static> {
     let cursor_ch = if is_cursor { '›' } else { ' ' };
     let select_ch = if is_selected { '*' } else { ' ' };
-    let icon = state_icon(row.state);
+    let icon = status_icon(row.status);
 
     let prefix = format!("{cursor_ch} {select_ch} {icon} ");
     let right = right_column(row);
@@ -209,15 +209,15 @@ fn header_line(row: &DownloadRow, is_cursor: bool, is_selected: bool, width: u16
     ])
 }
 
-fn state_icon(s: DownloadState) -> &'static str {
+fn status_icon(s: DownloadStatus) -> &'static str {
     match s {
-        DownloadState::Running => "▶",
-        DownloadState::Paused => "❚❚",
-        DownloadState::Retrying => "↻",
-        DownloadState::Queued => "⏳",
-        DownloadState::Done => "✓",
-        DownloadState::Failed | DownloadState::Cancelled => "✕",
-        DownloadState::Unspecified => "·",
+        DownloadStatus::Running => "▶",
+        DownloadStatus::Paused => "❚❚",
+        DownloadStatus::Retrying => "↻",
+        DownloadStatus::Pending => "⏳",
+        DownloadStatus::Done => "✓",
+        DownloadStatus::Failed | DownloadStatus::Cancelled => "✕",
+        DownloadStatus::Unspecified => "·",
     }
 }
 
@@ -228,8 +228,8 @@ fn right_column(row: &DownloadRow) -> String {
     } else {
         "—".to_string()
     };
-    let state_field: String = match row.state {
-        DownloadState::Running => {
+    let status_field: String = match row.status {
+        DownloadStatus::Running => {
             let eta = row
                 .progress
                 .eta_secs
@@ -237,23 +237,23 @@ fn right_column(row: &DownloadRow) -> String {
                 .unwrap_or_else(|| "—".to_string());
             format!("{} · {}", format::speed(row.progress.speed_bps), eta)
         }
-        DownloadState::Paused => "— · paused".into(),
-        DownloadState::Queued => "— · queued".into(),
-        DownloadState::Retrying => {
+        DownloadStatus::Paused => "— · paused".into(),
+        DownloadStatus::Pending => "— · queued".into(),
+        DownloadStatus::Retrying => {
             if row.max_attempts > 0 {
                 format!("— · {}/{}", row.attempt, row.max_attempts)
             } else {
                 format!("— · retry {}", row.attempt)
             }
         }
-        DownloadState::Done => "— · done".into(),
-        DownloadState::Failed => "— · failed".into(),
-        DownloadState::Cancelled => "— · cancelled".into(),
-        DownloadState::Unspecified => "—".into(),
+        DownloadStatus::Done => "— · done".into(),
+        DownloadStatus::Failed => "— · failed".into(),
+        DownloadStatus::Cancelled => "— · cancelled".into(),
+        DownloadStatus::Unspecified => "—".into(),
     };
     // Обрезаем до фиксированной ширины, чтобы все правые колонки
     // совпали по границе.
-    let raw = format!("{done} / {total} · {state_field}");
+    let raw = format!("{done} / {total} · {status_field}");
     let w = RIGHT_COL_WIDTH as usize;
     if raw.chars().count() >= w {
         format::right_ellipsis(&raw, w)

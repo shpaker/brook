@@ -24,14 +24,21 @@ mod service;
 pub mod testing;
 
 pub use domain::{
+    AttemptId,
+    AttemptStatus,
     Download,
     DownloadCommand,
     DownloadEvent,
     DownloadId,
     DownloadSpec,
-    DownloadState,
+    FailureReason,
+    FileStatus,
     OnFileExistsOverride,
+    PieceStatus,
     Progress,
+    ReasonCode,
+    WorkerId,
+    WorkerStatus,
     default_workers,
 };
 pub use error::{
@@ -39,17 +46,23 @@ pub use error::{
     Result,
 };
 pub use ports::{
+    AttemptRecord,
     ByteStream,
     InspectError,
     InspectReport,
+    NoopAttemptRepo,
+    NoopWorkerRepo,
     PreparedDownload,
     RangeError,
     RangeGuard,
     THttpInspect,
+    TPieceAttemptRepo,
     TPieceStorage,
     TPieceStorageFactory,
     TQueueStore,
     TRangeFetch,
+    TWorkerRepo,
+    WorkerRecord,
 };
 pub use service::{
     CrashLoopGuard,

@@ -10,7 +10,7 @@
 //! build_runtime(paths)
 //!     ├── .brook.lock (flock)
 //!     ├── Settings::load_or_init
-//!     ├── SqliteQueueRepository::open + миграции
+//!     ├── SharedDb::open + миграции + SqliteFileRepository
 //!     ├── HttpClientBuilder (один reqwest::Client → inspect + range)
 //!     ├── LocalPieceStorageFactory
 //!     └── DownloadManager::new + bootstrap()
@@ -43,6 +43,8 @@ use brook_api::{
 use brook_core::{
     DownloadManager,
     ManagerConfig,
+    TPieceAttemptRepo,
+    TWorkerRepo,
 };
 use brook_http::{
     HttpClientBuilder,
@@ -65,8 +67,12 @@ use crate::config::{
     OnFileExists,
     Settings,
 };
+use crate::storage::db::SharedDb;
 use crate::storage::factory::LocalPieceStorageFactory;
-use crate::storage::queue::SqliteQueueRepository;
+use crate::storage::files::SqliteFileRepository;
+use crate::storage::piece_attempts::SqlitePieceAttemptRepository;
+use crate::storage::pieces::SqlitePieceRepository;
+use crate::storage::workers::SqliteWorkerRepository;
 
 /// Имя lock-файла в CWD (гарантирует single-instance).
 pub const LOCK_FILENAME: &str = ".brook.lock";
@@ -78,10 +84,14 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 /// Конкретные типы адаптеров, с которыми параметризуется менеджер в
 /// проде и интеграционных тестах.
 pub type ProdFactory = LocalPieceStorageFactory<HttpInspectClient>;
-pub type ProdQueue = SqliteQueueRepository;
+pub type ProdQueue = SqliteFileRepository;
 pub type ProdFetch = RangeFetchClient;
-pub type ProdManager = DownloadManager<ProdFactory, ProdQueue, ProdFetch>;
-pub type ProdService = BrookService<ProdFactory, ProdQueue, ProdFetch>;
+pub type ProdWorkerRepo = SqliteWorkerRepository;
+pub type ProdAttemptRepo = SqlitePieceAttemptRepository;
+pub type ProdManager =
+    DownloadManager<ProdFactory, ProdQueue, ProdFetch, ProdWorkerRepo, ProdAttemptRepo>;
+pub type ProdService =
+    BrookService<ProdFactory, ProdQueue, ProdFetch, ProdWorkerRepo, ProdAttemptRepo>;
 
 /// Пути к артефактам демона (БД, lock, конфиг). В проде всё в CWD; в
 /// интеграционных тестах — в tempdir.
@@ -143,8 +153,26 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         .with_context(|| format!("load config {}", paths.config.display()))?;
     let daemon = DaemonRuntime::from_settings(&settings).context("derive daemon runtime")?;
 
-    // 3. Queue.
-    let queue = Arc::new(SqliteQueueRepository::open(&paths.db).context("open queue database")?);
+    // 3. Repositories (поверх общего `brook.db`).
+    let shared_db = SharedDb::open(&paths.db).context("open brook.db")?;
+    let files_repo = Arc::new(SqliteFileRepository::new(shared_db.clone()));
+    let pieces_repo = Arc::new(SqlitePieceRepository::new(shared_db.clone()));
+    let workers_repo = Arc::new(SqliteWorkerRepository::new(shared_db.clone()));
+    let attempts_repo = Arc::new(SqlitePieceAttemptRepository::new(shared_db));
+    let queue = Arc::clone(&files_repo);
+
+    // 3a. Startup recovery: любые `running`-воркеры и `running`-attempt'ы,
+    // оставшиеся от предыдущего (возможно, упавшего) инстанса, переводим в
+    // `paused`. Делаем это под `.brook.lock` — единственный раз за жизнь
+    // процесса, до того, как появится шанс породить новый engine.
+    workers_repo
+        .pause_all_running_globally()
+        .await
+        .context("workers recovery sweep")?;
+    attempts_repo
+        .pause_all_running_globally()
+        .await
+        .context("piece_attempts recovery sweep")?;
 
     // 4. HTTP-стек (один reqwest::Client на inspect + range).
     let http_client = HttpClientBuilder::new().build();
@@ -155,6 +183,8 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
     let factory = Arc::new(LocalPieceStorageFactory::new(
         Arc::clone(&inspect),
         daemon.defaults,
+        pieces_repo,
+        Arc::clone(&files_repo),
     ));
 
     // 6. Manager + bootstrap.
@@ -162,7 +192,14 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         max_concurrent: daemon.max_concurrent,
         ..Default::default()
     };
-    let manager = Arc::new(DownloadManager::new(factory, queue, fetch, manager_cfg));
+    let manager = Arc::new(DownloadManager::with_tracking(
+        factory,
+        queue,
+        fetch,
+        Arc::clone(&workers_repo),
+        Arc::clone(&attempts_repo),
+        manager_cfg,
+    ));
     manager.bootstrap().await.context("manager bootstrap")?;
 
     let bind_addr = SocketAddr::new(daemon.api_bind, daemon.api_port);

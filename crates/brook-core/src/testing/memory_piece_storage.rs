@@ -17,7 +17,10 @@ use std::collections::{
 };
 use std::sync::Mutex;
 
-use crate::domain::DownloadSpec;
+use crate::domain::{
+    DownloadId,
+    DownloadSpec,
+};
 use crate::error::{
     Error,
     Result,
@@ -239,7 +242,11 @@ impl MemoryPieceStorageFactory {
 impl TPieceStorageFactory for MemoryPieceStorageFactory {
     type Storage = MemoryPieceStorage;
 
-    async fn prepare(&self, spec: &DownloadSpec) -> Result<PreparedDownload<Self::Storage>> {
+    async fn prepare(
+        &self,
+        _id: DownloadId,
+        spec: &DownloadSpec,
+    ) -> Result<PreparedDownload<Self::Storage>> {
         // Для in-memory тестов fabricated total_size = count * piece_size;
         // расхождений с «последним куском меньше piece_size» здесь нет.
         let total_size = self.piece_count as u64 * self.piece_size;
@@ -348,8 +355,8 @@ mod tests {
     async fn factory_creates_independent_storages() {
         let factory = MemoryPieceStorageFactory::new(2, 3);
         let spec = DownloadSpec::new("https://example.com/a", "/tmp");
-        let a = factory.prepare(&spec).await.unwrap();
-        let b = factory.prepare(&spec).await.unwrap();
+        let a = factory.prepare(DownloadId::new(), &spec).await.unwrap();
+        let b = factory.prepare(DownloadId::new(), &spec).await.unwrap();
 
         assert_eq!(a.total_size, 6);
         assert_eq!(a.piece_size, 3);

@@ -62,6 +62,80 @@ impl FromStr for DownloadId {
     }
 }
 
+/// Идентификатор одного воркера в рамках одной engine-сессии.
+///
+/// Пересоздаётся на каждый старт движка: после паузы/рестарта предыдущий
+/// `WorkerId` уходит в историю со статусом `paused`, а новые воркеры
+/// получают свежие идентификаторы. Это даёт стабильный ключ для
+/// аналитики по попыткам конкретного slot-а.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkerId(Uuid);
+
+impl WorkerId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for WorkerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl FromStr for WorkerId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
+/// Идентификатор одной попытки (attempt) скачать конкретный piece
+/// конкретным воркером.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AttemptId(Uuid);
+
+impl AttemptId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for AttemptId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for AttemptId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl FromStr for AttemptId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

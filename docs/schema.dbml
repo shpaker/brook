@@ -1,14 +1,12 @@
 // brook.db — единая БД демона.
 // Формат — dbdiagram.io (https://dbdiagram.io).
 
-Table states {
-  id   text [pk, note: 'StateId (UUID)']
-  name text [unique, not null, note: 'queued|running|paused|retrying|done|failed|cancelled']
+Table statuses {
+  name text [pk, note: 'pending|running|paused|retrying|done|failed|cancelled — единый словарь, natural key']
 }
 
 Table reason_codes {
-  id   text [pk, note: 'ReasonCodeId (UUID)']
-  code text [unique, not null, note: 'network|timeout|http_4xx|http_5xx|source_mutated|disk_full|invalid_response|cancelled_by_user|unknown']
+  code text [pk, note: 'network|timeout|http_4xx|http_5xx|source_mutated|disk_full|invalid_response|cancelled_by_user|unknown — natural key']
 }
 
 Table files {
@@ -16,7 +14,7 @@ Table files {
   url        text [not null]
   target_dir text [not null]
   filename   text
-  state_id   text [not null, note: 'текущее состояние; история — в state_changes']
+  status_id  text [not null, note: 'текущий статус файла; история — в status_changes. Допустим любой из 7 значений']
   created_at integer [not null, note: 'unix seconds']
 }
 
@@ -33,16 +31,16 @@ Table file_settings {
   last_modified text
 }
 
-Table state_changes {
+Table status_changes {
   id             text    [pk, note: 'HistoryId (UUID)']
   file_id        text    [not null]
-  state_id       text    [not null]
+  status_id      text    [not null]
   reason_code_id text    [note: 'NULL для успешных переходов; обязательно при переходе в failed']
   reason_message text    [note: 'свободный текст с деталями, опционально']
   created_at     integer [not null, note: 'unix seconds']
 
   indexes {
-    (file_id, created_at) [name: 'idx_state_changes_file_time']
+    (file_id, created_at) [name: 'idx_status_changes_file_time']
   }
 }
 
@@ -50,7 +48,7 @@ Table pieces {
   id          text    [pk, note: 'PieceId (UUID)']
   file_id     text    [not null]
   number      integer [not null, note: 'offset = number * file_settings.piece_size; size = min(piece_size, total_size - offset)']
-  status      text    [not null, note: 'pending|in_progress|done']
+  status_id   text    [not null, note: 'pending|running|done — подмножество вокабуляра; CHECK на колонке']
   created_at  integer [not null, note: 'unix seconds']
   finished_at integer [note: 'unix seconds; NULL пока не done']
 
@@ -59,9 +57,53 @@ Table pieces {
   }
 }
 
-Ref: files.state_id                > states.id
-Ref: file_settings.file_id         > files.id         [delete: cascade]
-Ref: state_changes.file_id         > files.id         [delete: cascade]
-Ref: state_changes.state_id        > states.id
-Ref: state_changes.reason_code_id  > reason_codes.id
-Ref: pieces.file_id                > files.id         [delete: cascade]
+// Воркер — единица параллелизма одной engine-сессии. Identity воркера
+// живёт ровно одну сессию: после паузы/рестарта старые строки переходят
+// в paused, новая сессия создаёт свежие UUID'ы. Это даёт стабильный
+// ключ для per-worker аналитики.
+Table workers {
+  id          text    [pk, note: 'WorkerId (UUID); новый на каждый старт engine']
+  file_id     text    [not null]
+  slot_index  integer [not null, note: '0..N-1; не уникален — много поколений']
+  status_id   text    [not null, note: 'running|paused|done|failed|cancelled — подмножество вокабуляра']
+  started_at  integer [not null, note: 'unix seconds']
+  finished_at integer [note: 'unix seconds; NULL пока running']
+  error       text    [note: 'свободный текст для failed']
+
+  indexes {
+    (file_id, slot_index) [name: 'idx_workers_file_slot']
+  }
+}
+
+// Журнал попыток скачивания piece'а. На один piece может быть несколько
+// attempt'ов (ретраи, паузы, cancel). Источник истины для per-worker /
+// per-piece аналитики: скорость, bytes, число ретраев — всё выводится
+// оконными/GROUP BY запросами без суммирующих полей в workers.
+Table piece_attempts {
+  id          text    [pk, note: 'AttemptId (UUID)']
+  piece_id    text    [not null, note: 'FK → pieces.id']
+  worker_id   text    [not null, note: 'FK → workers.id']
+  status_id   text    [not null, note: 'running|paused|done|failed|cancelled — подмножество вокабуляра']
+  started_at  integer [not null, note: 'unix seconds']
+  finished_at integer [note: 'unix seconds; NULL пока running']
+  bytes       integer [not null, default: 0, note: 'скачано за эту попытку']
+  error       text
+
+  indexes {
+    (piece_id, started_at)  [name: 'idx_piece_attempts_piece_time']
+    (worker_id, started_at) [name: 'idx_piece_attempts_worker_time']
+  }
+}
+
+Ref: files.status_id                > statuses.name
+Ref: file_settings.file_id          > files.id         [delete: cascade]
+Ref: status_changes.file_id         > files.id         [delete: cascade]
+Ref: status_changes.status_id       > statuses.name
+Ref: status_changes.reason_code_id  > reason_codes.code
+Ref: pieces.file_id                 > files.id         [delete: cascade]
+Ref: pieces.status_id               > statuses.name
+Ref: workers.file_id                > files.id         [delete: cascade]
+Ref: workers.status_id              > statuses.name
+Ref: piece_attempts.piece_id        > pieces.id        [delete: cascade]
+Ref: piece_attempts.worker_id       > workers.id
+Ref: piece_attempts.status_id       > statuses.name

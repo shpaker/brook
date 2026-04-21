@@ -57,16 +57,22 @@ use crate::domain::{
     DownloadEvent,
     DownloadId,
     DownloadSpec,
-    DownloadState,
+    FailureReason,
+    FileStatus,
+    ReasonCode,
 };
 use crate::error::{
     Error,
     Result,
 };
 use crate::ports::{
+    NoopAttemptRepo,
+    NoopWorkerRepo,
+    TPieceAttemptRepo,
     TPieceStorageFactory,
     TQueueStore,
     TRangeFetch,
+    TWorkerRepo,
 };
 use crate::service::engine::{
     DownloadEngine,
@@ -98,22 +104,31 @@ impl Default for ManagerConfig {
 }
 
 /// Верхний координатор загрузок. Клонируется дёшево (внутри `Arc`).
-pub struct DownloadManager<PF, QS, F>
+///
+/// `WR`/`AR` — репозитории воркеров и попыток piece'ов. Дефолты
+/// ([`NoopWorkerRepo`] / [`NoopAttemptRepo`]) — для тестов и кейсов,
+/// где аналитика журнала не нужна; prod-подключение (brookd)
+/// подставляет SQLite-адаптеры явно через [`DownloadManager::with_tracking`].
+pub struct DownloadManager<PF, QS, F, WR = NoopWorkerRepo, AR = NoopAttemptRepo>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
-    shared: Arc<Shared<PF, QS, F>>,
+    shared: Arc<Shared<PF, QS, F, WR, AR>>,
 }
 
-impl<PF, QS, F> Clone for DownloadManager<PF, QS, F>
+impl<PF, QS, F, WR, AR> Clone for DownloadManager<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -122,16 +137,20 @@ where
     }
 }
 
-struct Shared<PF, QS, F>
+struct Shared<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     factory: Arc<PF>,
     queue: Arc<QS>,
     fetch: Arc<F>,
+    workers_repo: Arc<WR>,
+    attempts_repo: Arc<AR>,
     inner: Mutex<Inner>,
     events_tx: broadcast::Sender<DownloadEvent>,
     config: ManagerConfig,
@@ -146,20 +165,55 @@ struct Inner {
     waiting: VecDeque<DownloadId>,
 }
 
-impl<PF, QS, F> DownloadManager<PF, QS, F>
+impl<PF, QS, F> DownloadManager<PF, QS, F, NoopWorkerRepo, NoopAttemptRepo>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
 {
+    /// Собрать менеджер без аналитики воркеров/попыток (no-op репозитории).
+    /// Используется в юнит-тестах ядра и in-memory harness'ах.
     pub fn new(factory: Arc<PF>, queue: Arc<QS>, fetch: Arc<F>, config: ManagerConfig) -> Self {
+        Self::with_tracking(
+            factory,
+            queue,
+            fetch,
+            Arc::new(NoopWorkerRepo),
+            Arc::new(NoopAttemptRepo),
+            config,
+        )
+    }
+}
+
+impl<PF, QS, F, WR, AR> DownloadManager<PF, QS, F, WR, AR>
+where
+    PF: TPieceStorageFactory + Send + Sync + 'static,
+    PF::Storage: Send + Sync + 'static,
+    QS: TQueueStore + Send + Sync + 'static,
+    F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
+{
+    /// Собрать менеджер с явными репозиториями воркеров и попыток —
+    /// prod-путь brookd, где `workers` и `piece_attempts` пишутся в
+    /// общую `brook.db`.
+    pub fn with_tracking(
+        factory: Arc<PF>,
+        queue: Arc<QS>,
+        fetch: Arc<F>,
+        workers_repo: Arc<WR>,
+        attempts_repo: Arc<AR>,
+        config: ManagerConfig,
+    ) -> Self {
         let (events_tx, _) = broadcast::channel(config.events_capacity);
         Self {
             shared: Arc::new(Shared {
                 factory,
                 queue,
                 fetch,
+                workers_repo,
+                attempts_repo,
                 inner: Mutex::new(Inner {
                     records: HashMap::new(),
                     engines: HashMap::new(),
@@ -190,30 +244,30 @@ where
     /// `Queued` остаются как есть.
     pub async fn bootstrap(&self) -> Result<()> {
         let loaded = self.shared.queue.load_all().await?;
-        let mut to_fix: Vec<(DownloadId, DownloadState)> = Vec::new();
+        let mut to_fix: Vec<(DownloadId, FileStatus)> = Vec::new();
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
             for mut d in loaded {
-                let target = match d.state {
-                    DownloadState::Running | DownloadState::Retrying => {
-                        to_fix.push((d.id, DownloadState::Queued));
-                        DownloadState::Queued
+                let target = match d.status {
+                    FileStatus::Running | FileStatus::Retrying => {
+                        to_fix.push((d.id, FileStatus::Pending));
+                        FileStatus::Pending
                     }
                     s => s,
                 };
-                d.state = target;
+                d.status = target;
                 if matches!(
                     target,
-                    DownloadState::Queued | DownloadState::Paused | DownloadState::Retrying
-                ) && !matches!(target, DownloadState::Paused)
+                    FileStatus::Pending | FileStatus::Paused | FileStatus::Retrying
+                ) && !matches!(target, FileStatus::Paused)
                 {
                     inner.waiting.push_back(d.id);
                 }
                 inner.records.insert(d.id, d);
             }
         }
-        for (id, state) in to_fix {
-            if let Err(e) = self.shared.queue.update_state(id, state).await {
+        for (id, status) in to_fix {
+            if let Err(e) = self.shared.queue.update_status(id, status, None).await {
                 warn!(%id, error = %e, "bootstrap: failed to persist normalized state");
             }
         }
@@ -283,21 +337,21 @@ where
             }
             inner.waiting.retain(|x| *x != id);
             let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
-            if record.state.is_terminal() {
+            if record.status.is_terminal() {
                 return Err(Error::Other("download is terminal".into()));
             }
-            if record.state != DownloadState::Paused {
-                record.state = DownloadState::Paused;
+            if record.status != FileStatus::Paused {
+                record.status = FileStatus::Paused;
                 record.updated_at = SystemTime::now();
-                persist = Some(DownloadState::Paused);
-                let _ = self.shared.events_tx.send(DownloadEvent::StateChanged {
+                persist = Some(FileStatus::Paused);
+                let _ = self.shared.events_tx.send(DownloadEvent::StatusChanged {
                     id,
-                    state: DownloadState::Paused,
+                    status: FileStatus::Paused,
                 });
             }
         }
-        if let Some(state) = persist {
-            self.shared.queue.update_state(id, state).await?;
+        if let Some(status) = persist {
+            self.shared.queue.update_status(id, status, None).await?;
         }
         Ok(())
     }
@@ -315,24 +369,24 @@ where
                 return Ok(());
             }
             let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
-            if record.state.is_terminal() {
+            if record.status.is_terminal() {
                 return Err(Error::Other("download is terminal".into()));
             }
-            if record.state != DownloadState::Queued {
-                record.state = DownloadState::Queued;
+            if record.status != FileStatus::Pending {
+                record.status = FileStatus::Pending;
                 record.updated_at = SystemTime::now();
-                persist = Some(DownloadState::Queued);
-                let _ = self.shared.events_tx.send(DownloadEvent::StateChanged {
+                persist = Some(FileStatus::Pending);
+                let _ = self.shared.events_tx.send(DownloadEvent::StatusChanged {
                     id,
-                    state: DownloadState::Queued,
+                    status: FileStatus::Pending,
                 });
             }
             if !inner.waiting.iter().any(|x| *x == id) {
                 inner.waiting.push_back(id);
             }
         }
-        if let Some(state) = persist {
-            self.shared.queue.update_state(id, state).await?;
+        if let Some(status) = persist {
+            self.shared.queue.update_status(id, status, None).await?;
         }
         self.try_spawn_next().await;
         Ok(())
@@ -348,21 +402,25 @@ where
             }
             inner.waiting.retain(|x| *x != id);
             let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
-            if record.state.is_terminal() {
+            if record.status.is_terminal() {
                 return Ok(()); // уже всё.
             }
-            record.state = DownloadState::Cancelled;
+            record.status = FileStatus::Cancelled;
             record.updated_at = SystemTime::now();
-            let _ = self.shared.events_tx.send(DownloadEvent::StateChanged {
+            let _ = self.shared.events_tx.send(DownloadEvent::StatusChanged {
                 id,
-                state: DownloadState::Cancelled,
+                status: FileStatus::Cancelled,
             });
             true
         };
         if should_persist {
             self.shared
                 .queue
-                .update_state(id, DownloadState::Cancelled)
+                .update_status(
+                    id,
+                    FileStatus::Cancelled,
+                    Some(FailureReason::new(ReasonCode::CancelledByUser)),
+                )
                 .await?;
         }
         Ok(())
@@ -404,11 +462,11 @@ where
                     let inner = shared.inner.lock().expect("mutex poisoned");
                     active.iter().all(|id| match inner.records.get(id) {
                         Some(d) => matches!(
-                            d.state,
-                            DownloadState::Paused
-                                | DownloadState::Done
-                                | DownloadState::Failed
-                                | DownloadState::Cancelled
+                            d.status,
+                            FileStatus::Paused
+                                | FileStatus::Done
+                                | FileStatus::Failed
+                                | FileStatus::Cancelled
                         ),
                         None => true,
                     })
@@ -434,7 +492,7 @@ where
             inner
                 .records
                 .iter()
-                .filter(|(_, d)| d.state == DownloadState::Paused)
+                .filter(|(_, d)| d.status == FileStatus::Paused)
                 .map(|(id, _)| *id)
                 .collect()
         };
@@ -456,8 +514,8 @@ where
                 // Paused/Cancelled игнорируем и пропускаем.
                 let mut picked: Option<DownloadId> = None;
                 while let Some(id) = inner.waiting.pop_front() {
-                    match inner.records.get(&id).map(|d| d.state) {
-                        Some(DownloadState::Queued) | Some(DownloadState::Retrying) => {
+                    match inner.records.get(&id).map(|d| d.status) {
+                        Some(FileStatus::Pending) | Some(FileStatus::Retrying) => {
                             picked = Some(id);
                             break;
                         }
@@ -470,10 +528,11 @@ where
             let Some(id) = next else { return };
             if let Err(e) = self.spawn_engine(id).await {
                 warn!(%id, error = %e, "failed to spawn engine");
+                let reason = FailureReason::from_error(&e);
                 {
                     let mut inner = self.shared.inner.lock().expect("mutex poisoned");
                     if let Some(record) = inner.records.get_mut(&id) {
-                        record.state = DownloadState::Failed;
+                        record.status = FileStatus::Failed;
                         record.error = Some(e.to_string());
                         record.updated_at = SystemTime::now();
                     }
@@ -481,7 +540,7 @@ where
                 let _ = self
                     .shared
                     .queue
-                    .update_state(id, DownloadState::Failed)
+                    .update_status(id, FileStatus::Failed, Some(reason))
                     .await;
                 let _ = self.shared.events_tx.send(DownloadEvent::Failed {
                     id,
@@ -496,13 +555,16 @@ where
         async move { Self::spawn_engine_impl(shared, id).await }
     }
 
-    async fn spawn_engine_impl(shared: Arc<Shared<PF, QS, F>>, id: DownloadId) -> Result<()> {
+    async fn spawn_engine_impl(
+        shared: Arc<Shared<PF, QS, F, WR, AR>>,
+        id: DownloadId,
+    ) -> Result<()> {
         let maybe_spec = {
             let inner = shared.inner.lock().expect("mutex poisoned");
             inner.records.get(&id).map(|d| d.spec.clone())
         };
         let spec = maybe_spec.ok_or(Error::NotFound)?;
-        let prepared = shared.factory.prepare(&spec).await?;
+        let prepared = shared.factory.prepare(id, &spec).await?;
         let inputs = EngineInputs {
             spec,
             total_size: prepared.total_size,
@@ -517,6 +579,8 @@ where
             shared.config.engine.clone(),
             storage,
             Arc::clone(&shared.fetch),
+            Arc::clone(&shared.workers_repo),
+            Arc::clone(&shared.attempts_repo),
         );
         {
             let mut inner = shared.inner.lock().expect("mutex poisoned");
@@ -527,8 +591,8 @@ where
     }
 }
 
-async fn fan_in_events<PF, QS, F>(
-    shared: Arc<Shared<PF, QS, F>>,
+async fn fan_in_events<PF, QS, F, WR, AR>(
+    shared: Arc<Shared<PF, QS, F, WR, AR>>,
     id: DownloadId,
     mut rx: broadcast::Receiver<DownloadEvent>,
 ) where
@@ -536,6 +600,8 @@ async fn fan_in_events<PF, QS, F>(
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     // Выходим из цикла только когда канал событий движка закрылся
     // (движок завершил таск и уронил свой `Sender`). До этого момента
@@ -550,7 +616,8 @@ async fn fan_in_events<PF, QS, F>(
             }
             Err(broadcast::error::RecvError::Closed) => break,
         };
-        let mut state_to_persist: Option<DownloadState> = None;
+        let mut status_to_persist: Option<FileStatus> = None;
+        let mut reason_to_persist: Option<FailureReason> = None;
         {
             let mut inner = shared.inner.lock().expect("mutex poisoned");
             if let Some(record) = inner.records.get_mut(&id) {
@@ -559,35 +626,46 @@ async fn fan_in_events<PF, QS, F>(
                         record.progress = *progress;
                         record.updated_at = SystemTime::now();
                     }
-                    DownloadEvent::StateChanged { state, .. } => {
-                        if record.state != *state {
-                            record.state = *state;
+                    DownloadEvent::StatusChanged { status, .. } => {
+                        if record.status != *status {
+                            record.status = *status;
                             record.updated_at = SystemTime::now();
-                            state_to_persist = Some(*state);
+                            status_to_persist = Some(*status);
                         }
                     }
                     DownloadEvent::Completed { .. } => {
-                        if record.state != DownloadState::Done {
-                            record.state = DownloadState::Done;
+                        if record.status != FileStatus::Done {
+                            record.status = FileStatus::Done;
                             record.updated_at = SystemTime::now();
-                            state_to_persist = Some(DownloadState::Done);
+                            status_to_persist = Some(FileStatus::Done);
                         }
                     }
                     DownloadEvent::Failed { error, .. } => {
-                        record.state = DownloadState::Failed;
+                        record.status = FileStatus::Failed;
                         record.error = Some(error.clone());
                         record.updated_at = SystemTime::now();
-                        state_to_persist = Some(DownloadState::Failed);
+                        status_to_persist = Some(FileStatus::Failed);
+                        // У engine нет типизированного Error — только строка.
+                        // Stage 3+ поднимет ReasonCode в DownloadEvent::Failed;
+                        // пока маппим свободный текст в Unknown и сохраняем его
+                        // в сообщении, чтобы причина не терялась.
+                        reason_to_persist = Some(FailureReason::with_message(
+                            ReasonCode::Unknown,
+                            error.clone(),
+                        ));
                     }
                     DownloadEvent::WorkerUpdate { .. } | DownloadEvent::Snapshot { .. } => {}
                 }
             }
         }
         let _ = shared.events_tx.send(ev);
-        if let Some(state) = state_to_persist
-            && let Err(e) = shared.queue.update_state(id, state).await
+        if let Some(status) = status_to_persist
+            && let Err(e) = shared
+                .queue
+                .update_status(id, status, reason_to_persist)
+                .await
         {
-            warn!(%id, %state, error = %e, "failed to persist state change");
+            warn!(%id, %status, error = %e, "failed to persist status change");
         }
     }
     let handle = {
@@ -604,12 +682,14 @@ async fn fan_in_events<PF, QS, F>(
 /// Попытаться поднять следующий движок после завершения предыдущего.
 /// Вынесено как свободная функция, чтобы не тянуть `DownloadManager` в
 /// сигнатуру fan-in task (он бы создал больше генериков).
-async fn advance_queue<PF, QS, F>(shared: Arc<Shared<PF, QS, F>>)
+async fn advance_queue<PF, QS, F, WR, AR>(shared: Arc<Shared<PF, QS, F, WR, AR>>)
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     let manager = DownloadManager { shared };
     manager.try_spawn_next().await;
@@ -681,7 +761,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let snap = mgr.snapshot();
             if let Some(d) = snap.iter().find(|d| d.id == id)
-                && d.state.is_terminal()
+                && d.status.is_terminal()
             {
                 return;
             }
@@ -696,10 +776,10 @@ mod tests {
         wait_for_terminal(&mgr, id).await;
         let snap = mgr.snapshot();
         let d = snap.iter().find(|d| d.id == id).unwrap();
-        assert_eq!(d.state, DownloadState::Done);
+        assert_eq!(d.status, FileStatus::Done);
         // queue тоже обновился.
         let persisted = queue.load_all().await.unwrap();
-        assert_eq!(persisted[0].state, DownloadState::Done);
+        assert_eq!(persisted[0].status, FileStatus::Done);
     }
 
     #[tokio::test]
@@ -751,9 +831,9 @@ mod tests {
         mgr.cancel(id).await.unwrap();
         let snap = mgr.snapshot();
         let d = snap.iter().find(|d| d.id == id).unwrap();
-        assert_eq!(d.state, DownloadState::Cancelled);
+        assert_eq!(d.status, FileStatus::Cancelled);
         let persisted = queue.load_all().await.unwrap();
-        assert_eq!(persisted[0].state, DownloadState::Cancelled);
+        assert_eq!(persisted[0].status, FileStatus::Cancelled);
     }
 
     #[tokio::test]
@@ -785,11 +865,11 @@ mod tests {
         let queue = Arc::new(MemoryTQueueStore::new());
         // Предзаполним очередь тремя состояниями.
         let mut qd = Download::new(DownloadId::new(), spec("https://t/q"));
-        qd.state = DownloadState::Queued;
+        qd.status = FileStatus::Pending;
         let mut rd = Download::new(DownloadId::new(), spec("https://t/r"));
-        rd.state = DownloadState::Running;
+        rd.status = FileStatus::Running;
         let mut pd = Download::new(DownloadId::new(), spec("https://t/p"));
-        pd.state = DownloadState::Paused;
+        pd.status = FileStatus::Paused;
         queue.insert(&qd).await.unwrap();
         queue.insert(&rd).await.unwrap();
         queue.insert(&pd).await.unwrap();
@@ -807,10 +887,10 @@ mod tests {
         // Running должен быть нормализован до Queued, записано в очередь.
         let persisted = queue.load_all().await.unwrap();
         let r_persisted = persisted.iter().find(|d| d.id == rd.id).unwrap();
-        assert_eq!(r_persisted.state, DownloadState::Queued);
+        assert_eq!(r_persisted.status, FileStatus::Pending);
         // Paused остался как есть.
         let p_persisted = persisted.iter().find(|d| d.id == pd.id).unwrap();
-        assert_eq!(p_persisted.state, DownloadState::Paused);
+        assert_eq!(p_persisted.status, FileStatus::Paused);
         // Движков запущено не больше max_concurrent = 1.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let active = {
@@ -862,14 +942,14 @@ mod tests {
             let d = snap.iter().find(|d| d.id == id).unwrap();
             assert!(
                 matches!(
-                    d.state,
-                    DownloadState::Paused
-                        | DownloadState::Done
-                        | DownloadState::Failed
-                        | DownloadState::Cancelled
+                    d.status,
+                    FileStatus::Paused
+                        | FileStatus::Done
+                        | FileStatus::Failed
+                        | FileStatus::Cancelled
                 ),
                 "download {id} in state {:?} after shutdown",
-                d.state
+                d.status
             );
         }
     }
@@ -902,7 +982,7 @@ mod tests {
             if mgr
                 .snapshot()
                 .iter()
-                .any(|d| d.id == id && d.state == DownloadState::Done)
+                .any(|d| d.id == id && d.status == FileStatus::Done)
             {
                 saw_completed = true;
                 break;

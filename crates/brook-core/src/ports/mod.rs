@@ -9,14 +9,19 @@
 //! Соседи по слою:
 //! - `piece_storage` — запись и индексирование кусков одной загрузки.
 //! - `queue_store` — персистентность глобальной очереди.
+//! - `worker_repo` — журнал воркеров одной engine-сессии.
+//! - `piece_attempt_repo` — журнал попыток скачивания piece'а.
 //! - `http` — осмотр URL и потоковое получение байт (в т.ч. Range).
 //!
 //! Всё, что здесь живёт, — это только `trait` и сопутствующие типы.
 //! Никаких `impl for ...` конкретных бэкендов в ядре нет и быть не должно.
 
 pub mod http;
+pub mod noop_repos;
+pub mod piece_attempt_repo;
 pub mod piece_storage;
 pub mod queue_store;
+pub mod worker_repo;
 
 pub use http::{
     ByteStream,
@@ -27,9 +32,21 @@ pub use http::{
     THttpInspect,
     TRangeFetch,
 };
+pub use noop_repos::{
+    NoopAttemptRepo,
+    NoopWorkerRepo,
+};
+pub use piece_attempt_repo::{
+    AttemptRecord,
+    TPieceAttemptRepo,
+};
 pub use piece_storage::{
     PreparedDownload,
     TPieceStorage,
     TPieceStorageFactory,
 };
 pub use queue_store::TQueueStore;
+pub use worker_repo::{
+    TWorkerRepo,
+    WorkerRecord,
+};

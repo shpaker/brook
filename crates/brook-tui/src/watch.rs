@@ -79,7 +79,7 @@ fn to_stream_event(kind: EventKind) -> Option<StreamEvent> {
     match kind {
         EventKind::Snapshot(ev) => ev.download.map(StreamEvent::Snapshot),
         EventKind::Progress(ev) => Some(StreamEvent::Progress(ev.id?, ev.progress?)),
-        EventKind::StateChanged(ev) => Some(StreamEvent::StateChanged(ev.id?, ev.state)),
+        EventKind::StatusChanged(ev) => Some(StreamEvent::StatusChanged(ev.id?, ev.status)),
         EventKind::WorkerUpdate(ev) => Some(StreamEvent::WorkerUpdate(
             ev.id?,
             ev.piece_index,

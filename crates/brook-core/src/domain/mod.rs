@@ -5,11 +5,13 @@
 //! проверить без tokio-рантайма, файлов и сокетов.
 //!
 //! Соседи по слою:
-//! - `id` — уникальный идентификатор загрузки (newtype над UUID).
+//! - `id` — уникальные идентификаторы (newtypes над UUID): `DownloadId`,
+//!   `WorkerId`, `AttemptId`.
 //! - `spec` — неизменяемое описание задачи (url, target_dir, workers).
-//! - `state` — конечный автомат состояний загрузки.
+//! - `status` — единый словарь статусов для файлов / воркеров / piece'ов /
+//!   attempt'ов.
 //! - `progress` — снэпшот прогресса (байты, скорость, ETA).
-//! - `download` — агрегат: spec + state + progress + метаданные.
+//! - `download` — агрегат: spec + status + progress + метаданные.
 //! - `event` — события, которые engine эмитит наружу.
 //! - `command` — команды, которые engine принимает снаружи.
 //!
@@ -22,17 +24,31 @@ pub mod download;
 pub mod event;
 pub mod id;
 pub mod progress;
+pub mod reason;
 pub mod spec;
-pub mod state;
+pub mod status;
 
 pub use command::DownloadCommand;
 pub use download::Download;
 pub use event::DownloadEvent;
-pub use id::DownloadId;
+pub use id::{
+    AttemptId,
+    DownloadId,
+    WorkerId,
+};
 pub use progress::Progress;
+pub use reason::{
+    FailureReason,
+    ReasonCode,
+};
 pub use spec::{
     DownloadSpec,
     OnFileExistsOverride,
     default_workers,
 };
-pub use state::DownloadState;
+pub use status::{
+    AttemptStatus,
+    FileStatus,
+    PieceStatus,
+    WorkerStatus,
+};

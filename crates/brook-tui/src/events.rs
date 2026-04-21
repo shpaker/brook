@@ -19,7 +19,7 @@ use crossterm::event::{
 pub enum StreamEvent {
     Snapshot(proto::Download),
     Progress(proto::DownloadId, proto::Progress),
-    StateChanged(proto::DownloadId, i32),
+    StatusChanged(proto::DownloadId, i32),
     WorkerUpdate(proto::DownloadId, u32, f32),
     Completed(proto::DownloadId),
     Failed(proto::DownloadId, String),

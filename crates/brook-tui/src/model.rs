@@ -34,7 +34,7 @@ pub struct DownloadRow {
     pub url: String,
     pub target_dir: String,
     pub filename: String,
-    pub state: proto::DownloadState,
+    pub status: proto::DownloadStatus,
     pub progress: proto::Progress,
     pub attempt: u32,
     pub max_attempts: u32,
@@ -56,8 +56,8 @@ impl DownloadRow {
             url: spec.url,
             target_dir: spec.target_dir,
             filename,
-            state: proto::DownloadState::try_from(d.state)
-                .unwrap_or(proto::DownloadState::Unspecified),
+            status: proto::DownloadStatus::try_from(d.status)
+                .unwrap_or(proto::DownloadStatus::Unspecified),
             progress: d.progress.unwrap_or_default(),
             attempt: d.attempt,
             max_attempts: 0, // brook-proto не передаёт max; подтянем при бэкенд-расширении
@@ -232,10 +232,10 @@ impl ViewModel {
                     row.progress = p;
                 }
             }
-            E::StateChanged(id, st) => {
+            E::StatusChanged(id, st) => {
                 if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.state = proto::DownloadState::try_from(st)
-                        .unwrap_or(proto::DownloadState::Unspecified);
+                    row.status = proto::DownloadStatus::try_from(st)
+                        .unwrap_or(proto::DownloadStatus::Unspecified);
                 }
             }
             E::WorkerUpdate(id, piece, frac) => {
@@ -255,13 +255,13 @@ impl ViewModel {
             }
             E::Completed(id) => {
                 if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.state = proto::DownloadState::Done;
+                    row.status = proto::DownloadStatus::Done;
                     row.workers.clear();
                 }
             }
             E::Failed(id, err) => {
                 if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.state = proto::DownloadState::Failed;
+                    row.status = proto::DownloadStatus::Failed;
                     row.error = Some(err);
                     row.workers.clear();
                 }
@@ -285,11 +285,11 @@ impl ViewModel {
         let mut ids: Vec<&DownloadRow> = self
             .downloads
             .values()
-            .filter(|r| r.state != proto::DownloadState::Cancelled)
+            .filter(|r| r.status != proto::DownloadStatus::Cancelled)
             .collect();
         ids.sort_by(|a, b| {
-            state_rank(a.state)
-                .cmp(&state_rank(b.state))
+            state_rank(a.status)
+                .cmp(&state_rank(b.status))
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         ids.into_iter().map(|r| r.id.clone()).collect()
@@ -339,7 +339,7 @@ impl ViewModel {
     pub fn find_by_url(&self, url: &str) -> Option<String> {
         self.downloads
             .values()
-            .find(|r| r.url == url && r.state != proto::DownloadState::Cancelled)
+            .find(|r| r.url == url && r.status != proto::DownloadStatus::Cancelled)
             .map(|r| r.id.clone())
     }
 
@@ -380,12 +380,12 @@ impl ViewModel {
 
 /// Порядок групп по §6.2: RUNNING → RETRYING → QUEUED → PAUSED → DONE → FAILED.
 /// CANCELLED отфильтрован выше и здесь не появляется.
-fn state_rank(s: proto::DownloadState) -> u8 {
-    use proto::DownloadState as S;
+fn state_rank(s: proto::DownloadStatus) -> u8 {
+    use proto::DownloadStatus as S;
     match s {
         S::Running => 0,
         S::Retrying => 1,
-        S::Queued => 2,
+        S::Pending => 2,
         S::Paused => 3,
         S::Done => 4,
         S::Failed => 5,

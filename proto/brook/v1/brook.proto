@@ -76,16 +76,16 @@ enum OnFileExistsOverride {
   ON_FILE_EXISTS_OVERRIDE_OVERWRITE = 2;
 }
 
-// Состояние загрузки.
-enum DownloadState {
-  DOWNLOAD_STATE_UNSPECIFIED = 0;
-  DOWNLOAD_STATE_QUEUED = 1;
-  DOWNLOAD_STATE_RUNNING = 2;
-  DOWNLOAD_STATE_PAUSED = 3;
-  DOWNLOAD_STATE_RETRYING = 4;
-  DOWNLOAD_STATE_DONE = 5;
-  DOWNLOAD_STATE_FAILED = 6;
-  DOWNLOAD_STATE_CANCELLED = 7;
+// Статус загрузки.
+enum DownloadStatus {
+  DOWNLOAD_STATUS_UNSPECIFIED = 0;
+  DOWNLOAD_STATUS_PENDING = 1;
+  DOWNLOAD_STATUS_RUNNING = 2;
+  DOWNLOAD_STATUS_PAUSED = 3;
+  DOWNLOAD_STATUS_RETRYING = 4;
+  DOWNLOAD_STATUS_DONE = 5;
+  DOWNLOAD_STATUS_FAILED = 6;
+  DOWNLOAD_STATUS_CANCELLED = 7;
 }
 
 // Текущий прогресс загрузки.
@@ -104,7 +104,7 @@ message Progress {
 message Download {
   DownloadId id = 1;
   DownloadSpec spec = 2;
-  DownloadState state = 3;
+  DownloadStatus status = 3;
   Progress progress = 4;
   // Номер текущей попытки (с 1).
   uint32 attempt = 5;
@@ -120,10 +120,10 @@ message ProgressEvent {
   Progress progress = 2;
 }
 
-// Смена состояния.
-message StateChangedEvent {
+// Смена статуса.
+message StatusChangedEvent {
   DownloadId id = 1;
-  DownloadState state = 2;
+  DownloadStatus status = 2;
 }
 
 // Обновление отдельного куска — для чанкового прогрессбара.
@@ -154,7 +154,7 @@ message SnapshotEvent {
 message Event {
   oneof kind {
     ProgressEvent progress = 1;
-    StateChangedEvent state_changed = 2;
+    StatusChangedEvent status_changed = 2;
     WorkerUpdateEvent worker_update = 3;
     CompletedEvent completed = 4;
     FailedEvent failed = 5;

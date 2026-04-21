@@ -4,7 +4,7 @@
 //! под заданные размеры; `draw_*` функции печатают конкретные модалки
 //! поверх уже нарисованного UI (Clear + Block + Paragraph).
 
-use brook_proto::brook::v1::DownloadState;
+use brook_proto::brook::v1::DownloadStatus;
 use ratatui::Frame;
 use ratatui::layout::{
     Alignment,
@@ -158,7 +158,7 @@ fn draw_duplicate(
     let existing_label = vm
         .downloads
         .get(existing_id)
-        .map(|r| format!("{} ({:?})", r.display_name(), r.state))
+        .map(|r| format!("{} ({:?})", r.display_name(), r.status))
         .unwrap_or_else(|| "(unknown)".into());
 
     let lines = vec![
@@ -331,15 +331,15 @@ fn draw_help(f: &mut Frame, scroll: u16, no_color: bool) {
 }
 
 // Чтобы Mode::Duplicate можно было рендерить без лишнего заимствования.
-pub fn _state_name(s: DownloadState) -> &'static str {
+pub fn _state_name(s: DownloadStatus) -> &'static str {
     match s {
-        DownloadState::Running => "RUNNING",
-        DownloadState::Paused => "PAUSED",
-        DownloadState::Retrying => "RETRYING",
-        DownloadState::Queued => "QUEUED",
-        DownloadState::Done => "DONE",
-        DownloadState::Failed => "FAILED",
-        DownloadState::Cancelled => "CANCELLED",
-        DownloadState::Unspecified => "—",
+        DownloadStatus::Running => "RUNNING",
+        DownloadStatus::Paused => "PAUSED",
+        DownloadStatus::Retrying => "RETRYING",
+        DownloadStatus::Pending => "QUEUED",
+        DownloadStatus::Done => "DONE",
+        DownloadStatus::Failed => "FAILED",
+        DownloadStatus::Cancelled => "CANCELLED",
+        DownloadStatus::Unspecified => "—",
     }
 }

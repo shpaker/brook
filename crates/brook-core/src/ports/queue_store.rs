@@ -1,6 +1,6 @@
 //! Абстракция над глобальной очередью загрузок.
 //!
-//! Конкретная реализация (1.8) будет в SQLite `brook.db` в CWD демона.
+//! Конкретная реализация живёт в SQLite `brook.db` в CWD демона.
 //! `TQueueStore` выдаёт доменные методы — вызывающий не видит `Connection`,
 //! SQL или схему таблицы. Это соблюдает правило CLAUDE.md:
 //! «SQL и `rusqlite::Connection` никогда не должны утекать за пределы
@@ -14,7 +14,8 @@ use std::future::Future;
 use crate::domain::{
     Download,
     DownloadId,
-    DownloadState,
+    FailureReason,
+    FileStatus,
 };
 use crate::error::Result;
 
@@ -25,15 +26,20 @@ pub trait TQueueStore: Send + Sync {
     /// Вставить новую запись. Ошибка, если `id` уже существует.
     fn insert(&self, download: &Download) -> impl Future<Output = Result<()>> + Send;
 
-    /// Обновить состояние существующей загрузки. Ошибка, если записи нет.
+    /// Обновить статус существующей загрузки. Ошибка, если записи нет.
     ///
-    /// Зачем отдельный метод, а не «upsert всей `Download`»: типичный
-    /// путь — это частый переход состояний + редкое обновление остальных
-    /// полей. Узкая сигнатура читается и работает дешевле.
-    fn update_state(
+    /// `reason` обязателен при переходе в [`FileStatus::Failed`]
+    /// (инвариант схемы). Для остальных переходов опционален: например,
+    /// `Cancelled` + [`ReasonCode::CancelledByUser`] полезно писать в
+    /// историю, а для обычных `Running`/`Paused`/`Done` reason, как
+    /// правило, `None`.
+    ///
+    /// [`ReasonCode::CancelledByUser`]: crate::domain::ReasonCode::CancelledByUser
+    fn update_status(
         &self,
         id: DownloadId,
-        state: DownloadState,
+        status: FileStatus,
+        reason: Option<FailureReason>,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Удалить запись. Ошибка, если записи нет.

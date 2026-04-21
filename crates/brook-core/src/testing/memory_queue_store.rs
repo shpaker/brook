@@ -13,7 +13,8 @@ use std::time::SystemTime;
 use crate::domain::{
     Download,
     DownloadId,
-    DownloadState,
+    FailureReason,
+    FileStatus,
 };
 use crate::error::{
     Error,
@@ -63,11 +64,22 @@ impl TQueueStore for MemoryTQueueStore {
         Ok(())
     }
 
-    async fn update_state(&self, id: DownloadId, state: DownloadState) -> Result<()> {
+    async fn update_status(
+        &self,
+        id: DownloadId,
+        status: FileStatus,
+        reason: Option<FailureReason>,
+    ) -> Result<()> {
         let mut inner = self.inner.lock().expect("mutex poisoned");
         let entry = inner.get_mut(&id).ok_or(Error::NotFound)?;
-        entry.state = state;
+        entry.status = status;
         entry.updated_at = SystemTime::now();
+        // Для удобства юнит-тестов: если reason пришёл, отражаем
+        // его в `Download.error` (эта колонка и так пишется
+        // боевым SqliteQueueRepository при переходе в Failed).
+        if let Some(r) = reason {
+            entry.error = Some(r.to_string());
+        }
         Ok(())
     }
 
@@ -103,17 +115,17 @@ mod tests {
         let loaded_ids: Vec<_> = loaded.iter().map(|d| d.id).collect();
         assert!(loaded_ids.contains(&a.id) && loaded_ids.contains(&b.id));
 
-        // update_state меняет state и updated_at.
+        // update_status меняет state и updated_at.
         let before = loaded.iter().find(|d| d.id == a.id).unwrap().updated_at;
         // SystemTime::now() на macOS имеет разрешение не хуже микросекунды,
         // спать не нужно — разные вызовы now() гарантированно различаются.
         store
-            .update_state(a.id, DownloadState::Running)
+            .update_status(a.id, FileStatus::Running, None)
             .await
             .unwrap();
         let after_list = store.load_all().await.unwrap();
         let after_a = after_list.iter().find(|d| d.id == a.id).unwrap();
-        assert_eq!(after_a.state, DownloadState::Running);
+        assert_eq!(after_a.status, FileStatus::Running);
         assert!(after_a.updated_at >= before);
 
         // remove — запись пропадает.
@@ -136,7 +148,7 @@ mod tests {
         let store = MemoryTQueueStore::new();
         let missing = DownloadId::new();
         assert!(matches!(
-            store.update_state(missing, DownloadState::Paused).await,
+            store.update_status(missing, FileStatus::Paused, None).await,
             Err(Error::NotFound)
         ));
     }
