@@ -303,33 +303,33 @@ Bulk-операции:
 - [x] Hint-bar: `a add · p pause · r resume · c cancel · o open · Tab details · ? help · q`
 
 ### 6.5 Навигация и выделение
-- [ ] `↑↓` / `jk` — курсор по элементам
-- [ ] `gG` — в начало / конец
-- [ ] `Space` — toggle выделения строки под курсором (anchor = текущая)
-- [ ] `Shift+↑↓` / `Shift+JK` — расширение диапазона от `anchor`
-- [ ] Курсор автоматически прилипает к существующему элементу при исчезновении выбранной строки (Remove / Cancel)
+- [x] `↑↓` / `jk` — курсор по элементам
+- [x] `gG` — в начало / конец
+- [x] `Space` — toggle выделения строки под курсором (anchor = текущая)
+- [x] `Shift+↑↓` / `Shift+JK` — расширение диапазона от `anchor`
+- [x] Курсор автоматически прилипает к существующему элементу при исчезновении выбранной строки (Remove / Cancel) — `clamp_cursor` после каждого stream-события
 
 ### 6.6 Команды и модалки
-- [ ] Общая инфраструктура модалки: центрированный `Clear` + `Block` поверх UI, `Esc` закрывает, мышь игнорируется, paste через `Event::Paste`
-- [ ] `a` — Add-модалка: поля `url` (префилл из clipboard, если `http(s)://`) и `folder` (префилл из `GetSettings.default_dir`); `Tab` — переключение, `Enter` — submit, `Esc` — cancel
-- [ ] Клиентская проверка URL-дубля по `ViewModel` → модалка «duplicate url» (`open existing` / `add anyway` / `Esc`)
-- [ ] Серверная ошибка `FileExists` на `Add` → модалка «file exists» (`rename` / `overwrite` / `Esc`), повторный `Add` с `on_file_exists_override`
-- [ ] `p` / `r` — pause / resume выделенных (или под курсором); шлём bulk через `N × Pause` unary
-- [ ] `c` — модалка подтверждения; `y` / `n` или кнопки; при multi-select — сводное сообщение
-- [ ] `o` — `open` на macOS: если DONE — `open <path>`, иначе `open <target_dir>`
-- [ ] Серверные ошибки команд → toast внизу над hint-bar на 3 секунды
+- [x] Общая инфраструктура модалки: центрированный `Clear` + `Block` поверх UI, `Esc` закрывает, мышь игнорируется, paste через `Event::Paste`
+- [x] `a` — Add-модалка: поля `url` (префилл из clipboard через `arboard`, если `http(s)://`) и `folder` (префилл из `GetSettings.default_dir`); `Tab` — переключение, `Enter` — submit, `Esc` — cancel
+- [x] Клиентская проверка URL-дубля по `ViewModel` → модалка «duplicate url» (`open existing` / `add anyway` / `Esc`)
+- [x] Серверная ошибка `FileExists` на `Add` → модалка «file exists» (`rename` / `overwrite` / `Esc`), повторный `Add` с `on_file_exists_override`
+- [x] `p` / `r` — pause / resume выделенных (или под курсором); шлём bulk через `N × Pause` unary
+- [x] `c` — модалка подтверждения; `y` / `n` или кнопки; при multi-select — сводное сообщение
+- [x] `o` — `open` на macOS: если DONE — `open <path>`, иначе `open <target_dir>`
+- [x] Серверные ошибки команд → toast внизу над hint-bar на 3 секунды
 
 ### 6.7 Help overlay
-- [ ] `?` открывает полноэкранный overlay с группами `navigation` / `actions` / `view` / `misc`
-- [ ] Закрывается **любой клавишей** без выполнения команды
-- [ ] При высоте терминала < 25 — overlay скроллируется `↑↓`, закрытие только `Esc`/`q`/`?`
+- [x] `?` открывает полноэкранный overlay с группами `navigation` / `actions` / `view` / `misc`
+- [x] Закрывается **любой клавишей** без выполнения команды
+- [x] При высоте терминала < 25 — overlay скроллируется `↑↓`, закрытие только `Esc`/`q`/`?`
 
 ### 6.8 Полировка
-- [ ] `NO_COLOR` — отключает все цвета, рендер полагается на символы
-- [ ] Форматирование байт: humansize (`1.5 MB`, `532 KB`, `15 B`); скорость — `1.2 MB/s`
-- [ ] Форматирование ETA: `2h 15m`, `15m 30s`, `45s`, `<1s`
-- [ ] Обрезка длинных имён файлов с `…` справа
-- [ ] Обработка SIGINT/SIGTERM клиента: чисто выйти из alternate screen, не убить терминал
+- [x] `NO_COLOR` — отключает все цвета, рендер полагается на символы
+- [x] Форматирование байт: humansize (`1.5 MB`, `532 KB`, `15 B`); скорость — `1.2 MB/s`
+- [x] Форматирование ETA: `2h 15m`, `15m 30s`, `45s`, `<1s`
+- [x] Обрезка длинных имён файлов с `…` справа
+- [x] Обработка SIGINT/SIGTERM клиента: чисто выйти из alternate screen, не убить терминал (Ctrl+C через raw mode → KeyEvent, SIGTERM через `tokio::signal`; RAII-guard в [main.rs](../crates/brook-tui/src/main.rs) снимает alternate screen)
 
 ## 7. Наблюдаемость
 - [ ] `tracing-subscriber` с JSON-форматтером во всех крейтах

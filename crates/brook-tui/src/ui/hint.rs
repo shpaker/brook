@@ -23,16 +23,23 @@ const HINTS: &[(&str, &str)] = &[
     ("q", "quit"),
 ];
 
-pub fn draw(f: &mut Frame, area: Rect) {
+pub fn draw(f: &mut Frame, area: Rect, no_color: bool) {
+    let sep_style = if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let key_style = if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
     let mut spans = Vec::with_capacity(HINTS.len() * 3);
     for (i, (key, label)) in HINTS.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" · ", sep_style));
         }
-        spans.push(Span::styled(
-            (*key).to_string(),
-            Style::default().fg(Color::Cyan),
-        ));
+        spans.push(Span::styled((*key).to_string(), key_style));
         spans.push(Span::raw(format!(" {label}")));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

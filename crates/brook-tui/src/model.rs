@@ -4,11 +4,19 @@
 //! публичные — ViewModel живёт целиком внутри крейта, инкапсуляция тут
 //! только раздувала бы код.
 
-use std::collections::HashMap;
-use std::time::Instant;
+use std::collections::{
+    HashMap,
+    HashSet,
+};
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use brook_proto::brook::v1 as proto;
 use indexmap::IndexMap;
+
+use crate::events::AddForm;
 
 /// Снимок одного воркера для прогрессбара. Храним последний известный
 /// `fraction` по piece_index — §6.3 рисует по одному сегменту на
@@ -86,26 +94,120 @@ pub struct Toast {
     pub expires_at: Instant,
 }
 
+/// Что сейчас перехватывает ввод поверх списка. `Normal` = ничего.
+/// Остальные варианты — открытая модалка / overlay; клавиатура роутится
+/// в обработчик модалки, команды списка не срабатывают.
+#[derive(Debug, Clone)]
+pub enum Mode {
+    Normal,
+    Add(AddModal),
+    Duplicate {
+        form: AddForm,
+        existing_id: String,
+    },
+    FileExists {
+        form: AddForm,
+    },
+    ConfirmCancel {
+        ids: Vec<String>,
+    },
+    Help {
+        scroll: u16,
+    },
+    /// На выходе из TUI: гасить `brookd`, которого мы же подняли, или
+    /// оставить крутиться в фоне.
+    QuitConfirm,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddModal {
+    pub url: String,
+    pub folder: String,
+    pub field: AddField,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddField {
+    Url,
+    Folder,
+}
+
+impl AddModal {
+    pub fn new(url: String, folder: String) -> Self {
+        Self {
+            url,
+            folder,
+            field: AddField::Url,
+            error: None,
+        }
+    }
+
+    pub fn toggle_field(&mut self) {
+        self.field = match self.field {
+            AddField::Url => AddField::Folder,
+            AddField::Folder => AddField::Url,
+        };
+    }
+
+    pub fn insert_str(&mut self, s: &str) {
+        match self.field {
+            AddField::Url => self.url.push_str(s),
+            AddField::Folder => self.folder.push_str(s),
+        }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        match self.field {
+            AddField::Url => self.url.push(c),
+            AddField::Folder => self.folder.push(c),
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        match self.field {
+            AddField::Url => {
+                self.url.pop();
+            }
+            AddField::Folder => {
+                self.folder.pop();
+            }
+        }
+    }
+}
+
 pub struct ViewModel {
     pub downloads: IndexMap<String, DownloadRow>,
     pub cursor: usize,
+    /// Якорь для Shift-расширения диапазона.
+    pub anchor: Option<usize>,
+    /// Id выделенных строк (stable при переупорядочивании списка).
+    pub selected: HashSet<String>,
     pub detail_visible: bool,
     pub connection: ConnectionState,
     pub toast: Option<Toast>,
     pub port: u16,
     pub settings: proto::GetSettingsResponse,
+    pub mode: Mode,
+    /// Поднимали ли мы `brookd` в этом процессе. Если да — при выходе
+    /// спрашиваем, гасить ли его.
+    pub spawned_daemon: bool,
 }
 
 impl ViewModel {
-    pub fn new(port: u16, settings: proto::GetSettingsResponse) -> Self {
+    pub fn new(port: u16, settings: proto::GetSettingsResponse, spawned_daemon: bool) -> Self {
         Self {
             downloads: IndexMap::new(),
             cursor: 0,
+            anchor: None,
+            selected: HashSet::new(),
             detail_visible: true,
             connection: ConnectionState::Reconnecting { attempt: 1 },
             toast: None,
             port,
             settings,
+            mode: Mode::Normal,
+            spawned_daemon,
         }
     }
 
@@ -166,6 +268,8 @@ impl ViewModel {
     pub fn reset(&mut self) {
         self.downloads.clear();
         self.cursor = 0;
+        self.anchor = None;
+        self.selected.clear();
     }
 
     /// Идентификаторы в отображаемом порядке с учётом сортировки и
@@ -187,12 +291,88 @@ impl ViewModel {
         ids.into_iter().map(|r| r.id.clone()).collect()
     }
 
-    #[allow(dead_code)] // §6.5 вызовет явно при Remove/Cancel
     pub fn clamp_cursor(&mut self, visible_len: usize) {
         if visible_len == 0 {
             self.cursor = 0;
         } else if self.cursor >= visible_len {
             self.cursor = visible_len - 1;
+        }
+    }
+
+    /// Список id, на которые действуют bulk-команды (`p`/`r`/`c`): если
+    /// есть выделенные — они, иначе одна строка под курсором.
+    pub fn action_targets(&self) -> Vec<String> {
+        let visible = self.visible_ids();
+        if !self.selected.is_empty() {
+            return visible
+                .into_iter()
+                .filter(|id| self.selected.contains(id))
+                .collect();
+        }
+        let idx = self.cursor.min(visible.len().saturating_sub(1));
+        visible.get(idx).cloned().into_iter().collect()
+    }
+
+    /// `open`-таргет: если DONE → полный путь к файлу; иначе — target_dir.
+    pub fn open_target(&self) -> Option<String> {
+        let visible = self.visible_ids();
+        let idx = self.cursor.min(visible.len().saturating_sub(1));
+        let id = visible.get(idx)?;
+        let row = self.downloads.get(id)?;
+        if row.state == proto::DownloadState::Done && !row.filename.is_empty() {
+            let mut p = std::path::PathBuf::from(&row.target_dir);
+            p.push(&row.filename);
+            Some(p.display().to_string())
+        } else {
+            Some(row.target_dir.clone())
+        }
+    }
+
+    pub fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some(Toast {
+            message: msg.into(),
+            expires_at: Instant::now() + Duration::from_secs(3),
+        });
+    }
+
+    pub fn find_by_url(&self, url: &str) -> Option<String> {
+        self.downloads
+            .values()
+            .find(|r| r.url == url && r.state != proto::DownloadState::Cancelled)
+            .map(|r| r.id.clone())
+    }
+
+    /// Расширяет выделение от `anchor` до `cursor`. Если якоря нет —
+    /// ставит якорь в текущую позицию и помечает её.
+    pub fn extend_selection(&mut self, visible_len: usize) {
+        if visible_len == 0 {
+            return;
+        }
+        let visible = self.visible_ids();
+        let cur = self.cursor.min(visible_len - 1);
+        let anchor = *self.anchor.get_or_insert(cur);
+        let (lo, hi) = if anchor <= cur {
+            (anchor, cur)
+        } else {
+            (cur, anchor)
+        };
+        self.selected.clear();
+        for id in visible.iter().take(hi + 1).skip(lo) {
+            self.selected.insert(id.clone());
+        }
+    }
+
+    /// Toggle выделения текущей строки, фиксирует anchor на ней.
+    pub fn toggle_select_here(&mut self) {
+        let visible = self.visible_ids();
+        if visible.is_empty() {
+            return;
+        }
+        let idx = self.cursor.min(visible.len() - 1);
+        self.anchor = Some(idx);
+        let id = &visible[idx];
+        if !self.selected.remove(id) {
+            self.selected.insert(id.clone());
         }
     }
 }

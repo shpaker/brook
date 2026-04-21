@@ -29,6 +29,12 @@ service BrookService {
 
   // Настройки демона — дефолты и политики — для префилла модалок клиента.
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+
+  // Попросить демона корректно завершиться. Сервер отдаёт `StatusResponse`
+  // сразу (до реального exit'а) и инициирует graceful-shutdown tonic'а
+  // с последующим драйном менеджера. Клиент (TUI) использует это, чтобы
+  // остановить демон, который сам же и запустил, при выходе из UI.
+  rpc Shutdown(ShutdownRequest) returns (StatusResponse);
 }
 
 // Уникальный идентификатор загрузки (UUID в виде строки).
@@ -204,6 +210,9 @@ message ResumeAllRequest {
 }
 
 message GetSettingsRequest {
+}
+
+message ShutdownRequest {
 }
 
 // Политики конфликтов, живущие в `brook.yaml`. Клиент может использовать

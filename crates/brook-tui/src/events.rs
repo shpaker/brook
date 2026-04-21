@@ -26,7 +26,7 @@ pub enum StreamEvent {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Resize/Paste/Mouse полезны только с §6.5-6.6
+#[allow(dead_code)] // Resize/Mouse полезны для диагностики, мутации нет
 pub enum UiEvent {
     Key(KeyEvent),
     Resize(u16, u16),
@@ -39,4 +39,35 @@ pub enum UiEvent {
     StreamDisconnected(String),
     /// 250 ms-тик: протухание toast'ов, пересчёт ETA.
     Tick,
+    /// Результат команды, запущенной с UI. Передаёт ok/err-контекст,
+    /// и для `Add` — `FileExists`-хук, чтобы UI мог показать модалку
+    /// выбора rename/overwrite без лишнего кода.
+    CmdResult(CmdOutcome),
+    /// Внешний сигнал (SIGTERM/SIGINT из `tokio::signal`): чисто
+    /// завершаем цикл.
+    Quit,
+}
+
+/// Итог команды для UI-task'а.
+#[derive(Debug)]
+pub enum CmdOutcome {
+    /// Успех без побочных UI-эффектов.
+    Ok,
+    /// Ошибка — показываем toast'ом.
+    Error(String),
+    /// Сервер отказал в `Add` из-за существующего файла. UI должен
+    /// открыть модалку выбора rename/overwrite и повторить `Add` с
+    /// нужным override. Чтобы не терять введённое, возвращаем исходный
+    /// `AddForm`.
+    AddFileExists { form: AddForm },
+    /// Сервер успешно принял `Add` — вернул новый `DownloadId`.
+    AddAccepted,
+}
+
+/// Форма Add-модалки. Используется и при первом `Add`, и при повторе
+/// после `FileExists`.
+#[derive(Debug, Clone)]
+pub struct AddForm {
+    pub url: String,
+    pub folder: String,
 }

@@ -18,3 +18,4 @@ anyhow       = { workspace = true }
 clap         = { workspace = true }
 indexmap     = { workspace = true }
 futures-util = { workspace = true }
+arboard      = { workspace = true }

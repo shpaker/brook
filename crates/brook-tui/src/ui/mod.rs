@@ -21,6 +21,7 @@ use crate::model::ViewModel;
 mod detail;
 mod hint;
 mod list;
+pub mod modal;
 mod progress;
 mod status;
 
@@ -36,6 +37,7 @@ pub fn draw(f: &mut Frame, vm: &ViewModel) {
         draw_too_small(f, area);
         return;
     }
+    let no_color = std::env::var_os("NO_COLOR").is_some();
 
     // Detail скрывается автоматически при height < 20, но toggle
     // (`Tab`) работает поверх — пользователь может и раскрыть, и закрыть.
@@ -61,14 +63,16 @@ pub fn draw(f: &mut Frame, vm: &ViewModel) {
         .constraints(constraints)
         .split(area);
 
-    status::draw(f, chunks[0], vm);
-    list::draw(f, chunks[1], vm);
+    status::draw(f, chunks[0], vm, no_color);
+    list::draw(f, chunks[1], vm, no_color);
     if show_detail {
-        detail::draw(f, chunks[2], vm);
-        hint::draw(f, chunks[3]);
+        detail::draw(f, chunks[2], vm, no_color);
+        hint::draw(f, chunks[3], no_color);
     } else {
-        hint::draw(f, chunks[2]);
+        hint::draw(f, chunks[2], no_color);
     }
+
+    modal::draw_overlay(f, vm, no_color);
 
     // Toast рендерится поверх последней строки списка — простая
     // однострочная плашка.
