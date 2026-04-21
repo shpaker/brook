@@ -1,0 +1,67 @@
+// brook.db — единая БД демона.
+// Формат — dbdiagram.io (https://dbdiagram.io).
+
+Table states {
+  id   text [pk, note: 'StateId (UUID)']
+  name text [unique, not null, note: 'queued|running|paused|retrying|done|failed|cancelled']
+}
+
+Table reason_codes {
+  id   text [pk, note: 'ReasonCodeId (UUID)']
+  code text [unique, not null, note: 'network|timeout|http_4xx|http_5xx|source_mutated|disk_full|invalid_response|cancelled_by_user|unknown']
+}
+
+Table files {
+  id         text [pk, note: 'FileId (UUID)']
+  url        text [not null]
+  target_dir text [not null]
+  filename   text
+  state_id   text [not null, note: 'текущее состояние; история — в state_changes']
+  created_at integer [not null, note: 'unix seconds']
+}
+
+Table file_settings {
+  file_id            text [pk, note: 'FK → files.id; 1:1']
+  workers            integer [not null]
+  piece_target_count integer
+  piece_size_min     integer
+  piece_size_max     integer
+  // inspect-derived (NULL до prepare)
+  total_size    integer
+  piece_size    integer
+  etag          text
+  last_modified text
+}
+
+Table state_changes {
+  id             text    [pk, note: 'HistoryId (UUID)']
+  file_id        text    [not null]
+  state_id       text    [not null]
+  reason_code_id text    [note: 'NULL для успешных переходов; обязательно при переходе в failed']
+  reason_message text    [note: 'свободный текст с деталями, опционально']
+  created_at     integer [not null, note: 'unix seconds']
+
+  indexes {
+    (file_id, created_at) [name: 'idx_state_changes_file_time']
+  }
+}
+
+Table pieces {
+  id          text    [pk, note: 'PieceId (UUID)']
+  file_id     text    [not null]
+  number      integer [not null, note: 'offset = number * file_settings.piece_size; size = min(piece_size, total_size - offset)']
+  status      text    [not null, note: 'pending|in_progress|done']
+  created_at  integer [not null, note: 'unix seconds']
+  finished_at integer [note: 'unix seconds; NULL пока не done']
+
+  indexes {
+    (file_id, number) [unique, name: 'uniq_pieces_file_number']
+  }
+}
+
+Ref: files.state_id                > states.id
+Ref: file_settings.file_id         > files.id         [delete: cascade]
+Ref: state_changes.file_id         > files.id         [delete: cascade]
+Ref: state_changes.state_id        > states.id
+Ref: state_changes.reason_code_id  > reason_codes.id
+Ref: pieces.file_id                > files.id         [delete: cascade]

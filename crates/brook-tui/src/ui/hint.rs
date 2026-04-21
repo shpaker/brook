@@ -14,11 +14,8 @@ use ratatui::widgets::Paragraph;
 
 const HINTS: &[(&str, &str)] = &[
     ("a", "add"),
-    ("p", "pause"),
-    ("r", "resume"),
-    ("c", "cancel"),
-    ("o", "open"),
-    ("Tab", "details"),
+    ("p", "pause/resume"),
+    ("d", "delete"),
     ("?", "help"),
     ("q", "quit"),
 ];

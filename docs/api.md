@@ -80,5 +80,3 @@
 
 ## Открытое
 - **Версионирование** — `brook.v1`. Breaking changes только в `brook.v2`.
-
-Auth, TLS и Settings-методы — см. [post-mvp.md](post-mvp.md).

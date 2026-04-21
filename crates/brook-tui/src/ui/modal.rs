@@ -42,13 +42,10 @@ const HELP_LINES: &[&str] = &[
     "",
     "actions",
     "  a               — add download",
-    "  p               — pause selected (or under cursor)",
-    "  r               — resume selected",
-    "  c               — cancel (with confirm)",
-    "  o               — open file or folder",
+    "  p               — pause/resume selected (or under cursor)",
+    "  d               — delete (with confirm)",
     "",
     "view",
-    "  Tab             — toggle detail panel",
     "  ?               — this help",
     "",
     "misc",
@@ -62,9 +59,10 @@ pub fn draw_overlay(f: &mut Frame, vm: &ViewModel, no_color: bool) {
         Mode::Add(m) => draw_add(f, m, no_color),
         Mode::Duplicate { form, existing_id } => draw_duplicate(f, vm, form, existing_id, no_color),
         Mode::FileExists { form } => draw_file_exists(f, form, no_color),
-        Mode::ConfirmCancel { ids } => draw_confirm_cancel(f, vm, ids, no_color),
+        Mode::ConfirmDelete { ids } => draw_confirm_delete(f, vm, ids, no_color),
+        Mode::Ghost { ids } => draw_ghost(f, vm, ids, no_color),
         Mode::Help { scroll } => draw_help(f, *scroll, no_color),
-        Mode::QuitConfirm => draw_quit_confirm(f, no_color),
+        Mode::QuitConfirm => draw_quit_confirm(f, vm.spawned_daemon, no_color),
     }
 }
 
@@ -196,10 +194,10 @@ fn draw_file_exists(f: &mut Frame, form: &crate::events::AddForm, no_color: bool
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_confirm_cancel(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
+fn draw_confirm_delete(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
     let area = centered(f.area(), 60, 7);
     f.render_widget(Clear, area);
-    let block = block("cancel download?", no_color);
+    let block = block("delete download?", no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -209,7 +207,7 @@ fn draw_confirm_cancel(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: 
             .map(|r| r.display_name().to_string())
             .unwrap_or_else(|| ids[0].clone())
     } else {
-        format!("{} downloads will be cancelled.", ids.len())
+        format!("{} downloads will be deleted.", ids.len())
     };
 
     let lines = vec![
@@ -226,23 +224,65 @@ fn draw_confirm_cancel(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: 
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_quit_confirm(f: &mut Frame, no_color: bool) {
+fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
+    let area = centered(f.area(), 60, 8);
+    f.render_widget(Clear, area);
+    let block = block("download not found", no_color);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let summary = if ids.len() == 1 {
+        vm.downloads
+            .get(&ids[0])
+            .map(|r| r.display_name().to_string())
+            .unwrap_or_else(|| ids[0].clone())
+    } else {
+        format!("{} downloads are not known to brookd.", ids.len())
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(format!(" {summary}")),
+        Line::from(" brookd has no record of it anymore."),
+        Line::from(""),
+        Line::from(Span::styled(
+            " r · redownload    d · delete    Esc · cancel ",
+            hint_style(no_color),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_quit_confirm(f: &mut Frame, spawned_daemon: bool, no_color: bool) {
     let area = centered(f.area(), 60, 7);
     f.render_widget(Clear, area);
     let block = block("quit brook", no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let lines = vec![
-        Line::from(""),
-        Line::from(" brookd was started by this TUI."),
-        Line::from(" shut it down on exit, or leave it running?"),
-        Line::from(""),
-        Line::from(Span::styled(
-            " y · shutdown    n · leave running    Esc · cancel ",
-            hint_style(no_color),
-        )),
-    ];
+    let lines = if spawned_daemon {
+        vec![
+            Line::from(""),
+            Line::from(" brookd was started by this TUI."),
+            Line::from(" shut it down on exit, or leave it running?"),
+            Line::from(""),
+            Line::from(Span::styled(
+                " y · shutdown    n · leave running    Esc · cancel ",
+                hint_style(no_color),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(" quit brook TUI?"),
+            Line::from(" brookd keeps running in the background."),
+            Line::from(""),
+            Line::from(Span::styled(
+                " y · quit    n/Esc · cancel ",
+                hint_style(no_color),
+            )),
+        ]
+    };
     f.render_widget(Paragraph::new(lines), inner);
 }
 

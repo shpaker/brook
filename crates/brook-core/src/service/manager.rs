@@ -228,27 +228,43 @@ where
         self.shared.queue.insert(&download).await?;
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-            inner.records.insert(id, download);
+            inner.records.insert(id, download.clone());
             inner.waiting.push_back(id);
         }
+        // Уведомляем подписчиков Watch о новой записи до того, как движок
+        // начнёт слать `StateChanged`/`Progress`: у клиента этого id ещё
+        // нет, и событие без предшествующего `Snapshot` было бы выброшено.
+        let _ = self.shared.events_tx.send(DownloadEvent::Snapshot {
+            download: Box::new(download),
+        });
         self.try_spawn_next().await;
         Ok(id)
     }
 
     /// Удалить загрузку. Разрешено только для терминальных/не-активных.
     /// Для активных (running engine) — `Err`: сначала `cancel`.
+    ///
+    /// Идемпотентно: если id ни в records, ни в queue — тоже Ok. Это важно
+    /// для клиента, у которого в ViewModel может остаться «призрак»
+    /// (например, при рассинхроне после рестарта демона): повторный
+    /// `Remove` должен починить состояние, а не ругаться NotFound'ом.
     pub async fn remove(&self, id: DownloadId) -> Result<()> {
-        {
+        let was_known = {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
             if inner.engines.contains_key(&id) {
                 return Err(Error::Other(
                     "download is active, cancel before remove".into(),
                 ));
             }
-            inner.records.remove(&id).ok_or(Error::NotFound)?;
+            let had_record = inner.records.remove(&id).is_some();
             inner.waiting.retain(|x| *x != id);
+            had_record
+        };
+        match self.shared.queue.remove(id).await {
+            Ok(()) => Ok(()),
+            Err(Error::NotFound) if !was_known => Ok(()),
+            Err(e) => Err(e),
         }
-        self.shared.queue.remove(id).await
     }
 
     /// Поставить загрузку на паузу.

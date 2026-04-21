@@ -3,15 +3,14 @@
 Проект — **brook**.
 
 - [vision.md](vision.md) — что за продукт и для кого
-- [roadmap.md](roadmap.md) — порядок реализации MVP
-- [todo.md](todo.md) — чеклист задач MVP
+- [todo.md](todo.md) — текущий план работ
 - [stack.md](stack.md) — технологический стек и обоснование
-- [features.md](features.md) — функции MVP
-- [post-mvp.md](post-mvp.md) — всё, что идёт после MVP
+- [features.md](features.md) — функции продукта
 - [architecture.md](architecture.md) — процессы, крейты, модель акторов
 - [api.md](api.md) — контракт gRPC API (Transmission-like, proto)
 - [ux.md](ux.md) — клавиатура и навигация в `brook` (ratatui)
-- [open-questions.md](open-questions.md) — что нужно решить до старта реализации
+- [schema.dbml](schema.dbml) — схема `brook.db` (dbdiagram.io)
+- [open-questions.md](open-questions.md) — открытые вопросы
 
 ## Статус
 
