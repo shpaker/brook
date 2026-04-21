@@ -30,6 +30,7 @@ pub use domain::{
     DownloadId,
     DownloadSpec,
     DownloadState,
+    OnFileExistsOverride,
     Progress,
     default_workers,
 };

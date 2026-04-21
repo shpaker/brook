@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brook_api::{
+    ApiSettings,
     BrookService,
     BrookServiceServer,
 };
@@ -113,7 +114,7 @@ impl HarnessBuilder {
             engine: fast_engine_config(),
         };
         let manager = Arc::new(DownloadManager::new(factory, queue, fetch, cfg));
-        let service = BrookService::new(Arc::clone(&manager));
+        let service = BrookService::new(Arc::clone(&manager), ApiSettings::default());
         let server = BrookServiceServer::new(service);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

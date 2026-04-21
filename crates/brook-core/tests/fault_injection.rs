@@ -173,6 +173,7 @@ async fn midstream_abort_retries_and_completes() {
         piece_target_count: None,
         piece_size_min: None,
         piece_size_max: None,
+        on_file_exists_override: Default::default(),
     };
     let _id = manager.add(spec).await.expect("add ok");
 
@@ -212,6 +213,7 @@ async fn server_500_retries_then_completes() {
         piece_target_count: None,
         piece_size_min: None,
         piece_size_max: None,
+        on_file_exists_override: Default::default(),
     };
     manager.add(spec).await.expect("add ok");
 
@@ -249,6 +251,7 @@ async fn etag_change_fails_download() {
         piece_target_count: None,
         piece_size_min: None,
         piece_size_max: None,
+        on_file_exists_override: Default::default(),
     };
     manager.add(spec).await.expect("add ok");
 
@@ -286,6 +289,7 @@ async fn no_content_length_uses_full_stream_fallback() {
         piece_target_count: None,
         piece_size_min: None,
         piece_size_max: None,
+        on_file_exists_override: Default::default(),
     };
     manager.add(spec).await.expect("add ok");
 
@@ -356,6 +360,7 @@ async fn peak_rss_under_150mb_10_parallel_engines() {
             piece_target_count: None,
             piece_size_min: None,
             piece_size_max: None,
+            on_file_exists_override: Default::default(),
         };
         manager.add(spec).await.expect("add ok");
     }

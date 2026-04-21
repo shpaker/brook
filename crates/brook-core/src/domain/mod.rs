@@ -32,6 +32,7 @@ pub use id::DownloadId;
 pub use progress::Progress;
 pub use spec::{
     DownloadSpec,
+    OnFileExistsOverride,
     default_workers,
 };
 pub use state::DownloadState;

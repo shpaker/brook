@@ -35,6 +35,7 @@ use anyhow::{
     anyhow,
 };
 use brook_api::{
+    ApiSettings,
     BrookService,
     BrookServiceServer,
     trace_interceptor,
@@ -59,6 +60,8 @@ use tracing::{
 use crate::config::{
     DEFAULT_CONFIG_FILENAME,
     DaemonRuntime,
+    OnDuplicateUrl,
+    OnFileExists,
     Settings,
 };
 use crate::storage::factory::LocalPieceStorageFactory;
@@ -105,7 +108,6 @@ impl Paths {
 pub struct Runtime {
     /// Держим файл на время работы демона — при drop flock снимается.
     lock: std::fs::File,
-    #[allow(dead_code)] // пригодится, когда появится live-reload
     pub daemon: DaemonRuntime,
     pub manager: Arc<ProdManager>,
     pub addr: SocketAddr,
@@ -164,7 +166,7 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         .await
         .with_context(|| format!("bind gRPC listener on {bind_addr}"))?;
     let addr = listener.local_addr().context("local_addr")?;
-    let svc = BrookService::new(Arc::clone(&manager));
+    let svc = BrookService::new(Arc::clone(&manager), api_settings(&daemon));
 
     Ok(Runtime {
         lock,
@@ -206,6 +208,31 @@ pub async fn serve(runtime: Runtime, shutdown: impl Future<Output = ()> + Send) 
 
     drop(lock); // явно: flock снимается здесь, а не в конце main.
     Ok(())
+}
+
+/// Перевод `DaemonRuntime` в транспортный снимок для `BrookService::GetSettings`.
+/// Здесь же — маппинг YAML-enum'ов в proto-эквиваленты.
+fn api_settings(rt: &DaemonRuntime) -> ApiSettings {
+    use brook_proto::brook::v1 as proto;
+    ApiSettings {
+        default_dir: rt.default_dir.to_string_lossy().into_owned(),
+        default_workers: rt.defaults.workers,
+        max_workers: rt.max_workers,
+        max_concurrent: rt.max_concurrent as u32,
+        piece_target_count: rt.defaults.piece_target_count,
+        piece_size_min: rt.defaults.piece_size_min,
+        piece_size_max: rt.defaults.piece_size_max,
+        on_duplicate_url: match rt.on_duplicate_url {
+            OnDuplicateUrl::Ask => proto::OnDuplicateUrlPolicy::Ask,
+            OnDuplicateUrl::Skip => proto::OnDuplicateUrlPolicy::Skip,
+            OnDuplicateUrl::Add => proto::OnDuplicateUrlPolicy::Add,
+        },
+        on_file_exists: match rt.on_file_exists {
+            OnFileExists::Ask => proto::OnFileExistsPolicy::Ask,
+            OnFileExists::Rename => proto::OnFileExistsPolicy::Rename,
+            OnFileExists::Overwrite => proto::OnFileExistsPolicy::Overwrite,
+        },
+    }
 }
 
 /// Фьюча, которая разрешается по приходу `SIGTERM` или `SIGINT`.

@@ -20,5 +20,8 @@ pub mod service;
 pub mod trace;
 
 pub use brook_proto::brook::v1::brook_service_server::BrookServiceServer;
-pub use service::BrookService;
+pub use service::{
+    ApiSettings,
+    BrookService,
+};
 pub use trace::trace_interceptor;

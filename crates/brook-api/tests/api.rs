@@ -294,3 +294,27 @@ async fn add_without_spec_is_invalid_argument() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_settings_returns_defaults() {
+    // Harness собирает сервис через `ApiSettings::default()` — проверяем,
+    // что RPC действительно отдаёт эти значения клиенту без потерь.
+    let mut h = HarnessBuilder::default().build().await;
+    let resp = h
+        .client
+        .get_settings(proto::GetSettingsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.default_workers, 4);
+    assert_eq!(resp.max_workers, 16);
+    assert_eq!(resp.max_concurrent, 3);
+    assert_eq!(resp.piece_target_count, 128);
+    assert_eq!(resp.piece_size_min, 16 * 1024 * 1024);
+    assert_eq!(resp.piece_size_max, 128 * 1024 * 1024);
+    assert_eq!(
+        resp.on_duplicate_url,
+        proto::OnDuplicateUrlPolicy::Ask as i32
+    );
+    assert_eq!(resp.on_file_exists, proto::OnFileExistsPolicy::Ask as i32);
+}

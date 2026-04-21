@@ -319,6 +319,9 @@ fn row_to_download(r: RawRow) -> QueueResult<Download> {
         piece_target_count: r.piece_target_count,
         piece_size_min: r.piece_size_min,
         piece_size_max: r.piece_size_max,
+        // Override-хинт — transient, не персистится; при загрузке из БД
+        // всегда Unspecified.
+        on_file_exists_override: brook_core::OnFileExistsOverride::Unspecified,
     };
     Ok(Download {
         id,
@@ -376,6 +379,7 @@ mod tests {
             piece_target_count: Some(256),
             piece_size_min: Some(8 * 1024 * 1024),
             piece_size_max: Some(64 * 1024 * 1024),
+            on_file_exists_override: Default::default(),
         };
         Download::new(DownloadId::new(), spec)
     }

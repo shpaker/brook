@@ -17,6 +17,7 @@ use brook_core::{
     DownloadId,
     DownloadSpec,
     DownloadState,
+    OnFileExistsOverride,
     Progress,
     default_workers,
 };
@@ -62,6 +63,13 @@ pub fn spec_from_proto(s: proto::DownloadSpec) -> Result<DownloadSpec, Status> {
         s.workers
     };
     let filename = s.filename.filter(|f| !f.is_empty());
+    let on_file_exists_override =
+        match proto::OnFileExistsOverride::try_from(s.on_file_exists_override) {
+            Ok(proto::OnFileExistsOverride::Rename) => OnFileExistsOverride::Rename,
+            Ok(proto::OnFileExistsOverride::Overwrite) => OnFileExistsOverride::Overwrite,
+            // Неизвестный/Unspecified — дефолт.
+            _ => OnFileExistsOverride::Unspecified,
+        };
     Ok(DownloadSpec {
         url: s.url,
         target_dir: PathBuf::from(s.target_dir),
@@ -70,7 +78,16 @@ pub fn spec_from_proto(s: proto::DownloadSpec) -> Result<DownloadSpec, Status> {
         piece_target_count: s.piece_target_count,
         piece_size_min: s.piece_size_min,
         piece_size_max: s.piece_size_max,
+        on_file_exists_override,
     })
+}
+
+fn override_to_proto(o: OnFileExistsOverride) -> proto::OnFileExistsOverride {
+    match o {
+        OnFileExistsOverride::Unspecified => proto::OnFileExistsOverride::Unspecified,
+        OnFileExistsOverride::Rename => proto::OnFileExistsOverride::Rename,
+        OnFileExistsOverride::Overwrite => proto::OnFileExistsOverride::Overwrite,
+    }
 }
 
 pub fn spec_to_proto(s: &DownloadSpec) -> proto::DownloadSpec {
@@ -84,6 +101,7 @@ pub fn spec_to_proto(s: &DownloadSpec) -> proto::DownloadSpec {
         piece_target_count: s.piece_target_count,
         piece_size_min: s.piece_size_min,
         piece_size_max: s.piece_size_max,
+        on_file_exists_override: override_to_proto(s.on_file_exists_override) as i32,
     }
 }
 
@@ -202,6 +220,9 @@ pub fn core_err_to_status(e: brook_core::Error) -> Status {
     use brook_core::Error as E;
     match e {
         E::NotFound => Status::not_found("download not found"),
+        E::FileExists { path } => {
+            Status::already_exists(format!("target file already exists: {}", path.display()))
+        }
         E::SourceMutated => Status::aborted("source changed while downloading"),
         E::TruncatedResponse => Status::data_loss("truncated response from source"),
         E::Io(ref io) => Status::internal(format!("io error: {io}")),

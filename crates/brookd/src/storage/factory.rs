@@ -15,11 +15,16 @@
 //! §6.6, которая до `prepare` договаривается с пользователем и правит
 //! `spec.filename`. Фабрика не делает предположений.
 
+use std::path::{
+    Path,
+    PathBuf,
+};
 use std::sync::Arc;
 
 use brook_core::{
     DownloadSpec,
     Error,
+    OnFileExistsOverride,
     PreparedDownload,
     RangeGuard,
     Result,
@@ -77,6 +82,8 @@ where
 
             let filename = resolve_filename(&spec, report.filename.as_deref())?;
             validate_filename(&filename).map_err(|e| Error::Other(format!("filename: {e}")))?;
+            let filename =
+                apply_on_file_exists(&spec.target_dir, filename, spec.on_file_exists_override)?;
 
             let cfg = effective_plan_config(&spec, &defaults)
                 .map_err(|e| Error::Other(format!("plan config: {e}")))?;
@@ -116,6 +123,62 @@ fn resolve_filename(spec: &DownloadSpec, from_report: Option<&str>) -> Result<St
             url = spec.url
         ))
     })
+}
+
+/// Применить политику `on_file_exists_override`: если целевой файл уже
+/// лежит в `target_dir`, либо подобрать свободное имя (Rename), либо
+/// удалить его (Overwrite), либо вернуть `Error::FileExists` (Unspecified).
+///
+/// Возвращает окончательное `resolved_filename`, с которым должен
+/// работать `LocalPieceStorage::open`.
+fn apply_on_file_exists(
+    target_dir: &Path,
+    filename: String,
+    policy: OnFileExistsOverride,
+) -> Result<String> {
+    let target = target_dir.join(&filename);
+    if !target.exists() {
+        return Ok(filename);
+    }
+    match policy {
+        OnFileExistsOverride::Unspecified => Err(Error::FileExists { path: target }),
+        OnFileExistsOverride::Overwrite => {
+            std::fs::remove_file(&target)
+                .map_err(|e| Error::Other(format!("overwrite {}: {e}", target.display())))?;
+            Ok(filename)
+        }
+        OnFileExistsOverride::Rename => pick_free_name(target_dir, &filename),
+    }
+}
+
+/// Подобрать `<stem> (N).<ext>` (или `<name> (N)` без расширения),
+/// начиная с `N = 1`, пока не найдётся несуществующее имя.
+fn pick_free_name(target_dir: &Path, original: &str) -> Result<String> {
+    let as_path = PathBuf::from(original);
+    let stem = as_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(original)
+        .to_owned();
+    let ext = as_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned);
+    // Защитный верхний предел: за 10 000 конфликтов подряд что-то точно
+    // не так — возвращаем ошибку, а не крутимся вечно.
+    for n in 1u32..=10_000 {
+        let candidate = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        if !target_dir.join(&candidate).exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::Other(format!(
+        "cannot pick free filename for {original} in {}",
+        target_dir.display()
+    )))
 }
 
 fn filename_from_url(url: &str) -> Option<String> {
@@ -191,6 +254,7 @@ mod tests {
             piece_target_count: None,
             piece_size_min: None,
             piece_size_max: None,
+            on_file_exists_override: Default::default(),
         };
         let prepared = factory.prepare(&spec).await.unwrap();
         assert_eq!(prepared.resolved_filename, "explicit.bin");
@@ -214,6 +278,7 @@ mod tests {
             piece_target_count: None,
             piece_size_min: None,
             piece_size_max: None,
+            on_file_exists_override: Default::default(),
         };
         let prepared = factory.prepare(&spec).await.unwrap();
         assert_eq!(prepared.resolved_filename, "from-header.bin");
@@ -231,6 +296,7 @@ mod tests {
             piece_target_count: None,
             piece_size_min: None,
             piece_size_max: None,
+            on_file_exists_override: Default::default(),
         };
         let prepared = factory.prepare(&spec).await.unwrap();
         assert_eq!(prepared.resolved_filename, "server.bin");
@@ -264,6 +330,7 @@ mod tests {
             piece_target_count: Some(64),
             piece_size_min: Some(1024 * 1024),
             piece_size_max: Some(1024 * 1024),
+            on_file_exists_override: Default::default(),
         };
         let prepared = factory.prepare(&spec).await.unwrap();
         assert_eq!(prepared.piece_size, 1024 * 1024);
@@ -284,6 +351,7 @@ mod tests {
             piece_target_count: Some(8),
             piece_size_min: Some(3 * 1024 * 1024), // не pow2
             piece_size_max: Some(16 * 1024 * 1024),
+            on_file_exists_override: Default::default(),
         };
         let err = match factory.prepare(&spec).await {
             Err(e) => e,
@@ -309,4 +377,97 @@ mod tests {
     // Use PathBuf to silence unused-import lints across platforms.
     #[allow(dead_code)]
     fn _unused(_: PathBuf) {}
+
+    fn spec_for(dir: &Path, filename: &str, policy: OnFileExistsOverride) -> DownloadSpec {
+        DownloadSpec {
+            url: "https://host/f.bin".into(),
+            target_dir: dir.to_path_buf(),
+            filename: Some(filename.into()),
+            workers: 1,
+            piece_target_count: None,
+            piece_size_min: None,
+            piece_size_max: None,
+            on_file_exists_override: policy,
+        }
+    }
+
+    #[tokio::test]
+    async fn on_file_exists_unspecified_errors_when_target_present() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"old").unwrap();
+        let factory =
+            LocalPieceStorageFactory::new(inspect_with(Some(1024), Some("f.bin")), defaults());
+        let spec = spec_for(dir.path(), "f.bin", OnFileExistsOverride::Unspecified);
+        let err = match factory.prepare(&spec).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected FileExists"),
+        };
+        assert!(
+            matches!(err, brook_core::Error::FileExists { .. }),
+            "expected FileExists, got {err:?}"
+        );
+        // Существующий файл не тронут.
+        assert_eq!(std::fs::read(dir.path().join("f.bin")).unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn on_file_exists_rename_picks_free_candidate() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"old").unwrap();
+        std::fs::write(dir.path().join("f (1).bin"), b"other").unwrap();
+        let factory =
+            LocalPieceStorageFactory::new(inspect_with(Some(1024), Some("f.bin")), defaults());
+        let spec = spec_for(dir.path(), "f.bin", OnFileExistsOverride::Rename);
+        let prepared = factory.prepare(&spec).await.unwrap();
+        assert_eq!(prepared.resolved_filename, "f (2).bin");
+        // Существующие файлы не тронуты.
+        assert_eq!(std::fs::read(dir.path().join("f.bin")).unwrap(), b"old");
+        assert_eq!(
+            std::fs::read(dir.path().join("f (1).bin")).unwrap(),
+            b"other"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_file_exists_overwrite_removes_existing_file() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.bin"), b"old").unwrap();
+        let factory =
+            LocalPieceStorageFactory::new(inspect_with(Some(1024), Some("f.bin")), defaults());
+        let spec = spec_for(dir.path(), "f.bin", OnFileExistsOverride::Overwrite);
+        let prepared = factory.prepare(&spec).await.unwrap();
+        assert_eq!(prepared.resolved_filename, "f.bin");
+        // До finalize целевой файл отсутствует (стёрт политикой overwrite),
+        // а `.data.brook` преаллоцирован.
+        assert!(!dir.path().join("f.bin").exists());
+        assert!(dir.path().join("f.bin.data.brook").exists());
+    }
+
+    #[tokio::test]
+    async fn on_file_exists_unspecified_passes_when_target_absent() {
+        let dir = tempdir().unwrap();
+        let factory =
+            LocalPieceStorageFactory::new(inspect_with(Some(1024), Some("f.bin")), defaults());
+        let spec = spec_for(dir.path(), "f.bin", OnFileExistsOverride::Unspecified);
+        let prepared = factory.prepare(&spec).await.unwrap();
+        assert_eq!(prepared.resolved_filename, "f.bin");
+    }
+
+    #[test]
+    fn pick_free_name_handles_no_extension() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("foo"), b"").unwrap();
+        assert_eq!(pick_free_name(dir.path(), "foo").unwrap(), "foo (1)");
+    }
+
+    #[test]
+    fn pick_free_name_uses_last_extension() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.tar.gz"), b"").unwrap();
+        // `Path::file_stem` считает "a.tar" стволом, "gz" — расширением.
+        assert_eq!(
+            pick_free_name(dir.path(), "a.tar.gz").unwrap(),
+            "a.tar (1).gz"
+        );
+    }
 }

@@ -1091,6 +1091,7 @@ mod tests {
                 piece_target_count: None,
                 piece_size_min: None,
                 piece_size_max: None,
+                on_file_exists_override: Default::default(),
             },
             total_size: plan.total(),
             piece_size: plan.piece_size,

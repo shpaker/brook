@@ -8,9 +8,13 @@ name = "brook"
 path = "src/main.rs"
 
 [dependencies]
-brook-proto = { path = "../brook-proto" }
-tonic       = { workspace = true }
-tokio       = { workspace = true }
-ratatui     = { workspace = true }
-crossterm   = { workspace = true }
-anyhow      = { workspace = true }
+brook-proto  = { path = "../brook-proto" }
+tonic        = { workspace = true }
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+ratatui      = { workspace = true }
+crossterm    = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+indexmap     = { workspace = true }
+futures-util = { workspace = true }
