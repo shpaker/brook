@@ -281,6 +281,7 @@ mod tests {
                 etag: Some("\"abc\"".into()),
                 last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
                 filename: filename.map(str::to_owned),
+                effective_url: None,
             },
         })
     }

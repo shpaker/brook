@@ -1,11 +1,17 @@
 //! `HttpInspectClient` — реализация [`brook_core::THttpInspect`].
 //!
-//! Алгоритм:
-//! 1. `HEAD url`. Если `2xx` и есть полезные заголовки — готово.
-//! 2. Иначе (`4xx`/`5xx` или сетевой сбой) — fallback `GET url` с заголовком
-//!    `Range: bytes=0-0`. Размер берётся из `Content-Range: bytes 0-0/TOTAL`.
-//! 3. Имя файла: `Content-Disposition filename*=` (RFC 5987) → `filename=`
-//!    → последний сегмент URL-пути.
+//! Алгоритм (smart probe): единственный `GET url` с заголовком
+//! `Range: bytes=0-0`. Читаем только status + headers и сразу
+//! `drop(resp)` — тело ответа не тянем:
+//! - `206 Partial Content` → `Content-Range: bytes 0-0/TOTAL` → размер
+//!   известен, `accepts_ranges = true`. Вариант `.../*` → `total_size = None`.
+//! - `200 OK` → сервер проигнорировал Range; `total_size` — из
+//!   `Content-Length` (может быть `None` для chunked), `accepts_ranges = false`
+//!   независимо от декларированного `Accept-Ranges` (он соврал).
+//! - иначе → `InspectError::UnexpectedStatus`.
+//!
+//! `effective_url` берётся из `response.url()` до drop'а — пригодится
+//! воркерам, чтобы бить по разрешённому (после редиректов) URL.
 
 use std::time::Duration;
 
@@ -17,7 +23,6 @@ use brook_core::{
 };
 use reqwest::StatusCode;
 use reqwest::header::{
-    ACCEPT_RANGES,
     CONTENT_DISPOSITION,
     CONTENT_LENGTH,
     CONTENT_RANGE,
@@ -49,27 +54,9 @@ impl THttpInspect for HttpInspectClient {
     async fn inspect(&self, url: &str) -> Result<InspectReport, InspectError> {
         let parsed = validate_http_url(url).map_err(classify_url_error)?;
 
-        // Сначала HEAD.
-        let head = self
-            .client
-            .head(parsed.clone())
-            .timeout(READ_TIMEOUT)
-            .send()
-            .await;
-
-        match head {
-            Ok(resp) if resp.status().is_success() => Ok(report_from_head(resp.headers(), &parsed)),
-            // HEAD-неудача (4xx/5xx) → fallback на GET-Range.
-            Ok(_) | Err(_) => self.inspect_via_range(&parsed).await,
-        }
-    }
-}
-
-impl HttpInspectClient {
-    async fn inspect_via_range(&self, url: &Url) -> Result<InspectReport, InspectError> {
         let resp = self
             .client
-            .get(url.clone())
+            .get(parsed.clone())
             .header(RANGE, "bytes=0-0")
             .timeout(READ_TIMEOUT)
             .send()
@@ -78,36 +65,45 @@ impl HttpInspectClient {
 
         let status = resp.status();
         let headers = resp.headers().clone();
+        let final_url = resp.url().clone();
+        // СРАЗУ закрываем ответ: НЕ зовём .bytes()/.text()/.chunk().
+        // Для серверов, ответивших 200 вместо 206, это спасает нас от
+        // полного скачивания тела только ради inspect.
+        drop(resp);
 
-        // Успешные варианты: 206 (Range поддерживается) или 200 (нет, но тело
-        // есть — размер тогда из Content-Length).
+        let effective_url = if final_url == parsed {
+            None
+        } else {
+            Some(final_url.to_string())
+        };
+
         if status == StatusCode::PARTIAL_CONTENT {
             let total = parse_content_range_total(headers.get(CONTENT_RANGE))
                 .map_err(InspectError::Malformed)?;
             Ok(InspectReport {
                 total_size: total,
-                accepts_ranges: accepts_ranges(headers.get(ACCEPT_RANGES)) || total.is_some(),
+                accepts_ranges: true,
                 etag: header_str(&headers, ETAG),
                 last_modified: header_str(&headers, LAST_MODIFIED),
-                filename: pick_filename(headers.get(CONTENT_DISPOSITION), url),
+                filename: pick_filename(headers.get(CONTENT_DISPOSITION), &parsed),
+                effective_url,
             })
         } else if status.is_success() {
-            Ok(report_from_head(&headers, url))
+            // 200 OK — сервер не уважает Range. Верим только Content-Length;
+            // Accept-Ranges игнорируем (сервер мог соврать).
+            Ok(InspectReport {
+                total_size: parse_content_length(headers.get(CONTENT_LENGTH)),
+                accepts_ranges: false,
+                etag: header_str(&headers, ETAG),
+                last_modified: header_str(&headers, LAST_MODIFIED),
+                filename: pick_filename(headers.get(CONTENT_DISPOSITION), &parsed),
+                effective_url,
+            })
         } else {
             Err(InspectError::UnexpectedStatus {
                 code: status.as_u16(),
             })
         }
-    }
-}
-
-fn report_from_head(headers: &HeaderMap, url: &Url) -> InspectReport {
-    InspectReport {
-        total_size: parse_content_length(headers.get(CONTENT_LENGTH)),
-        accepts_ranges: accepts_ranges(headers.get(ACCEPT_RANGES)),
-        etag: header_str(headers, ETAG),
-        last_modified: header_str(headers, LAST_MODIFIED),
-        filename: pick_filename(headers.get(CONTENT_DISPOSITION), url),
     }
 }
 
@@ -121,13 +117,6 @@ fn header_str(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<
 
 fn parse_content_length(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
     value?.to_str().ok()?.trim().parse::<u64>().ok()
-}
-
-fn accepts_ranges(value: Option<&reqwest::header::HeaderValue>) -> bool {
-    value
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().eq_ignore_ascii_case("bytes"))
-        .unwrap_or(false)
 }
 
 /// Парсит `Content-Range: bytes 0-0/TOTAL`, возвращает TOTAL.
@@ -311,5 +300,107 @@ mod tests {
         let url = Url::parse("https://example.com/a/%D1%84%D0%B0%D0%B9%D0%BB.bin").unwrap();
         let name = pick_filename(None, &url).unwrap();
         assert_eq!(name, "файл.bin");
+    }
+
+    // ─── Smart probe integration tests via wiremock ────────────────────
+    use reqwest::Client;
+    use reqwest_middleware::ClientBuilder;
+    use wiremock::matchers::{
+        method,
+        path,
+    };
+    use wiremock::{
+        Mock,
+        MockServer,
+        ResponseTemplate,
+    };
+
+    fn client() -> ClientWithMiddleware {
+        ClientBuilder::new(Client::new()).build()
+    }
+
+    #[tokio::test]
+    async fn probe_206_parses_content_range_total() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/f.bin"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 0-0/4096")
+                    .insert_header("Accept-Ranges", "bytes")
+                    .insert_header("ETag", "\"abc\"")
+                    .set_body_bytes(b"X".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let ins = HttpInspectClient::new(client());
+        let rep = ins
+            .inspect(&format!("{}/f.bin", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(rep.total_size, Some(4096));
+        assert!(rep.accepts_ranges);
+        assert_eq!(rep.etag.as_deref(), Some("\"abc\""));
+    }
+
+    #[tokio::test]
+    async fn probe_200_with_content_length_no_range_support() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/f.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // wiremock сам выставит Content-Length из body; этого
+                    // и хватит для проверки, что мы читаем размер из
+                    // Content-Length при 200-ответе.
+                    // Сервер анонсирует Ranges, но на Range ответил 200.
+                    .insert_header("Accept-Ranges", "bytes")
+                    .set_body_bytes(vec![0u8; 123_456]),
+            )
+            .mount(&server)
+            .await;
+
+        let ins = HttpInspectClient::new(client());
+        let rep = ins
+            .inspect(&format!("{}/f.bin", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(rep.total_size, Some(123456));
+        assert!(
+            !rep.accepts_ranges,
+            "200 — Range не поддерживается, невзирая на Accept-Ranges"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_200_without_content_length_streams_unknown_size() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/s"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 256]))
+            .mount(&server)
+            .await;
+
+        let ins = HttpInspectClient::new(client());
+        let rep = ins.inspect(&format!("{}/s", server.uri())).await.unwrap();
+        assert!(!rep.accepts_ranges);
+    }
+
+    #[tokio::test]
+    async fn probe_4xx_returns_unexpected_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/g"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let ins = HttpInspectClient::new(client());
+        let err = ins
+            .inspect(&format!("{}/g", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InspectError::UnexpectedStatus { code: 404 }));
     }
 }
