@@ -63,7 +63,6 @@ fn spin_up_manager(
         events_capacity: 1024,
         engine: EngineConfig {
             write_buffer: 8 * 1024,
-            commit_every: 1,
             progress_interval: Duration::from_millis(10),
             retry: RetryPolicy {
                 base: Duration::from_millis(1),

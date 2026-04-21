@@ -105,18 +105,11 @@ impl SqlitePieceRepository {
         run(&self.db, move |c| pending_numbers_impl(c, file_id)).await
     }
 
-    /// Пометить набор piece'ов как `done` одной транзакцией.
-    /// Неизвестные `number` молча игнорируются (rowid'ы из старого
-    /// батча отменённого воркера — нормальный кейс).
-    pub async fn commit_done_batch(
-        &self,
-        file_id: DownloadId,
-        numbers: Vec<u32>,
-    ) -> PiecesResult<()> {
-        run(&self.db, move |c| {
-            commit_done_batch_impl(c, file_id, &numbers)
-        })
-        .await
+    /// Пометить piece как `done`.
+    /// Неизвестный `number` молча игнорируется (rowid из отменённой
+    /// попытки — нормальный кейс).
+    pub async fn commit_done(&self, file_id: DownloadId, number: u32) -> PiecesResult<()> {
+        run(&self.db, move |c| commit_done_impl(c, file_id, number)).await
     }
 
     /// Удалить все piece-строки этого файла. Используется при `abort`,
@@ -195,27 +188,13 @@ fn pending_numbers_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesRes
     Ok(out)
 }
 
-fn commit_done_batch_impl(
-    conn: &mut Connection,
-    file_id: DownloadId,
-    numbers: &[u32],
-) -> PiecesResult<()> {
-    if numbers.is_empty() {
-        return Ok(());
-    }
+fn commit_done_impl(conn: &mut Connection, file_id: DownloadId, number: u32) -> PiecesResult<()> {
     let now = unix_secs(SystemTime::now());
-    let file_id_str = file_id.to_string();
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "UPDATE pieces SET status_id = 'done', finished_at = ?
-             WHERE file_id = ? AND number = ?",
-        )?;
-        for &n in numbers {
-            stmt.execute(params![now, file_id_str, n as i64])?;
-        }
-    }
-    tx.commit()?;
+    conn.execute(
+        "UPDATE pieces SET status_id = 'done', finished_at = ?
+         WHERE file_id = ? AND number = ?",
+        params![now, file_id.to_string(), number as i64],
+    )?;
     Ok(())
 }
 
@@ -304,7 +283,8 @@ mod tests {
     async fn commit_marks_done_and_drops_from_pending() {
         let (db, repo, id) = fresh().await;
         repo.init(id, 4).await.unwrap();
-        repo.commit_done_batch(id, vec![0, 2]).await.unwrap();
+        repo.commit_done(id, 0).await.unwrap();
+        repo.commit_done(id, 2).await.unwrap();
         assert_eq!(repo.pending_numbers(id).await.unwrap(), vec![1, 3]);
 
         // finished_at заполнился у закоммиченных, у pending — NULL.
@@ -335,15 +315,7 @@ mod tests {
     async fn commit_unknown_number_is_noop() {
         let (_db, repo, id) = fresh().await;
         repo.init(id, 3).await.unwrap();
-        repo.commit_done_batch(id, vec![42]).await.unwrap();
-        assert_eq!(repo.pending_numbers(id).await.unwrap(), vec![0, 1, 2]);
-    }
-
-    #[tokio::test]
-    async fn commit_empty_batch_is_noop() {
-        let (_db, repo, id) = fresh().await;
-        repo.init(id, 3).await.unwrap();
-        repo.commit_done_batch(id, vec![]).await.unwrap();
+        repo.commit_done(id, 42).await.unwrap();
         assert_eq!(repo.pending_numbers(id).await.unwrap(), vec![0, 1, 2]);
     }
 
@@ -379,7 +351,8 @@ mod tests {
             files.insert(&d).await.unwrap();
             let pieces = SqlitePieceRepository::new(db);
             pieces.init(id, 4).await.unwrap();
-            pieces.commit_done_batch(id, vec![0, 2]).await.unwrap();
+            pieces.commit_done(id, 0).await.unwrap();
+            pieces.commit_done(id, 2).await.unwrap();
         }
         let db = SharedDb::open(&path).unwrap();
         let pieces = SqlitePieceRepository::new(db);
@@ -400,7 +373,9 @@ mod tests {
 
         repo.init(a, 3).await.unwrap();
         repo.init(b, 3).await.unwrap();
-        repo.commit_done_batch(a, vec![0, 1, 2]).await.unwrap();
+        repo.commit_done(a, 0).await.unwrap();
+        repo.commit_done(a, 1).await.unwrap();
+        repo.commit_done(a, 2).await.unwrap();
 
         assert!(repo.pending_numbers(a).await.unwrap().is_empty());
         assert_eq!(repo.pending_numbers(b).await.unwrap(), vec![0, 1, 2]);
