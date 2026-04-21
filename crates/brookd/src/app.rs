@@ -43,6 +43,8 @@ use brook_api::{
 use brook_core::{
     DownloadManager,
     ManagerConfig,
+    TPieceAttemptRepo,
+    TWorkerRepo,
 };
 use brook_http::{
     HttpClientBuilder,
@@ -68,7 +70,9 @@ use crate::config::{
 use crate::storage::db::SharedDb;
 use crate::storage::factory::LocalPieceStorageFactory;
 use crate::storage::files::SqliteFileRepository;
+use crate::storage::piece_attempts::SqlitePieceAttemptRepository;
 use crate::storage::pieces::SqlitePieceRepository;
+use crate::storage::workers::SqliteWorkerRepository;
 
 /// Имя lock-файла в CWD (гарантирует single-instance).
 pub const LOCK_FILENAME: &str = ".brook.lock";
@@ -148,8 +152,23 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
     // 3. Repositories (поверх общего `brook.db`).
     let shared_db = SharedDb::open(&paths.db).context("open brook.db")?;
     let files_repo = Arc::new(SqliteFileRepository::new(shared_db.clone()));
-    let pieces_repo = Arc::new(SqlitePieceRepository::new(shared_db));
+    let pieces_repo = Arc::new(SqlitePieceRepository::new(shared_db.clone()));
+    let workers_repo = Arc::new(SqliteWorkerRepository::new(shared_db.clone()));
+    let attempts_repo = Arc::new(SqlitePieceAttemptRepository::new(shared_db));
     let queue = Arc::clone(&files_repo);
+
+    // 3a. Startup recovery: любые `running`-воркеры и `running`-attempt'ы,
+    // оставшиеся от предыдущего (возможно, упавшего) инстанса, переводим в
+    // `paused`. Делаем это под `.brook.lock` — единственный раз за жизнь
+    // процесса, до того, как появится шанс породить новый engine.
+    workers_repo
+        .pause_all_running_globally()
+        .await
+        .context("workers recovery sweep")?;
+    attempts_repo
+        .pause_all_running_globally()
+        .await
+        .context("piece_attempts recovery sweep")?;
 
     // 4. HTTP-стек (один reqwest::Client на inspect + range).
     let http_client = HttpClientBuilder::new().build();

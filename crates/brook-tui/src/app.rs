@@ -280,7 +280,7 @@ fn handle_key_normal(
             let (to_resume, to_pause): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
                 vm.downloads
                     .get(id)
-                    .map(|r| r.state == brook_proto::brook::v1::DownloadState::Paused)
+                    .map(|r| r.status == brook_proto::brook::v1::DownloadStatus::Paused)
                     .unwrap_or(false)
             });
             if !to_resume.is_empty() {

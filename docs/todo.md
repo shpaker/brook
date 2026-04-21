@@ -177,3 +177,31 @@ sidecar-индекс `<name>.index.brook`. Рядом с таргетом ост
       таргет на месте, piece-строки для `file_id` пусты, последняя
       запись `state_changes` — `done` (`tests/shutdown.rs` round 2)
 - [x] `cargo tree -p brook-core` не тянет `rusqlite`
+
+## Единый словарь статусов + персистентная идентичность воркера
+
+- [x] Переименовать `states` → `statuses`, колонки `state_id` → `status_id`
+      во всей схеме и во всех репозиториях; `pieces.status` тоже
+      становится `status_id` c FK на `statuses.name`.
+- [x] Proto: `DownloadState` → `DownloadStatus`, `QUEUED` → `PENDING`,
+      поле `state` → `status`; `StateChangedEvent` → `StatusChangedEvent`.
+      Переименование прошито через все крейты workspace'а.
+- [x] Rust-enum'ы `FileStatus` / `WorkerStatus` / `PieceStatus` /
+      `AttemptStatus` в `brook-core/src/domain/status.rs`; сериализация
+      совпадает с natural-key в БД, компилятор страхует от
+      «чужого» статуса.
+- [x] Новые таблицы `workers` и `piece_attempts` (см. `schema.dbml`):
+      per-сессионная identity воркера, журнал попыток piece'а.
+- [x] Порты `TWorkerRepo` / `TPieceAttemptRepo` в `brook-core/ports`;
+      SQLite-реализации `SqliteWorkerRepository` /
+      `SqlitePieceAttemptRepository` в `brookd/storage`, зарегистрированы
+      через mod.rs и покрыты unit-тестами (ensure_slots pause-sweep,
+      глобальный recovery).
+- [x] Startup recovery в `brookd::app::build_runtime`: под `.brook.lock`
+      ровно один раз зовём `pause_all_running_globally` у обоих
+      репозиториев до bootstrap'а менеджера.
+- [ ] Прошить `workers_repo` / `attempts_repo` через `DownloadManager`
+      и `DownloadEngine` (start/finish/fail/pause на каждый piece,
+      ensure_slots на старте engine-сессии). Следующая итерация —
+      трогает генерики менеджера и тесты, в текущем PR оставлено
+      за скобками, чтобы не раздувать diff.

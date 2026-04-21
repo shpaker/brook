@@ -16,7 +16,7 @@ use brook_core::{
     DownloadEvent,
     DownloadId,
     DownloadSpec,
-    DownloadState,
+    FileStatus,
     OnFileExistsOverride,
     Progress,
     default_workers,
@@ -105,17 +105,17 @@ pub fn spec_to_proto(s: &DownloadSpec) -> proto::DownloadSpec {
     }
 }
 
-// ─── DownloadState ───────────────────────────────────────────────────────
+// ─── Status ───────────────────────────────────────────────────────────────
 
-pub fn state_to_proto(s: DownloadState) -> proto::DownloadState {
+pub fn status_to_proto(s: FileStatus) -> proto::DownloadStatus {
     match s {
-        DownloadState::Queued => proto::DownloadState::Queued,
-        DownloadState::Running => proto::DownloadState::Running,
-        DownloadState::Paused => proto::DownloadState::Paused,
-        DownloadState::Retrying => proto::DownloadState::Retrying,
-        DownloadState::Done => proto::DownloadState::Done,
-        DownloadState::Failed => proto::DownloadState::Failed,
-        DownloadState::Cancelled => proto::DownloadState::Cancelled,
+        FileStatus::Pending => proto::DownloadStatus::Pending,
+        FileStatus::Running => proto::DownloadStatus::Running,
+        FileStatus::Paused => proto::DownloadStatus::Paused,
+        FileStatus::Retrying => proto::DownloadStatus::Retrying,
+        FileStatus::Done => proto::DownloadStatus::Done,
+        FileStatus::Failed => proto::DownloadStatus::Failed,
+        FileStatus::Cancelled => proto::DownloadStatus::Cancelled,
     }
 }
 
@@ -156,7 +156,7 @@ pub fn download_to_proto(d: &Download) -> proto::Download {
     proto::Download {
         id: Some(id_to_proto(d.id)),
         spec: Some(spec_to_proto(&d.spec)),
-        state: state_to_proto(d.state) as i32,
+        status: status_to_proto(d.status) as i32,
         progress: Some(progress_to_proto(&d.progress)),
         attempt: d.attempt,
         error: d.error.clone(),
@@ -174,10 +174,12 @@ pub fn event_to_proto(ev: &DownloadEvent) -> proto::Event {
             id: Some(id_to_proto(*id)),
             progress: Some(progress_to_proto(progress)),
         }),
-        DownloadEvent::StateChanged { id, state } => Kind::StateChanged(proto::StateChangedEvent {
-            id: Some(id_to_proto(*id)),
-            state: state_to_proto(*state) as i32,
-        }),
+        DownloadEvent::StatusChanged { id, status } => {
+            Kind::StatusChanged(proto::StatusChangedEvent {
+                id: Some(id_to_proto(*id)),
+                status: status_to_proto(*status) as i32,
+            })
+        }
         DownloadEvent::WorkerUpdate {
             id,
             piece_index,
@@ -349,7 +351,7 @@ mod tests {
     fn download_roundtrip_through_proto_keeps_fields() {
         let id = DownloadId::new();
         let mut d = Download::new(id, CoreSpec::new("https://x", "/tmp"));
-        d.state = DownloadState::Running;
+        d.status = FileStatus::Running;
         d.progress = Progress {
             bytes_done: 50,
             bytes_total: 100,
@@ -362,7 +364,7 @@ mod tests {
         d.error = Some("boom".into());
         let p = download_to_proto(&d);
         assert_eq!(p.id.unwrap().value, id.to_string());
-        assert_eq!(p.state, proto::DownloadState::Running as i32);
+        assert_eq!(p.status, proto::DownloadStatus::Running as i32);
         let pg = p.progress.unwrap();
         assert_eq!(pg.bytes_done, 50);
         assert_eq!(pg.pieces_total, 2);
@@ -380,9 +382,9 @@ mod tests {
                 id,
                 progress: Progress::default(),
             },
-            DownloadEvent::StateChanged {
+            DownloadEvent::StatusChanged {
                 id,
-                state: DownloadState::Paused,
+                status: FileStatus::Paused,
             },
             DownloadEvent::WorkerUpdate {
                 id,
@@ -408,15 +410,15 @@ mod tests {
     fn state_enum_parity() {
         // Все 7 core-вариантов отображаются в не-Unspecified proto-значения.
         for s in [
-            DownloadState::Queued,
-            DownloadState::Running,
-            DownloadState::Paused,
-            DownloadState::Retrying,
-            DownloadState::Done,
-            DownloadState::Failed,
-            DownloadState::Cancelled,
+            FileStatus::Pending,
+            FileStatus::Running,
+            FileStatus::Paused,
+            FileStatus::Retrying,
+            FileStatus::Done,
+            FileStatus::Failed,
+            FileStatus::Cancelled,
         ] {
-            assert_ne!(state_to_proto(s), proto::DownloadState::Unspecified);
+            assert_ne!(status_to_proto(s), proto::DownloadStatus::Unspecified);
         }
     }
 

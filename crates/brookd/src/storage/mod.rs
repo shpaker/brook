@@ -10,5 +10,7 @@ pub mod files;
 pub mod fs;
 pub mod local;
 pub mod paths;
+pub mod piece_attempts;
 pub mod pieces;
 pub mod plan;
+pub mod workers;

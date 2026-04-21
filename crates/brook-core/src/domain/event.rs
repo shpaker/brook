@@ -7,18 +7,15 @@
 use super::download::Download;
 use super::id::DownloadId;
 use super::progress::Progress;
-use super::state::DownloadState;
+use super::status::FileStatus;
 
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
     /// Тик прогресса (троттлится со стороны движка).
     Progress { id: DownloadId, progress: Progress },
 
-    /// Смена состояния (`Queued → Running`, `Running → Paused`, …).
-    StateChanged {
-        id: DownloadId,
-        state: DownloadState,
-    },
+    /// Смена статуса (`Pending → Running`, `Running → Paused`, …).
+    StatusChanged { id: DownloadId, status: FileStatus },
 
     /// Частичное обновление по одному piece'у — для чанкового прогрессбара.
     WorkerUpdate {
@@ -50,14 +47,11 @@ mod tests {
 
     #[test]
     fn match_exhaustive_compiles() {
-        // Этот тест ничего не проверяет во время выполнения — он «компиляционный».
-        // Если в enum добавят новый вариант, `match` здесь перестанет компилироваться,
-        // и это хорошо: мы заставим автора нового варианта решить, что с ним делать.
         let id = DownloadId::new();
         let ev = DownloadEvent::Completed { id };
         let _text: &'static str = match ev {
             DownloadEvent::Progress { .. } => "progress",
-            DownloadEvent::StateChanged { .. } => "state",
+            DownloadEvent::StatusChanged { .. } => "status",
             DownloadEvent::WorkerUpdate { .. } => "worker",
             DownloadEvent::Completed { .. } => "done",
             DownloadEvent::Failed { .. } => "failed",

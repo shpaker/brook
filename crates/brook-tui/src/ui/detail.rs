@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use brook_proto::brook::v1::DownloadState;
+use brook_proto::brook::v1::DownloadStatus;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{
@@ -73,7 +73,7 @@ fn build_lines(row: &DownloadRow, width: usize) -> Vec<Line<'static>> {
         labelled("path   ", path),
         labelled("pieces ", pieces_line),
     ];
-    if row.state == DownloadState::Failed {
+    if row.status == DownloadStatus::Failed {
         let err = row.error.clone().unwrap_or_default();
         lines.push(Line::from(vec![
             Span::styled(" error  ", Style::default().fg(Color::Red)),

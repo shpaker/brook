@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use brook_core::{
     Download,
-    DownloadState,
+    FileStatus,
     TQueueStore,
 };
 use brook_proto::brook::v1 as proto;
@@ -183,15 +183,15 @@ async fn shutdown_persists_and_restart_resumes() {
         // до него — может быть любым. Ключевое: запись пережила рестарт.
         assert!(
             matches!(
-                all[0].state,
-                DownloadState::Queued
-                    | DownloadState::Running
-                    | DownloadState::Paused
-                    | DownloadState::Retrying
-                    | DownloadState::Done
+                all[0].status,
+                FileStatus::Pending
+                    | FileStatus::Running
+                    | FileStatus::Paused
+                    | FileStatus::Retrying
+                    | FileStatus::Done
             ),
             "unexpected state: {:?}",
-            all[0].state
+            all[0].status
         );
 
         // Stage 9 E2E — наблюдаемости после shutdown:
@@ -222,7 +222,7 @@ async fn shutdown_persists_and_restart_resumes() {
                     |r| r.get(0),
                 )?;
                 let changes: i64 = c.query_row(
-                    "SELECT COUNT(*) FROM state_changes WHERE file_id = ?",
+                    "SELECT COUNT(*) FROM status_changes WHERE file_id = ?",
                     params![id_str],
                     |r| r.get(0),
                 )?;
@@ -231,7 +231,7 @@ async fn shutdown_persists_and_restart_resumes() {
             .await
             .expect("brook.db readback");
         assert!(state_changes >= 1, "state_changes must record transitions");
-        if all[0].state != DownloadState::Done {
+        if all[0].status != FileStatus::Done {
             assert!(pieces_total >= 1, "pieces must be populated until finalize");
         }
     }
@@ -262,12 +262,9 @@ async fn shutdown_persists_and_restart_resumes() {
     // Нормализация гарантируется: Running/Retrying превращаются в Queued
     // до публикации snapshot'а.
     assert!(
-        !matches!(
-            snap[0].state,
-            DownloadState::Running | DownloadState::Retrying
-        ),
+        !matches!(snap[0].status, FileStatus::Running | FileStatus::Retrying),
         "bootstrap must normalize Running/Retrying, got {:?}",
-        snap[0].state
+        snap[0].status
     );
 
     // Дождаться финализации: `.data.brook` исчезает, таргет появляется,
@@ -276,7 +273,7 @@ async fn shutdown_persists_and_restart_resumes() {
     let mut finalized = false;
     for _ in 0..160 {
         let snap = manager2.snapshot();
-        if snap.iter().any(|d| d.state == DownloadState::Done) {
+        if snap.iter().any(|d| d.status == FileStatus::Done) {
             finalized = true;
             break;
         }
@@ -302,7 +299,7 @@ async fn shutdown_persists_and_restart_resumes() {
                     |r| r.get(0),
                 )?;
                 let last: String = c.query_row(
-                    "SELECT state_id FROM state_changes
+                    "SELECT status_id FROM status_changes
                       WHERE file_id = ?
                       ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     params![id_str],

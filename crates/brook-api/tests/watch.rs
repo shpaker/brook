@@ -108,9 +108,9 @@ async fn watch_forwards_state_changes() {
             .expect("timeout")
             .expect("stream ended")
             .expect("event ok");
-        if let Some(proto::event::Kind::StateChanged(sc)) = ev.kind {
+        if let Some(proto::event::Kind::StatusChanged(sc)) = ev.kind {
             assert_eq!(sc.id.unwrap().value, id.value);
-            assert_eq!(sc.state, proto::DownloadState::Paused as i32);
+            assert_eq!(sc.status, proto::DownloadStatus::Paused as i32);
             saw = true;
             break;
         }

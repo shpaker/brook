@@ -68,7 +68,7 @@ use crate::domain::{
     DownloadEvent,
     DownloadId,
     DownloadSpec,
-    DownloadState,
+    FileStatus,
     Progress,
 };
 use crate::ports::{
@@ -261,7 +261,7 @@ async fn run_engine<S, F>(
         Ok(p) => p,
         Err(e) => {
             warn!(%id, error = %e, "failed to read pending pieces");
-            emit_state(&events_tx, id, DownloadState::Failed);
+            emit_status(&events_tx, id, FileStatus::Failed);
             let _ = events_tx.send(DownloadEvent::Failed {
                 id,
                 error: format!("pending_pieces: {e}"),
@@ -273,15 +273,15 @@ async fn run_engine<S, F>(
     // Быстрый выход, если качать нечего — сразу финализируем и Completed.
     if pending.is_empty() {
         info!(%id, "no pending pieces — finalizing immediately");
-        emit_state(&events_tx, id, DownloadState::Running);
+        emit_status(&events_tx, id, FileStatus::Running);
         match storage.finalize().await {
             Ok(()) => {
-                emit_state(&events_tx, id, DownloadState::Done);
+                emit_status(&events_tx, id, FileStatus::Done);
                 let _ = events_tx.send(DownloadEvent::Completed { id });
             }
             Err(e) => {
                 warn!(%id, error = %e, "finalize failed");
-                emit_state(&events_tx, id, DownloadState::Failed);
+                emit_status(&events_tx, id, FileStatus::Failed);
                 let _ = events_tx.send(DownloadEvent::Failed {
                     id,
                     error: format!("finalize: {e}"),
@@ -292,7 +292,7 @@ async fn run_engine<S, F>(
     }
 
     // Доменный переход: Queued → Running.
-    emit_state(&events_tx, id, DownloadState::Running);
+    emit_status(&events_tx, id, FileStatus::Running);
 
     // Общий стейт между воркерами и супервизором.
     let total_pieces = pieces_total(inputs.total_size, inputs.piece_size);
@@ -367,14 +367,14 @@ async fn run_engine<S, F>(
                         if *state_rx.borrow() == RunState::Running {
                             info!(%id, "pausing");
                             let _ = state_tx.send(RunState::Paused);
-                            emit_state(&events_tx, id, DownloadState::Paused);
+                            emit_status(&events_tx, id, FileStatus::Paused);
                         }
                     }
                     DownloadCommand::Resume => {
                         if *state_rx.borrow() == RunState::Paused {
                             info!(%id, "resuming");
                             let _ = state_tx.send(RunState::Running);
-                            emit_state(&events_tx, id, DownloadState::Running);
+                            emit_status(&events_tx, id, FileStatus::Running);
                         }
                     }
                     DownloadCommand::Cancel => {
@@ -485,12 +485,12 @@ async fn run_engine<S, F>(
                         total_pieces,
                         total_pieces,
                     );
-                    emit_state(&events_tx, id, DownloadState::Done);
+                    emit_status(&events_tx, id, FileStatus::Done);
                     let _ = events_tx.send(DownloadEvent::Completed { id });
                 }
                 Err(e) => {
                     warn!(%id, error = %e, "finalize failed");
-                    emit_state(&events_tx, id, DownloadState::Failed);
+                    emit_status(&events_tx, id, FileStatus::Failed);
                     let _ = events_tx.send(DownloadEvent::Failed {
                         id,
                         error: format!("finalize: {e}"),
@@ -500,13 +500,13 @@ async fn run_engine<S, F>(
         }
         Outcome::Failed(err) => {
             warn!(%id, error = %err, "download failed");
-            emit_state(&events_tx, id, DownloadState::Failed);
+            emit_status(&events_tx, id, FileStatus::Failed);
             let _ = events_tx.send(DownloadEvent::Failed { id, error: err });
         }
         Outcome::Cancelled => {
             info!(%id, "download cancelled — aborting storage");
             let _ = storage.abort().await;
-            emit_state(&events_tx, id, DownloadState::Cancelled);
+            emit_status(&events_tx, id, FileStatus::Cancelled);
         }
     }
 }
@@ -517,8 +517,8 @@ enum Outcome {
     Cancelled,
 }
 
-fn emit_state(tx: &broadcast::Sender<DownloadEvent>, id: DownloadId, state: DownloadState) {
-    let _ = tx.send(DownloadEvent::StateChanged { id, state });
+fn emit_status(tx: &broadcast::Sender<DownloadEvent>, id: DownloadId, status: FileStatus) {
+    let _ = tx.send(DownloadEvent::StatusChanged { id, status });
 }
 
 fn emit_progress(
@@ -1107,8 +1107,8 @@ mod tests {
                 ev,
                 DownloadEvent::Completed { .. }
                     | DownloadEvent::Failed { .. }
-                    | DownloadEvent::StateChanged {
-                        state: DownloadState::Cancelled,
+                    | DownloadEvent::StatusChanged {
+                        status: FileStatus::Cancelled,
                         ..
                     }
             );
@@ -1221,8 +1221,8 @@ mod tests {
         let mut saw_completed = false;
         while let Ok(ev) = rx.recv().await {
             match ev {
-                DownloadEvent::StateChanged {
-                    state: DownloadState::Paused,
+                DownloadEvent::StatusChanged {
+                    status: FileStatus::Paused,
                     ..
                 } => {
                     saw_paused = true;
@@ -1260,8 +1260,8 @@ mod tests {
         while let Ok(ev) = rx.recv().await {
             if matches!(
                 ev,
-                DownloadEvent::StateChanged {
-                    state: DownloadState::Cancelled,
+                DownloadEvent::StatusChanged {
+                    status: FileStatus::Cancelled,
                     ..
                 }
             ) {

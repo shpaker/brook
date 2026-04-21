@@ -1,13 +1,13 @@
 //! Общее SQLite-соединение к `./brook.db`.
 //!
-//! Фундамент миграции на единую БД (см. [docs/todo.md]): один файл,
-//! одно соединение, одна точка применения миграций и PRAGMA. Будущие
-//! репозитории (`SqliteFileRepository`, `SqlitePieceRepository`) берут
+//! Один файл, одно соединение, одна точка применения миграций и PRAGMA.
+//! Репозитории (`SqliteFileRepository`, `SqlitePieceRepository`,
+//! `SqliteWorkerRepository`, `SqlitePieceAttemptRepository`) берут
 //! `SharedDb` и гоняют SQL-замыкания через [`SharedDb::with_conn`].
 //!
 //! ## Конкурентность
 //!
-//! `Arc<Mutex<Connection>>` — ровно как в [`queue.rs`]: `rusqlite`
+//! `Arc<Mutex<Connection>>` — ровно как в `queue.rs`: `rusqlite`
 //! синхронный и его нельзя держать на async-потоке, поэтому любой
 //! публичный async-метод уходит в `tokio::task::spawn_blocking`.
 //!
@@ -15,12 +15,10 @@
 //!
 //! Продукт ещё не запущен, обратной совместимости нет: пустая БД
 //! получает `user_version = 1` и полную схему из
-//! [`docs/schema.dbml`] в одной транзакции. Справочники `states`
+//! [`docs/schema.dbml`] в одной транзакции. Справочники `statuses`
 //! и `reason_codes` заполняются natural-key'ами (имя = PK), чтобы
 //! не тащить бессмысленные суррогатные UUID'ы.
 //!
-//! [`queue.rs`]: super::queue
-//! [docs/todo.md]: ../../../../docs/todo.md
 //! [`docs/schema.dbml`]: ../../../../docs/schema.dbml
 
 use std::path::Path;
@@ -55,22 +53,17 @@ impl SharedDb {
     /// и миграции.
     pub fn open(path: &Path) -> DbResult<Self> {
         let conn = Connection::open(path)?;
-        // WAL имеет смысл только для on-disk БД; для `:memory:`
-        // SQLite молча оставит `memory`, но отдельный путь
-        // для ясности.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::finish_open(conn)
     }
 
-    /// Открыть in-memory БД (для тестов и stage-1 верификации).
+    /// Открыть in-memory БД (для тестов).
     pub fn open_in_memory() -> DbResult<Self> {
         let conn = Connection::open_in_memory()?;
         Self::finish_open(conn)
     }
 
     fn finish_open(mut conn: Connection) -> DbResult<Self> {
-        // `synchronous` и `foreign_keys` ставятся ДО транзакции
-        // миграции — их нельзя менять, пока открыт tx.
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&mut conn)?;
@@ -80,10 +73,6 @@ impl SharedDb {
     }
 
     /// Выполнить замыкание под локом на отдельной blocking-таске.
-    ///
-    /// Единственный способ для внешнего кода прикоснуться к
-    /// `Connection`. Будущие репозитории строят на этом свои
-    /// публичные async-методы.
     pub async fn with_conn<F, T>(&self, f: F) -> DbResult<T>
     where
         F: FnOnce(&mut Connection) -> DbResult<T> + Send + 'static,
@@ -101,7 +90,7 @@ impl SharedDb {
 // ─── Схема и миграция ──────────────────────────────────────────────────
 
 const SCHEMA_V1: &str = "\
-CREATE TABLE IF NOT EXISTS states (
+CREATE TABLE IF NOT EXISTS statuses (
     name TEXT PRIMARY KEY
 );
 
@@ -114,7 +103,10 @@ CREATE TABLE IF NOT EXISTS files (
     url        TEXT    NOT NULL,
     target_dir TEXT    NOT NULL,
     filename   TEXT,
-    state_id   TEXT    NOT NULL REFERENCES states(name),
+    status_id  TEXT    NOT NULL REFERENCES statuses(name)
+                       CHECK (status_id IN
+                           ('pending','running','paused','retrying',
+                            'done','failed','cancelled')),
     created_at INTEGER NOT NULL
 );
 
@@ -130,37 +122,72 @@ CREATE TABLE IF NOT EXISTS file_settings (
     last_modified      TEXT
 );
 
-CREATE TABLE IF NOT EXISTS state_changes (
+CREATE TABLE IF NOT EXISTS status_changes (
     id             TEXT    PRIMARY KEY,
     file_id        TEXT    NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    state_id       TEXT    NOT NULL REFERENCES states(name),
+    status_id      TEXT    NOT NULL REFERENCES statuses(name),
     reason_code_id TEXT    REFERENCES reason_codes(code),
     reason_message TEXT,
     created_at     INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_state_changes_file_time
-    ON state_changes (file_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_status_changes_file_time
+    ON status_changes (file_id, created_at);
 
 CREATE TABLE IF NOT EXISTS pieces (
     id          TEXT    PRIMARY KEY,
     file_id     TEXT    NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     number      INTEGER NOT NULL,
-    status      TEXT    NOT NULL CHECK (status IN ('pending','done')),
+    status_id   TEXT    NOT NULL REFERENCES statuses(name)
+                        CHECK (status_id IN ('pending','running','done')),
     created_at  INTEGER NOT NULL,
     finished_at INTEGER
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_pieces_file_number
     ON pieces (file_id, number);
+
+CREATE TABLE IF NOT EXISTS workers (
+    id          TEXT    PRIMARY KEY,
+    file_id     TEXT    NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    slot_index  INTEGER NOT NULL,
+    status_id   TEXT    NOT NULL REFERENCES statuses(name)
+                        CHECK (status_id IN
+                            ('running','paused','done','failed','cancelled')),
+    started_at  INTEGER NOT NULL,
+    finished_at INTEGER,
+    error       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_workers_file_slot
+    ON workers (file_id, slot_index);
+
+CREATE TABLE IF NOT EXISTS piece_attempts (
+    id          TEXT    PRIMARY KEY,
+    piece_id    TEXT    NOT NULL REFERENCES pieces(id) ON DELETE CASCADE,
+    worker_id   TEXT    NOT NULL REFERENCES workers(id),
+    status_id   TEXT    NOT NULL REFERENCES statuses(name)
+                        CHECK (status_id IN
+                            ('running','paused','done','failed','cancelled')),
+    started_at  INTEGER NOT NULL,
+    finished_at INTEGER,
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    error       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_piece_attempts_piece_time
+    ON piece_attempts (piece_id, started_at);
+
+CREATE INDEX IF NOT EXISTS idx_piece_attempts_worker_time
+    ON piece_attempts (worker_id, started_at);
 ";
 
-/// Набор состояний загрузки (natural key).
-///
-/// `in_progress` у piece'ов — runtime-состояние engine, на диск
-/// не персистится (см. todo §21).
-const STATES: &[&str] = &[
-    "queued",
+/// Единый словарь статусов (natural key). Семь значений — `pending`,
+/// `running`, `paused`, `retrying`, `done`, `failed`, `cancelled`.
+/// Подмножества по сущностям выбираются через `CHECK (status_id IN ...)`
+/// на соответствующих колонках.
+const STATUSES: &[&str] = &[
+    "pending",
     "running",
     "paused",
     "retrying",
@@ -192,8 +219,8 @@ fn migrate(conn: &mut Connection) -> DbResult<()> {
     tx.execute_batch(SCHEMA_V1)?;
 
     {
-        let mut stmt = tx.prepare("INSERT OR IGNORE INTO states (name) VALUES (?1)")?;
-        for name in STATES {
+        let mut stmt = tx.prepare("INSERT OR IGNORE INTO statuses (name) VALUES (?1)")?;
+        for name in STATUSES {
             stmt.execute([name])?;
         }
     }
@@ -243,17 +270,19 @@ mod tests {
 
         let tables = table_names(&conn);
         for t in [
-            "states",
+            "statuses",
             "reason_codes",
             "files",
             "file_settings",
-            "state_changes",
+            "status_changes",
             "pieces",
+            "workers",
+            "piece_attempts",
         ] {
             assert!(tables.iter().any(|n| n == t), "missing table {t}");
         }
 
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM states"), 7);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM statuses"), 7);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 9);
     }
 
@@ -283,7 +312,7 @@ mod tests {
                 .pragma_query_value(None, "user_version", |r| r.get(0))
                 .unwrap();
             assert_eq!(version, 1);
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM states"), 7);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM statuses"), 7);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 9);
         }
     }
@@ -294,20 +323,20 @@ mod tests {
         let conn = db.inner.lock().unwrap();
 
         conn.execute(
-            "INSERT INTO files (id, url, target_dir, filename, state_id, created_at)
-             VALUES ('f1', 'http://x', '/tmp', 'x.bin', 'queued', 0)",
+            "INSERT INTO files (id, url, target_dir, filename, status_id, created_at)
+             VALUES ('f1', 'http://x', '/tmp', 'x.bin', 'pending', 0)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO pieces (id, file_id, number, status, created_at)
+            "INSERT INTO pieces (id, file_id, number, status_id, created_at)
              VALUES ('p1', 'f1', 0, 'pending', 0)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO state_changes (id, file_id, state_id, created_at)
-             VALUES ('sc1', 'f1', 'queued', 0)",
+            "INSERT INTO status_changes (id, file_id, status_id, created_at)
+             VALUES ('sc1', 'f1', 'pending', 0)",
             [],
         )
         .unwrap();
@@ -316,7 +345,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM pieces"), 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM state_changes"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM status_changes"), 0);
     }
 
     #[tokio::test]

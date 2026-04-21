@@ -150,7 +150,7 @@ fn init_impl(conn: &mut Connection, file_id: DownloadId, count: u32) -> PiecesRe
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO pieces (id, file_id, number, status, created_at)
+            "INSERT INTO pieces (id, file_id, number, status_id, created_at)
              VALUES (?, ?, ?, 'pending', ?)",
         )?;
         for n in 0..count {
@@ -182,7 +182,7 @@ fn count_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesResult<u32> {
 fn pending_numbers_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesResult<Vec<u32>> {
     let mut stmt = conn.prepare(
         "SELECT number FROM pieces
-         WHERE file_id = ? AND status = 'pending'
+         WHERE file_id = ? AND status_id = 'pending'
          ORDER BY number",
     )?;
     let rows = stmt.query_map(params![file_id.to_string()], |row| {
@@ -208,7 +208,7 @@ fn commit_done_batch_impl(
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(
-            "UPDATE pieces SET status = 'done', finished_at = ?
+            "UPDATE pieces SET status_id = 'done', finished_at = ?
              WHERE file_id = ? AND number = ?",
         )?;
         for &n in numbers {
@@ -313,13 +313,13 @@ mod tests {
             .with_conn(move |c| {
                 let done_with_ts: i64 = c.query_row(
                     "SELECT COUNT(*) FROM pieces
-                     WHERE file_id = ? AND status = 'done' AND finished_at IS NOT NULL",
+                     WHERE file_id = ? AND status_id = 'done' AND finished_at IS NOT NULL",
                     params![id_str.clone()],
                     |r| r.get(0),
                 )?;
                 let pending_with_ts: i64 = c.query_row(
                     "SELECT COUNT(*) FROM pieces
-                     WHERE file_id = ? AND status = 'pending' AND finished_at IS NOT NULL",
+                     WHERE file_id = ? AND status_id = 'pending' AND finished_at IS NOT NULL",
                     params![id_str],
                     |r| r.get(0),
                 )?;

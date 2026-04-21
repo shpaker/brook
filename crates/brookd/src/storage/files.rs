@@ -10,11 +10,11 @@
 //! (см. [`docs/schema.dbml`]):
 //!
 //! - `files` — «шапка»: `id`, `url`, `target_dir`, `filename`,
-//!   текущее `state_id`, `created_at`.
+//!   текущее `status_id`, `created_at`.
 //! - `file_settings` (1:1) — override-поля spec'а (`workers`,
 //!   `piece_*`) + inspect-поля (`total_size`, `piece_size`, `etag`,
 //!   `last_modified`; NULL до stage 6, когда их пишет фабрика).
-//! - `state_changes` — полный аудит переходов: `reason_code_id` +
+//! - `status_changes` — полный аудит переходов: `reason_code_id` +
 //!   `reason_message` живут только тут; колонки в `files` их не дублируют.
 //!
 //! Собственной миграции у репозитория нет — схема + сиды справочников
@@ -44,9 +44,9 @@ use brook_core::{
     Download,
     DownloadId,
     DownloadSpec,
-    DownloadState,
     Error,
     FailureReason,
+    FileStatus,
     OnFileExistsOverride,
     Progress,
     Result as CoreResult,
@@ -157,18 +157,18 @@ impl TQueueStore for SqliteFileRepository {
         async move { run(&db, move |c| insert_impl(c, &d)).await }
     }
 
-    fn update_state(
+    fn update_status(
         &self,
         id: DownloadId,
-        state: DownloadState,
+        state: FileStatus,
         reason: Option<FailureReason>,
     ) -> impl std::future::Future<Output = CoreResult<()>> + Send {
         let db = self.db.clone();
         async move {
-            if matches!(state, DownloadState::Failed) && reason.is_none() {
+            if matches!(state, FileStatus::Failed) && reason.is_none() {
                 return Err(FilesError::MissingFailureReason.into());
             }
-            run(&db, move |c| update_state_impl(c, id, state, reason)).await
+            run(&db, move |c| update_status_impl(c, id, state, reason)).await
         }
     }
 
@@ -202,14 +202,14 @@ fn insert_impl(conn: &mut Connection, d: &Download) -> FilesResult<()> {
     let tx = conn.transaction()?;
     let res = tx.execute(
         "INSERT INTO files
-           (id, url, target_dir, filename, state_id, created_at)
+           (id, url, target_dir, filename, status_id, created_at)
          VALUES (?,?,?,?,?,?)",
         params![
             d.id.to_string(),
             d.spec.url,
             target_dir,
             d.spec.filename,
-            d.state.as_str(),
+            d.status.as_str(),
             created_at,
         ],
     );
@@ -237,22 +237,22 @@ fn insert_impl(conn: &mut Connection, d: &Download) -> FilesResult<()> {
         ],
     )?;
 
-    insert_state_change(&tx, d.id, d.state, None, created_at)?;
+    insert_status_change(&tx, d.id, d.status, None, created_at)?;
 
     tx.commit()?;
     Ok(())
 }
 
-fn update_state_impl(
+fn update_status_impl(
     conn: &mut Connection,
     id: DownloadId,
-    state: DownloadState,
+    state: FileStatus,
     reason: Option<FailureReason>,
 ) -> FilesResult<()> {
     let now = unix_secs(SystemTime::now());
     let tx = conn.transaction()?;
     let n = tx.execute(
-        "UPDATE files SET state_id = ? WHERE id = ?",
+        "UPDATE files SET status_id = ? WHERE id = ?",
         params![state.as_str(), id.to_string()],
     )?;
     if n == 0 {
@@ -260,23 +260,23 @@ fn update_state_impl(
         // но формально — rollback).
         return Err(FilesError::NotFound);
     }
-    insert_state_change(&tx, id, state, reason.as_ref(), now)?;
+    insert_status_change(&tx, id, state, reason.as_ref(), now)?;
     tx.commit()?;
     Ok(())
 }
 
-fn insert_state_change(
+fn insert_status_change(
     tx: &Transaction<'_>,
     id: DownloadId,
-    state: DownloadState,
+    state: FileStatus,
     reason: Option<&FailureReason>,
     at: i64,
 ) -> FilesResult<()> {
     let reason_code = reason.map(|r| r.code.as_str());
     let reason_message = reason.and_then(|r| r.message.as_deref());
     tx.execute(
-        "INSERT INTO state_changes
-           (id, file_id, state_id, reason_code_id, reason_message, created_at)
+        "INSERT INTO status_changes
+           (id, file_id, status_id, reason_code_id, reason_message, created_at)
          VALUES (?,?,?,?,?,?)",
         params![
             Uuid::new_v4().to_string(),
@@ -300,7 +300,7 @@ fn remove_impl(conn: &mut Connection, id: DownloadId) -> FilesResult<()> {
 
 fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<Download>> {
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.url, f.target_dir, f.filename, f.state_id, f.created_at,
+        "SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at,
                 s.workers, s.piece_target_count, s.piece_size_min, s.piece_size_max
          FROM files f
          JOIN file_settings s ON s.file_id = f.id
@@ -313,7 +313,7 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<Download>> {
                 url: row.get(1)?,
                 target_dir: row.get(2)?,
                 filename: row.get(3)?,
-                state: row.get(4)?,
+                status: row.get(4)?,
                 created_at: row.get::<_, i64>(5)?,
                 workers: row.get::<_, i64>(6)? as u32,
                 piece_target_count: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
@@ -323,13 +323,13 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<Download>> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    // Второй запрос — последняя строка `state_changes` по каждому файлу.
+    // Второй запрос — последняя строка `status_changes` по каждому файлу.
     // Нужен, чтобы восстановить `updated_at` и (для failed) `error`.
     // Для небольшой очереди (единицы-сотни строк) отдельный проход дешевле
     // жонглирования сложным JOIN'ом с оконной функцией.
     let mut last_stmt = conn.prepare(
         "SELECT created_at, reason_message
-         FROM state_changes
+         FROM status_changes
          WHERE file_id = ?
          ORDER BY created_at DESC, rowid DESC
          LIMIT 1",
@@ -419,7 +419,7 @@ struct RawRow {
     url: String,
     target_dir: String,
     filename: Option<String>,
-    state: String,
+    status: String,
     created_at: i64,
     workers: u32,
     piece_target_count: Option<u32>,
@@ -435,10 +435,10 @@ fn row_to_download(
     let id: DownloadId =
         r.id.parse()
             .map_err(|e| FilesError::Corrupt(format!("id: {e}")))?;
-    let state: DownloadState = r
-        .state
+    let status: FileStatus = r
+        .status
         .parse()
-        .map_err(|e| FilesError::Corrupt(format!("state: {e}")))?;
+        .map_err(|e| FilesError::Corrupt(format!("status: {e}")))?;
     let spec = DownloadSpec {
         url: r.url,
         target_dir: PathBuf::from(r.target_dir),
@@ -450,7 +450,7 @@ fn row_to_download(
         // Override-хинт — transient, не персистится.
         on_file_exists_override: OnFileExistsOverride::Unspecified,
     };
-    let error = if matches!(state, DownloadState::Failed) {
+    let error = if matches!(status, FileStatus::Failed) {
         last_reason_message
     } else {
         None
@@ -458,7 +458,7 @@ fn row_to_download(
     Ok(Download {
         id,
         spec,
-        state,
+        status,
         progress: Progress::default(),
         attempt: 0,
         error,
@@ -497,8 +497,8 @@ mod tests {
         Download,
         DownloadId,
         DownloadSpec,
-        DownloadState,
         FailureReason,
+        FileStatus,
         ReasonCode,
         TQueueStore,
     };
@@ -537,15 +537,15 @@ mod tests {
         let got = &loaded[0];
         assert_eq!(got.id, id);
         assert_eq!(got.spec, d.spec);
-        assert_eq!(got.state, DownloadState::Queued);
+        assert_eq!(got.status, FileStatus::Pending);
         assert_eq!(got.attempt, 0);
         assert!(got.error.is_none());
 
-        repo.update_state(id, DownloadState::Running, None)
+        repo.update_status(id, FileStatus::Running, None)
             .await
             .unwrap();
         let loaded = repo.load_all().await.unwrap();
-        assert_eq!(loaded[0].state, DownloadState::Running);
+        assert_eq!(loaded[0].status, FileStatus::Running);
         assert!(loaded[0].updated_at >= loaded[0].created_at);
 
         repo.remove(id).await.unwrap();
@@ -553,96 +553,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_writes_initial_state_change() {
+    async fn insert_writes_initial_status_change() {
         let (db, repo) = fresh_repo();
         let d = sample_download();
         repo.insert(&d).await.unwrap();
 
         let id_str = d.id.to_string();
-        let (cnt, state_id, reason): (i64, String, Option<String>) = db
+        let (cnt, status_id, reason): (i64, String, Option<String>) = db
             .with_conn(move |c| {
                 let cnt: i64 = c.query_row(
-                    "SELECT COUNT(*) FROM state_changes WHERE file_id = ?",
+                    "SELECT COUNT(*) FROM status_changes WHERE file_id = ?",
                     params![id_str],
                     |r| r.get(0),
                 )?;
                 let id_str2 = d.id.to_string();
-                let (state_id, reason): (String, Option<String>) = c.query_row(
-                    "SELECT state_id, reason_code_id FROM state_changes WHERE file_id = ?",
+                let (status_id, reason): (String, Option<String>) = c.query_row(
+                    "SELECT status_id, reason_code_id FROM status_changes WHERE file_id = ?",
                     params![id_str2],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
-                Ok((cnt, state_id, reason))
+                Ok((cnt, status_id, reason))
             })
             .await
             .unwrap();
         assert_eq!(cnt, 1);
-        assert_eq!(state_id, "queued");
+        assert_eq!(status_id, "pending");
         assert!(reason.is_none());
     }
 
     #[tokio::test]
-    async fn update_state_failed_writes_reason_atomically() {
+    async fn update_status_failed_writes_reason_atomically() {
         let (db, repo) = fresh_repo();
         let d = sample_download();
         let id = d.id;
         repo.insert(&d).await.unwrap();
 
         let reason = FailureReason::with_message(ReasonCode::Timeout, "deadline 30s");
-        repo.update_state(id, DownloadState::Failed, Some(reason))
+        repo.update_status(id, FileStatus::Failed, Some(reason))
             .await
             .unwrap();
 
         let id_str = id.to_string();
-        let (files_state, reason_code, reason_msg): (String, String, Option<String>) = db
+        let (files_status, reason_code, reason_msg): (String, String, Option<String>) = db
             .with_conn(move |c| {
-                let files_state: String = c.query_row(
-                    "SELECT state_id FROM files WHERE id = ?",
+                let files_status: String = c.query_row(
+                    "SELECT status_id FROM files WHERE id = ?",
                     params![id_str.clone()],
                     |r| r.get(0),
                 )?;
                 let (code, msg): (String, Option<String>) = c.query_row(
                     "SELECT reason_code_id, reason_message
-                       FROM state_changes
+                       FROM status_changes
                       WHERE file_id = ?
                       ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     params![id_str],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
-                Ok((files_state, code, msg))
+                Ok((files_status, code, msg))
             })
             .await
             .unwrap();
-        assert_eq!(files_state, "failed");
+        assert_eq!(files_status, "failed");
         assert_eq!(reason_code, "timeout");
         assert_eq!(reason_msg.as_deref(), Some("deadline 30s"));
 
         let loaded = repo.load_all().await.unwrap();
-        assert_eq!(loaded[0].state, DownloadState::Failed);
+        assert_eq!(loaded[0].status, FileStatus::Failed);
         assert_eq!(loaded[0].error.as_deref(), Some("deadline 30s"));
     }
 
     #[tokio::test]
-    async fn update_state_failed_without_reason_errors() {
+    async fn update_status_failed_without_reason_errors() {
         let (_db, repo) = fresh_repo();
         let d = sample_download();
         let id = d.id;
         repo.insert(&d).await.unwrap();
 
         let err = repo
-            .update_state(id, DownloadState::Failed, None)
+            .update_status(id, FileStatus::Failed, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("failed transition"), "{err}");
 
         // Состояние не изменилось.
         let loaded = repo.load_all().await.unwrap();
-        assert_eq!(loaded[0].state, DownloadState::Queued);
+        assert_eq!(loaded[0].status, FileStatus::Pending);
     }
 
     #[tokio::test]
-    async fn update_state_rolls_back_on_state_changes_failure() {
-        // Валим INSERT `state_changes` через FK: удаляем строку 'retrying'
+    async fn update_status_rolls_back_on_status_changes_failure() {
+        // Валим INSERT `status_changes` через FK: удаляем строку 'retrying'
         // из справочника `states`; UPDATE `files` пройдёт (там state
         // валидный), а INSERT в историю с тем же state упадёт на FK.
         let (db, repo) = fresh_repo();
@@ -651,7 +651,7 @@ mod tests {
         repo.insert(&d).await.unwrap();
 
         db.with_conn(|c| {
-            c.execute("DELETE FROM states WHERE name = 'retrying'", [])
+            c.execute("DELETE FROM statuses WHERE name = 'retrying'", [])
                 .map_err(Into::into)
                 .map(|_| ())
         })
@@ -659,7 +659,7 @@ mod tests {
         .unwrap();
 
         let err = repo
-            .update_state(id, DownloadState::Retrying, None)
+            .update_status(id, FileStatus::Retrying, None)
             .await
             .unwrap_err();
         assert!(
@@ -667,12 +667,12 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        // `files.state_id` не сдвинулся — UPDATE откатился вместе с транзакцией.
+        // `files.status_id` не сдвинулся — UPDATE откатился вместе с транзакцией.
         let id_str = id.to_string();
-        let state: String = db
+        let status: String = db
             .with_conn(move |c| {
                 c.query_row(
-                    "SELECT state_id FROM files WHERE id = ?",
+                    "SELECT status_id FROM files WHERE id = ?",
                     params![id_str],
                     |r| r.get::<_, String>(0),
                 )
@@ -680,14 +680,14 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(state, "queued");
+        assert_eq!(status, "pending");
     }
 
     #[tokio::test]
-    async fn update_state_missing_is_not_found() {
+    async fn update_status_missing_is_not_found() {
         let (_db, repo) = fresh_repo();
         let err = repo
-            .update_state(DownloadId::new(), DownloadState::Paused, None)
+            .update_status(DownloadId::new(), FileStatus::Paused, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound));
@@ -711,7 +711,7 @@ mod tests {
         let id_str = id.to_string();
         db.with_conn(move |c| {
             c.execute(
-                "INSERT INTO pieces (id, file_id, number, status, created_at)
+                "INSERT INTO pieces (id, file_id, number, status_id, created_at)
                  VALUES (?, ?, 0, 'pending', 0)",
                 params![Uuid::new_v4().to_string(), id_str],
             )
@@ -721,7 +721,7 @@ mod tests {
         .await
         .unwrap();
 
-        repo.update_state(id, DownloadState::Paused, None)
+        repo.update_status(id, FileStatus::Paused, None)
             .await
             .unwrap();
         repo.remove(id).await.unwrap();
@@ -735,7 +735,7 @@ mod tests {
                 Ok((
                     q("SELECT COUNT(*) FROM files WHERE id = ?")?,
                     q("SELECT COUNT(*) FROM file_settings WHERE file_id = ?")?,
-                    q("SELECT COUNT(*) FROM state_changes WHERE file_id = ?")?,
+                    q("SELECT COUNT(*) FROM status_changes WHERE file_id = ?")?,
                     q("SELECT COUNT(*) FROM pieces WHERE file_id = ?")?,
                 ))
             })

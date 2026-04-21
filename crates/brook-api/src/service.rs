@@ -282,7 +282,7 @@ where
                         for d in manager
                             .snapshot()
                             .iter()
-                            .filter(|d| !d.state.is_terminal())
+                            .filter(|d| !d.status.is_terminal())
                         {
                             yield mapper::snapshot_event(d);
                         }

@@ -24,7 +24,7 @@ async fn wait_until_terminal(
     h: &common::TestHarness,
     id: &proto::DownloadId,
     timeout: Duration,
-) -> proto::DownloadState {
+) -> proto::DownloadStatus {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let list = h
@@ -39,12 +39,12 @@ async fn wait_until_terminal(
             .iter()
             .find(|d| d.id.as_ref().map(|x| x.value == id.value).unwrap_or(false))
         {
-            let state = proto::DownloadState::try_from(d.state).unwrap();
+            let state = proto::DownloadStatus::try_from(d.status).unwrap();
             if matches!(
                 state,
-                proto::DownloadState::Done
-                    | proto::DownloadState::Failed
-                    | proto::DownloadState::Cancelled
+                proto::DownloadStatus::Done
+                    | proto::DownloadStatus::Failed
+                    | proto::DownloadStatus::Cancelled
             ) {
                 return state;
             }
@@ -88,7 +88,10 @@ async fn add_list_cancel_remove_roundtrip() {
         .unwrap()
         .into_inner();
     assert_eq!(list.downloads.len(), 1);
-    assert_eq!(list.downloads[0].state, proto::DownloadState::Queued as i32);
+    assert_eq!(
+        list.downloads[0].status,
+        proto::DownloadStatus::Pending as i32
+    );
 
     // Cancel.
     let status = h
@@ -109,8 +112,8 @@ async fn add_list_cancel_remove_roundtrip() {
         .unwrap()
         .into_inner();
     assert_eq!(
-        list.downloads[0].state,
-        proto::DownloadState::Cancelled as i32
+        list.downloads[0].status,
+        proto::DownloadStatus::Cancelled as i32
     );
 
     // Remove после отмены — ок.
@@ -155,7 +158,10 @@ async fn pause_and_resume_unqueued() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(list.downloads[0].state, proto::DownloadState::Paused as i32);
+    assert_eq!(
+        list.downloads[0].status,
+        proto::DownloadStatus::Paused as i32
+    );
 
     h.client
         .resume(proto::IdRequest {
@@ -169,7 +175,10 @@ async fn pause_and_resume_unqueued() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(list.downloads[0].state, proto::DownloadState::Queued as i32);
+    assert_eq!(
+        list.downloads[0].status,
+        proto::DownloadStatus::Pending as i32
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -192,7 +201,7 @@ async fn pause_all_and_resume_all() {
         .unwrap()
         .into_inner();
     for d in &list.downloads {
-        assert_eq!(d.state, proto::DownloadState::Paused as i32);
+        assert_eq!(d.status, proto::DownloadStatus::Paused as i32);
     }
 
     h.client
@@ -206,7 +215,7 @@ async fn pause_all_and_resume_all() {
         .unwrap()
         .into_inner();
     for d in &list.downloads {
-        assert_eq!(d.state, proto::DownloadState::Queued as i32);
+        assert_eq!(d.status, proto::DownloadStatus::Pending as i32);
     }
 }
 
@@ -225,7 +234,7 @@ async fn download_runs_to_completion() {
         .id
         .unwrap();
     let final_state = wait_until_terminal(&h, &id, Duration::from_secs(5)).await;
-    assert_eq!(final_state, proto::DownloadState::Done);
+    assert_eq!(final_state, proto::DownloadStatus::Done);
 }
 
 #[tokio::test(flavor = "multi_thread")]
