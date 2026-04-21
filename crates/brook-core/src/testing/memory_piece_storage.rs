@@ -36,7 +36,7 @@ use crate::ports::{
 /// Порядок работы типичного теста:
 /// 1. `MemoryPieceStorage::new(piece_count, piece_size)` — «преаллокация».
 /// 2. `write_piece_bytes(...)` — воркеры складывают байты.
-/// 3. `commit_batch(...)` — помечаем готовыми.
+/// 3. `commit_done(...)` — помечаем готовыми.
 /// 4. `finalize()` или `abort()` — завершаем.
 /// 5. Ассерты через [`MemoryPieceStorage::snapshot`].
 pub struct MemoryPieceStorage {
@@ -52,7 +52,7 @@ struct Inner {
     /// Накопленные байты по piece'ам — `piece_index -> буфер размера piece_size`.
     /// Буфер создаётся лениво при первой записи в piece.
     buffers: HashMap<u32, Vec<u8>>,
-    /// Piece'ы, для которых был вызван `commit_batch`.
+    /// Piece'ы, для которых был вызван `commit_done`.
     committed: HashSet<u32>,
     /// Стал ли `finalize`d — после этого операции записи запрещены.
     finalized: bool,
@@ -150,20 +150,18 @@ impl TPieceStorage for MemoryPieceStorage {
         Ok(())
     }
 
-    async fn commit_batch(&self, piece_indices: &[u32]) -> Result<()> {
+    async fn commit_done(&self, piece_index: u32) -> Result<()> {
         let mut inner = self.inner.lock().expect("mutex poisoned");
         if inner.finalized || inner.aborted {
             return Err(Error::Other("commit after finalize/abort".into()));
         }
-        for idx in piece_indices {
-            if *idx >= inner.piece_count {
-                return Err(Error::Other(format!(
-                    "commit: piece_index {idx} out of range (count = {})",
-                    inner.piece_count
-                )));
-            }
-            inner.committed.insert(*idx);
+        if piece_index >= inner.piece_count {
+            return Err(Error::Other(format!(
+                "commit: piece_index {piece_index} out of range (count = {})",
+                inner.piece_count
+            )));
         }
+        inner.committed.insert(piece_index);
         Ok(())
     }
 
@@ -295,14 +293,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Коммит — батчем на два куска.
-        storage.commit_batch(&[0, 1]).await.unwrap();
+        storage.commit_done(0).await.unwrap();
+        storage.commit_done(1).await.unwrap();
         assert_eq!(storage.pending_pieces().await.unwrap(), vec![2]);
 
         // Финализация раньше времени — ошибка, piece 2 ещё не закоммичен.
         assert!(storage.finalize().await.is_err());
 
-        storage.commit_batch(&[2]).await.unwrap();
+        storage.commit_done(2).await.unwrap();
         assert!(storage.pending_pieces().await.unwrap().is_empty());
 
         // Теперь finalize проходит.
@@ -323,7 +321,7 @@ mod tests {
     async fn write_after_finalize_is_rejected() {
         let s = MemoryPieceStorage::new(1, 2);
         s.write_piece_bytes(0, 0, &[1, 2]).await.unwrap();
-        s.commit_batch(&[0]).await.unwrap();
+        s.commit_done(0).await.unwrap();
         s.finalize().await.unwrap();
         assert!(s.write_piece_bytes(0, 0, &[3, 4]).await.is_err());
     }
@@ -332,14 +330,14 @@ mod tests {
     async fn abort_wipes_state_and_blocks_commit() {
         let s = MemoryPieceStorage::new(2, 4);
         s.write_piece_bytes(0, 0, &[1, 2, 3, 4]).await.unwrap();
-        s.commit_batch(&[0]).await.unwrap();
+        s.commit_done(0).await.unwrap();
         s.abort().await.unwrap();
 
         let snap = s.snapshot();
         assert!(snap.aborted);
         assert!(snap.committed.is_empty());
         assert_eq!(s.assembled_bytes(), Vec::<u8>::new());
-        assert!(s.commit_batch(&[1]).await.is_err());
+        assert!(s.commit_done(1).await.is_err());
     }
 
     #[tokio::test]
@@ -363,7 +361,7 @@ mod tests {
         assert!(a.accepts_ranges);
 
         a.storage.write_piece_bytes(0, 0, &[1, 2, 3]).await.unwrap();
-        a.storage.commit_batch(&[0]).await.unwrap();
+        a.storage.commit_done(0).await.unwrap();
 
         // У `b` ничего не закоммичено — инстансы независимы.
         assert_eq!(a.storage.pending_pieces().await.unwrap(), vec![1]);

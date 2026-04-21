@@ -140,8 +140,6 @@ pub struct EngineConfig {
     /// копится, пока не перевалит за этот порог, затем — `write_piece_bytes`.
     /// Разумный диапазон 64–256 KiB.
     pub write_buffer: usize,
-    /// Через сколько закоммиченных piece'ов делать `commit_batch`.
-    pub commit_every: usize,
     /// Интервал агрегата `Progress`.
     pub progress_interval: Duration,
     /// Политика повторов для воркеров.
@@ -154,7 +152,6 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             write_buffer: 128 * 1024,
-            commit_every: 16,
             progress_interval: Duration::from_millis(200),
             retry: RetryPolicy::default(),
             events_capacity: 1024,
@@ -417,7 +414,6 @@ async fn run_engine<S, F, WR, AR>(
     drop(worker_tx);
 
     // Главный цикл супервизора.
-    let mut commit_buffer: Vec<u32> = Vec::with_capacity(config.commit_every);
     let mut progress_tick = tokio::time::interval(config.progress_interval);
     progress_tick.tick().await; // первый tick — мгновенный, пропускаем.
     let mut pieces_committed: usize = 0;
@@ -459,18 +455,14 @@ async fn run_engine<S, F, WR, AR>(
             Some(msg) = worker_rx.recv() => {
                 match msg {
                     WorkerMsg::PieceDone { piece: idx, .. } => {
-                        commit_buffer.push(idx);
-                        if commit_buffer.len() >= config.commit_every {
-                            if let Err(e) = storage.commit_batch(&commit_buffer).await {
-                                final_outcome = Some(Outcome::Failed(format!("commit: {e}")));
-                                let _ = state_tx.send(RunState::Stopping);
-                                break;
-                            }
-                            pieces_committed += commit_buffer.len();
-                            commit_buffer.clear();
-                            emit_progress(&events_tx, id, &bytes_done, &inputs,
-                                          pieces_committed as u32, total_pieces);
+                        if let Err(e) = storage.commit_done(idx).await {
+                            final_outcome = Some(Outcome::Failed(format!("commit: {e}")));
+                            let _ = state_tx.send(RunState::Stopping);
+                            break;
                         }
+                        pieces_committed += 1;
+                        emit_progress(&events_tx, id, &bytes_done, &inputs,
+                                      pieces_committed as u32, total_pieces);
                     }
                     WorkerMsg::Failed(err) => {
                         warn!(%id, error = %err, "worker reported failure");
@@ -534,7 +526,13 @@ async fn run_engine<S, F, WR, AR>(
     // репозитория до engine-финализации.
     while let Ok(msg) = worker_rx.try_recv() {
         match msg {
-            WorkerMsg::PieceDone { piece: idx, .. } => commit_buffer.push(idx),
+            WorkerMsg::PieceDone { piece: idx, .. } => {
+                if let Err(e) = storage.commit_done(idx).await {
+                    warn!(%id, piece = idx, error = %e, "commit on drain failed");
+                } else {
+                    pieces_committed += 1;
+                }
+            }
             WorkerMsg::AttemptStarted { worker_id, piece } => {
                 match attempts_repo.start(id, piece, worker_id).await {
                     Ok(rec) => {
@@ -570,34 +568,18 @@ async fn run_engine<S, F, WR, AR>(
     }
 
     if final_outcome.is_none() {
-        // Нормальный сход: финальный commit + finalize.
-        if !commit_buffer.is_empty() {
-            if let Err(e) = storage.commit_batch(&commit_buffer).await {
-                final_outcome = Some(Outcome::Failed(format!("commit: {e}")));
-            } else {
-                pieces_committed += commit_buffer.len();
-                commit_buffer.clear();
+        // Нормальный сход: finalize.
+        match storage.pending_pieces().await {
+            Ok(p) if p.is_empty() => final_outcome = Some(Outcome::Completed),
+            Ok(_) if total_pieces_expected > 0 && pieces_committed == 0 => {
+                // Воркеры завершились, ничего не скачав — это отказ.
+                final_outcome = Some(Outcome::Failed("workers exited without progress".into()));
             }
-        }
-        if final_outcome.is_none() {
-            match storage.pending_pieces().await {
-                Ok(p) if p.is_empty() => final_outcome = Some(Outcome::Completed),
-                Ok(_) if total_pieces_expected > 0 && pieces_committed == 0 => {
-                    // Воркеры завершились, ничего не скачав — это отказ.
-                    final_outcome = Some(Outcome::Failed("workers exited without progress".into()));
-                }
-                Ok(_) => {
-                    // Остались pending, но воркеры молча вышли — тоже fail.
-                    final_outcome =
-                        Some(Outcome::Failed("workers exited before completion".into()));
-                }
-                Err(e) => final_outcome = Some(Outcome::Failed(format!("pending: {e}"))),
+            Ok(_) => {
+                // Остались pending, но воркеры молча вышли — тоже fail.
+                final_outcome = Some(Outcome::Failed("workers exited before completion".into()));
             }
-        }
-    } else {
-        // При Cancel/Failed делаем best-effort commit того, что успели.
-        if !commit_buffer.is_empty() {
-            let _ = storage.commit_batch(&commit_buffer).await;
+            Err(e) => final_outcome = Some(Outcome::Failed(format!("pending: {e}"))),
         }
     }
 
@@ -1341,7 +1323,6 @@ mod tests {
     fn fast_config() -> EngineConfig {
         EngineConfig {
             write_buffer: 16,
-            commit_every: 2,
             progress_interval: Duration::from_millis(40),
             retry: RetryPolicy {
                 base: Duration::from_millis(5),

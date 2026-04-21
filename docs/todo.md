@@ -111,8 +111,8 @@ sidecar-индекс `<name>.index.brook`. Рядом с таргетом ост
       «count == expected» нужен потому, что фабрика пишет inspect
       ДО `open`: иначе старые piece-строки совпадали бы с уже
       обновлёнными inspect-полями и резюмировали по чужой нарезке
-- [x] `commit_batch(numbers)`: `sync_data()` **до**
-      `commit_done_batch(id, numbers)`
+- [x] `commit_done(number)`: `sync_data()` **до**
+      `commit_done(id, number)` в репозитории
 - [x] `finalize`: `sync_all` → `rename .data.brook → target`
       → `delete_all(id)`; переход в `done` делает engine
       через `TQueueStore::update_state`

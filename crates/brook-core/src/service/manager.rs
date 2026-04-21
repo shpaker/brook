@@ -712,7 +712,6 @@ mod tests {
     fn fast_engine_config() -> EngineConfig {
         EngineConfig {
             write_buffer: 16,
-            commit_every: 2,
             progress_interval: Duration::from_millis(40),
             retry: RetryPolicy {
                 base: Duration::from_millis(5),

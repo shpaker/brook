@@ -290,7 +290,7 @@ impl TPieceStorage for LocalPieceStorage {
         .map_err(|e| Error::Other(format!("join: {e}")))?
     }
 
-    async fn commit_batch(&self, piece_indices: &[u32]) -> Result<()> {
+    async fn commit_done(&self, piece_index: u32) -> Result<()> {
         // Сначала fsync самих байт — иначе после краша БД будет
         // врать, что piece готов, а данных на диске нет. Инвариант
         // «commit ⇒ persisted» держится именно этим порядком:
@@ -313,7 +313,7 @@ impl TPieceStorage for LocalPieceStorage {
         must_check?;
 
         self.pieces_repo
-            .commit_done_batch(self.file_id, piece_indices.to_vec())
+            .commit_done(self.file_id, piece_index)
             .await
             .map_err(piece_err)
     }
@@ -485,7 +485,9 @@ mod tests {
         s.write_piece_bytes(1, 0, b"CCCCDDDD").await.unwrap();
         s.write_piece_bytes(2, 0, b"EEEE").await.unwrap();
 
-        s.commit_batch(&[0, 1, 2]).await.unwrap();
+        s.commit_done(0).await.unwrap();
+        s.commit_done(1).await.unwrap();
+        s.commit_done(2).await.unwrap();
         assert!(s.pending_pieces().await.unwrap().is_empty());
 
         s.finalize().await.unwrap();
@@ -519,7 +521,8 @@ mod tests {
             .unwrap();
             s.write_piece_bytes(0, 0, b"AAAABBBB").await.unwrap();
             s.write_piece_bytes(1, 0, b"CCCCDDDD").await.unwrap();
-            s.commit_batch(&[0, 1]).await.unwrap();
+            s.commit_done(0).await.unwrap();
+            s.commit_done(1).await.unwrap();
         }
         // Имитируем рестарт демона: сборка repo заново, но БД та же
         // и `.data.brook` остался.
@@ -538,7 +541,7 @@ mod tests {
         assert_eq!(s.pending_pieces().await.unwrap(), vec![2]);
 
         s.write_piece_bytes(2, 0, b"EEEE").await.unwrap();
-        s.commit_batch(&[2]).await.unwrap();
+        s.commit_done(2).await.unwrap();
         s.finalize().await.unwrap();
 
         assert_eq!(
@@ -553,7 +556,7 @@ mod tests {
         let (_db, _files, pieces, id, s) = open_fresh(dir.path(), "a.bin").await;
 
         s.write_piece_bytes(0, 0, b"AAAABBBB").await.unwrap();
-        s.commit_batch(&[0]).await.unwrap();
+        s.commit_done(0).await.unwrap();
         s.abort().await.unwrap();
 
         assert!(!dir.path().join("a.bin.data.brook").exists());
@@ -561,7 +564,7 @@ mod tests {
         assert!(!pieces.is_initialized(id).await.unwrap());
 
         assert!(s.write_piece_bytes(1, 0, b"CC").await.is_err());
-        assert!(s.commit_batch(&[1]).await.is_err());
+        assert!(s.commit_done(1).await.is_err());
     }
 
     #[tokio::test]
@@ -583,7 +586,7 @@ mod tests {
             .await
             .unwrap();
             s.write_piece_bytes(0, 0, b"XXXXYYYY").await.unwrap();
-            s.commit_batch(&[0]).await.unwrap();
+            s.commit_done(0).await.unwrap();
         }
 
         // Меняем inspect-поля (как будто фабрика перезаписала после
@@ -636,7 +639,7 @@ mod tests {
             .await
             .unwrap();
             s.write_piece_bytes(0, 0, b"AAAABBBB").await.unwrap();
-            s.commit_batch(&[0]).await.unwrap();
+            s.commit_done(0).await.unwrap();
         }
         let s = LocalPieceStorage::open(
             dir.path(),
@@ -660,11 +663,13 @@ mod tests {
         s.write_piece_bytes(0, 0, b"AAAABBBB").await.unwrap();
         s.write_piece_bytes(1, 0, b"CCCCDDDD").await.unwrap();
         s.write_piece_bytes(2, 0, b"EEEE").await.unwrap();
-        s.commit_batch(&[0, 1, 2]).await.unwrap();
+        s.commit_done(0).await.unwrap();
+        s.commit_done(1).await.unwrap();
+        s.commit_done(2).await.unwrap();
         s.finalize().await.unwrap();
 
         assert!(s.write_piece_bytes(0, 0, b"ZZZZ").await.is_err());
-        assert!(s.commit_batch(&[0]).await.is_err());
+        assert!(s.commit_done(0).await.is_err());
     }
 
     // Use PathBuf to silence unused-import lints across platforms.
