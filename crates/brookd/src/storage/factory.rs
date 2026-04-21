@@ -35,6 +35,7 @@ use brook_core::{
     Error,
     OnFileExistsOverride,
     PreparedDownload,
+    PreparedMode,
     RangeGuard,
     Result,
     THttpInspect,
@@ -42,7 +43,10 @@ use brook_core::{
 };
 
 use super::files::SqliteFileRepository;
-use super::local::LocalPieceStorage;
+use super::local::{
+    LocalPieceStorage,
+    LocalStreamStorage,
+};
 use super::paths::validate_filename;
 use super::pieces::SqlitePieceRepository;
 use super::plan::{
@@ -84,12 +88,15 @@ where
     I: THttpInspect + ?Sized + Send + Sync + 'static,
 {
     type Storage = LocalPieceStorage;
+    type StreamStorage = LocalStreamStorage;
 
     fn prepare(
         &self,
         id: DownloadId,
         spec: &DownloadSpec,
-    ) -> impl std::future::Future<Output = Result<PreparedDownload<Self::Storage>>> + Send {
+    ) -> impl std::future::Future<
+        Output = Result<PreparedDownload<Self::Storage, Self::StreamStorage>>,
+    > + Send {
         // Клонируем всё, что нужно для async-блока: фабрика может быть
         // живее отдельного `prepare`-вызова.
         let inspect = Arc::clone(&self.inspect);
@@ -103,57 +110,82 @@ where
                 .await
                 .map_err(|e| Error::Other(format!("inspect: {e}")))?;
 
-            let total_size = report.total_size.ok_or_else(|| {
-                Error::Other("inspect: server did not report Content-Length".into())
-            })?;
-
             let filename = resolve_filename(&spec, report.filename.as_deref())?;
             validate_filename(&filename).map_err(|e| Error::Other(format!("filename: {e}")))?;
             let filename =
                 apply_on_file_exists(&spec.target_dir, filename, spec.on_file_exists_override)?;
 
-            let cfg = effective_plan_config(&spec, &defaults)
-                .map_err(|e| Error::Other(format!("plan config: {e}")))?;
-            // `plan_pieces` считает и раскладку, но геометрия piece'ов
-            // теперь арифметическая (см. LocalPieceStorage): нам нужен
-            // только `piece_size`. Список кусков `plan.pieces`
-            // не используется и дропается.
-            let piece_size = plan_pieces(total_size, cfg).piece_size;
             let guard = RangeGuard::from_report(&report);
-            let accepts_ranges = report.accepts_ranges;
+            let effective_url = report.effective_url.clone();
 
-            // Персистим inspect-поля в `file_settings` ДО открытия
-            // хранилища: `LocalPieceStorage::open` сверит их через
-            // `get_inspect_fields` при принятии решения «resume vs fresh».
-            files_repo
-                .set_inspect_fields(
-                    id,
-                    total_size,
-                    piece_size,
-                    report.etag.clone(),
-                    report.last_modified.clone(),
-                )
-                .await?;
+            match report.total_size {
+                Some(total_size) => {
+                    let cfg = effective_plan_config(&spec, &defaults)
+                        .map_err(|e| Error::Other(format!("plan config: {e}")))?;
+                    // `plan_pieces` считает раскладку, но геометрия piece'ов
+                    // арифметическая: нужен только `piece_size`.
+                    let piece_size = plan_pieces(total_size, cfg).piece_size;
+                    let accepts_ranges = report.accepts_ranges;
 
-            let storage = LocalPieceStorage::open(
-                &spec.target_dir,
-                &filename,
-                id,
-                total_size,
-                piece_size,
-                pieces_repo,
-                files_repo,
-            )
-            .await?;
+                    files_repo
+                        .set_inspect_fields(
+                            id,
+                            Some(total_size),
+                            Some(piece_size),
+                            report.etag.clone(),
+                            report.last_modified.clone(),
+                            effective_url.clone(),
+                        )
+                        .await?;
 
-            Ok(PreparedDownload {
-                storage,
-                total_size,
-                piece_size,
-                accepts_ranges,
-                guard,
-                resolved_filename: filename,
-            })
+                    let storage = LocalPieceStorage::open(
+                        &spec.target_dir,
+                        &filename,
+                        id,
+                        total_size,
+                        piece_size,
+                        pieces_repo,
+                        files_repo,
+                    )
+                    .await?;
+
+                    Ok(PreparedDownload {
+                        mode: PreparedMode::Known {
+                            total_size,
+                            piece_size,
+                            accepts_ranges,
+                            guard,
+                        },
+                        piece_storage: Some(storage),
+                        stream_storage: None,
+                        resolved_filename: filename,
+                        effective_url,
+                    })
+                }
+                None => {
+                    // Streaming-режим: ни размера, ни piece-нарезки. Один
+                    // воркер, append-mode. Resume не поддерживается.
+                    files_repo
+                        .set_inspect_fields(
+                            id,
+                            None,
+                            None,
+                            report.etag.clone(),
+                            report.last_modified.clone(),
+                            effective_url.clone(),
+                        )
+                        .await?;
+                    let stream =
+                        LocalStreamStorage::open_streaming(&spec.target_dir, &filename).await?;
+                    Ok(PreparedDownload {
+                        mode: PreparedMode::Streaming,
+                        piece_storage: None,
+                        stream_storage: Some(stream),
+                        resolved_filename: filename,
+                        effective_url,
+                    })
+                }
+            }
         }
     }
 }
@@ -334,9 +366,19 @@ mod tests {
         .await;
         let prepared = factory.prepare(id, &spec).await.unwrap();
         assert_eq!(prepared.resolved_filename, "explicit.bin");
-        assert_eq!(prepared.total_size, 1024 * 1024);
-        assert!(prepared.accepts_ranges);
-        assert_eq!(prepared.guard, Some(RangeGuard::Etag("\"abc\"".into())));
+        match prepared.mode {
+            PreparedMode::Known {
+                total_size,
+                accepts_ranges,
+                guard,
+                ..
+            } => {
+                assert_eq!(total_size, 1024 * 1024);
+                assert!(accepts_ranges);
+                assert_eq!(guard, Some(RangeGuard::Etag("\"abc\"".into())));
+            }
+            PreparedMode::Streaming => panic!("expected Known"),
+        }
     }
 
     #[tokio::test]
@@ -378,16 +420,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_errors_without_content_length() {
+    async fn prepare_allows_unknown_size() {
         let dir = tempdir().unwrap();
         let spec = DownloadSpec::new("https://host/f.bin", dir.path());
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(None, Some("f.bin")), &spec).await;
-        let err = match factory.prepare(id, &spec).await {
-            Err(e) => e,
-            Ok(_) => panic!("expected error"),
-        };
-        assert!(err.to_string().contains("Content-Length"), "{err}");
+        let prepared = factory.prepare(id, &spec).await.unwrap();
+        assert!(
+            matches!(prepared.mode, PreparedMode::Streaming),
+            "expected Streaming mode, got {:?}",
+            prepared.mode
+        );
+        assert!(prepared.piece_storage.is_none());
+        assert!(prepared.stream_storage.is_some());
+        assert_eq!(prepared.resolved_filename, "f.bin");
     }
 
     #[tokio::test]
@@ -406,7 +452,10 @@ mod tests {
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(64 * 1024 * 1024), Some("f.bin")), &spec).await;
         let prepared = factory.prepare(id, &spec).await.unwrap();
-        assert_eq!(prepared.piece_size, 1024 * 1024);
+        match prepared.mode {
+            PreparedMode::Known { piece_size, .. } => assert_eq!(piece_size, 1024 * 1024),
+            PreparedMode::Streaming => panic!("expected Known"),
+        }
     }
 
     #[tokio::test]
@@ -447,10 +496,14 @@ mod tests {
         let (_db, files, _pieces, id, factory) =
             build(inspect_with(Some(64 * 1024 * 1024), Some("f.bin")), &spec).await;
         let prepared = factory.prepare(id, &spec).await.unwrap();
+        let prepared_piece_size = match prepared.mode {
+            PreparedMode::Known { piece_size, .. } => piece_size,
+            PreparedMode::Streaming => panic!("expected Known"),
+        };
 
         let got = files.get_inspect_fields(id).await.unwrap().unwrap();
-        assert_eq!(got.total_size, 64 * 1024 * 1024);
-        assert_eq!(got.piece_size, prepared.piece_size);
+        assert_eq!(got.total_size, Some(64 * 1024 * 1024));
+        assert_eq!(got.piece_size, Some(prepared_piece_size));
         assert_eq!(got.etag.as_deref(), Some("\"abc\""));
         assert_eq!(
             got.last_modified.as_deref(),

@@ -98,10 +98,14 @@ pub type FilesResult<T> = std::result::Result<T, FilesError>;
 /// `file_settings`, ни этот тип не нужны.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectFields {
-    pub total_size: u64,
-    pub piece_size: u64,
+    /// `None`, если сервер не прислал `Content-Length` (streaming-режим).
+    pub total_size: Option<u64>,
+    /// `None` — сопутствует `total_size = None` (piece-нарезки нет).
+    pub piece_size: Option<u64>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// URL после цепочки редиректов — для воркеров (§3 плана).
+    pub effective_url: Option<String>,
 }
 
 /// SQLite-репозиторий загрузок.
@@ -122,13 +126,22 @@ impl SqliteFileRepository {
     pub async fn set_inspect_fields(
         &self,
         id: DownloadId,
-        total_size: u64,
-        piece_size: u64,
+        total_size: Option<u64>,
+        piece_size: Option<u64>,
         etag: Option<String>,
         last_modified: Option<String>,
+        effective_url: Option<String>,
     ) -> CoreResult<()> {
         run(&self.db, move |c| {
-            set_inspect_fields_impl(c, id, total_size, piece_size, etag, last_modified)
+            set_inspect_fields_impl(
+                c,
+                id,
+                total_size,
+                piece_size,
+                etag,
+                last_modified,
+                effective_url,
+            )
         })
         .await
     }
@@ -226,8 +239,8 @@ fn insert_impl(conn: &mut Connection, d: &Download) -> FilesResult<()> {
     tx.execute(
         "INSERT INTO file_settings
            (file_id, workers, piece_target_count, piece_size_min, piece_size_max,
-            total_size, piece_size, etag, last_modified)
-         VALUES (?,?,?,?,?, NULL, NULL, NULL, NULL)",
+            total_size, piece_size, etag, last_modified, effective_url)
+         VALUES (?,?,?,?,?, NULL, NULL, NULL, NULL, NULL)",
         params![
             d.id.to_string(),
             d.spec.workers as i64,
@@ -352,20 +365,22 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<Download>> {
 fn set_inspect_fields_impl(
     conn: &mut Connection,
     id: DownloadId,
-    total_size: u64,
-    piece_size: u64,
+    total_size: Option<u64>,
+    piece_size: Option<u64>,
     etag: Option<String>,
     last_modified: Option<String>,
+    effective_url: Option<String>,
 ) -> FilesResult<()> {
     let n = conn.execute(
         "UPDATE file_settings
-           SET total_size = ?, piece_size = ?, etag = ?, last_modified = ?
+           SET total_size = ?, piece_size = ?, etag = ?, last_modified = ?, effective_url = ?
          WHERE file_id = ?",
         params![
-            total_size as i64,
-            piece_size as i64,
+            total_size.map(|v| v as i64),
+            piece_size.map(|v| v as i64),
             etag,
             last_modified,
+            effective_url,
             id.to_string(),
         ],
     )?;
@@ -382,10 +397,16 @@ fn get_inspect_fields_impl(
     // Разделяем «файла нет» и «inspect ещё не заполнен»:
     // отсутствие строки в `file_settings` — NotFound; NULL в total_size —
     // Ok(None).
-    type InspectRow = (Option<i64>, Option<i64>, Option<String>, Option<String>);
+    type InspectRow = (
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let row: Option<InspectRow> = conn
         .query_row(
-            "SELECT total_size, piece_size, etag, last_modified
+            "SELECT total_size, piece_size, etag, last_modified, effective_url
              FROM file_settings WHERE file_id = ?",
             params![id.to_string()],
             |r| {
@@ -394,22 +415,32 @@ fn get_inspect_fields_impl(
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((total, piece, etag, last_modified)) = row else {
+    let Some((total, piece, etag, last_modified, effective_url)) = row else {
         return Err(FilesError::NotFound);
     };
-    match (total, piece) {
-        (Some(t), Some(p)) => Ok(Some(InspectFields {
-            total_size: t as u64,
-            piece_size: p as u64,
-            etag,
-            last_modified,
-        })),
-        _ => Ok(None),
+    // Строка `file_settings` есть всегда (INSERT при `insert_impl`); если
+    // ни total_size, ни piece_size ещё не выставлены — возвращаем None,
+    // иначе собираем DTO с тем, что есть (streaming — с `None` в обоих).
+    let inspect_filled = total.is_some()
+        || piece.is_some()
+        || etag.is_some()
+        || last_modified.is_some()
+        || effective_url.is_some();
+    if !inspect_filled {
+        return Ok(None);
     }
+    Ok(Some(InspectFields {
+        total_size: total.map(|v| v as u64),
+        piece_size: piece.map(|v| v as u64),
+        etag,
+        last_modified,
+        effective_url,
+    }))
 }
 
 // ─── Row ↔ Domain ───────────────────────────────────────────────────────
@@ -756,27 +787,34 @@ mod tests {
 
         repo.set_inspect_fields(
             id,
-            123_456_789,
-            8 * 1024 * 1024,
+            Some(123_456_789),
+            Some(8 * 1024 * 1024),
             Some("\"abc\"".into()),
             Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            Some("https://cdn.example/resolved".into()),
         )
         .await
         .unwrap();
 
         let got = repo.get_inspect_fields(id).await.unwrap().unwrap();
-        assert_eq!(got.total_size, 123_456_789);
-        assert_eq!(got.piece_size, 8 * 1024 * 1024);
+        assert_eq!(got.total_size, Some(123_456_789));
+        assert_eq!(got.piece_size, Some(8 * 1024 * 1024));
         assert_eq!(got.etag.as_deref(), Some("\"abc\""));
         assert_eq!(
             got.last_modified.as_deref(),
             Some("Wed, 21 Oct 2015 07:28:00 GMT")
         );
+        assert_eq!(
+            got.effective_url.as_deref(),
+            Some("https://cdn.example/resolved")
+        );
 
         // Повторный set перезаписывает.
-        repo.set_inspect_fields(id, 1, 1, None, None).await.unwrap();
+        repo.set_inspect_fields(id, Some(1), Some(1), None, None, None)
+            .await
+            .unwrap();
         let got = repo.get_inspect_fields(id).await.unwrap().unwrap();
-        assert_eq!(got.total_size, 1);
+        assert_eq!(got.total_size, Some(1));
         assert!(got.etag.is_none());
     }
 

@@ -27,8 +27,10 @@ use crate::error::{
 };
 use crate::ports::{
     PreparedDownload,
+    PreparedMode,
     TPieceStorage,
     TPieceStorageFactory,
+    TStreamStorage,
 };
 
 /// In-memory хранилище piece'ов одной загрузки.
@@ -200,6 +202,80 @@ impl TPieceStorage for MemoryPieceStorage {
     }
 }
 
+/// In-memory реализация [`TStreamStorage`] для тестов streaming-режима.
+///
+/// Хранит байты append-ом в `Vec<u8>`, как и piece-вариант — без диска.
+pub struct MemoryStreamStorage {
+    inner: Mutex<StreamInner>,
+}
+
+struct StreamInner {
+    buf: Vec<u8>,
+    finalized: bool,
+    aborted: bool,
+}
+
+impl Default for MemoryStreamStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemoryStreamStorage {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(StreamInner {
+                buf: Vec::new(),
+                finalized: false,
+                aborted: false,
+            }),
+        }
+    }
+
+    /// Возвращает копию накопленных байт — для ассертов.
+    pub fn assembled_bytes(&self) -> Vec<u8> {
+        self.inner.lock().expect("mutex poisoned").buf.clone()
+    }
+
+    pub fn is_finalized(&self) -> bool {
+        self.inner.lock().expect("mutex poisoned").finalized
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        self.inner.lock().expect("mutex poisoned").aborted
+    }
+}
+
+impl TStreamStorage for MemoryStreamStorage {
+    async fn append_chunk(&self, bytes: &[u8]) -> Result<()> {
+        let mut inner = self.inner.lock().expect("mutex poisoned");
+        if inner.finalized {
+            return Err(Error::Other("append after finalize".into()));
+        }
+        if inner.aborted {
+            return Err(Error::Other("append after abort".into()));
+        }
+        inner.buf.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn finalize(&self) -> Result<()> {
+        let mut inner = self.inner.lock().expect("mutex poisoned");
+        if inner.aborted {
+            return Err(Error::Other("finalize after abort".into()));
+        }
+        inner.finalized = true;
+        Ok(())
+    }
+
+    async fn abort(&self) -> Result<()> {
+        let mut inner = self.inner.lock().expect("mutex poisoned");
+        inner.buf.clear();
+        inner.aborted = true;
+        Ok(())
+    }
+}
+
 /// Фабрика in-memory хранилищ.
 ///
 /// `piece_count`/`piece_size` задаются на уровне фабрики: реальный расчёт
@@ -214,6 +290,10 @@ pub struct MemoryPieceStorageFactory {
     piece_size: u64,
     accepts_ranges: bool,
     guard: Option<crate::ports::RangeGuard>,
+    /// Режим: если `true`, фабрика отдаёт [`PreparedMode::Streaming`] и
+    /// `MemoryStreamStorage` вместо piece-варианта. Используется тестами,
+    /// которые проверяют стриминговый путь.
+    streaming: bool,
 }
 
 impl MemoryPieceStorageFactory {
@@ -223,6 +303,7 @@ impl MemoryPieceStorageFactory {
             piece_size,
             accepts_ranges: true,
             guard: None,
+            streaming: false,
         }
     }
 
@@ -235,30 +316,55 @@ impl MemoryPieceStorageFactory {
         self.guard = guard;
         self
     }
+
+    /// Заставить фабрику вернуть streaming-Prepared (unknown-size).
+    pub fn streaming() -> Self {
+        Self {
+            piece_count: 0,
+            piece_size: 0,
+            accepts_ranges: false,
+            guard: None,
+            streaming: true,
+        }
+    }
 }
 
 impl TPieceStorageFactory for MemoryPieceStorageFactory {
     type Storage = MemoryPieceStorage;
+    type StreamStorage = MemoryStreamStorage;
 
     async fn prepare(
         &self,
         _id: DownloadId,
         spec: &DownloadSpec,
-    ) -> Result<PreparedDownload<Self::Storage>> {
-        // Для in-memory тестов fabricated total_size = count * piece_size;
-        // расхождений с «последним куском меньше piece_size» здесь нет.
-        let total_size = self.piece_count as u64 * self.piece_size;
+    ) -> Result<PreparedDownload<Self::Storage, Self::StreamStorage>> {
         let resolved_filename = spec
             .filename
             .clone()
             .unwrap_or_else(|| "memory.bin".to_owned());
+        if self.streaming {
+            return Ok(PreparedDownload {
+                mode: PreparedMode::Streaming,
+                piece_storage: None,
+                stream_storage: Some(MemoryStreamStorage::new()),
+                resolved_filename,
+                effective_url: None,
+            });
+        }
+        // Для in-memory тестов fabricated total_size = count * piece_size;
+        // расхождений с «последним куском меньше piece_size» здесь нет.
+        let total_size = self.piece_count as u64 * self.piece_size;
         Ok(PreparedDownload {
-            storage: MemoryPieceStorage::new(self.piece_count, self.piece_size),
-            total_size,
-            piece_size: self.piece_size,
-            accepts_ranges: self.accepts_ranges,
-            guard: self.guard.clone(),
+            mode: PreparedMode::Known {
+                total_size,
+                piece_size: self.piece_size,
+                accepts_ranges: self.accepts_ranges,
+                guard: self.guard.clone(),
+            },
+            piece_storage: Some(MemoryPieceStorage::new(self.piece_count, self.piece_size)),
+            stream_storage: None,
             resolved_filename,
+            effective_url: None,
         })
     }
 }
@@ -356,15 +462,27 @@ mod tests {
         let a = factory.prepare(DownloadId::new(), &spec).await.unwrap();
         let b = factory.prepare(DownloadId::new(), &spec).await.unwrap();
 
-        assert_eq!(a.total_size, 6);
-        assert_eq!(a.piece_size, 3);
-        assert!(a.accepts_ranges);
+        match a.mode {
+            PreparedMode::Known {
+                total_size,
+                piece_size,
+                accepts_ranges,
+                ..
+            } => {
+                assert_eq!(total_size, 6);
+                assert_eq!(piece_size, 3);
+                assert!(accepts_ranges);
+            }
+            PreparedMode::Streaming => panic!("expected Known"),
+        }
 
-        a.storage.write_piece_bytes(0, 0, &[1, 2, 3]).await.unwrap();
-        a.storage.commit_done(0).await.unwrap();
+        let a_storage = a.piece_storage.as_ref().expect("Known carries storage");
+        let b_storage = b.piece_storage.as_ref().expect("Known carries storage");
+        a_storage.write_piece_bytes(0, 0, &[1, 2, 3]).await.unwrap();
+        a_storage.commit_done(0).await.unwrap();
 
         // У `b` ничего не закоммичено — инстансы независимы.
-        assert_eq!(a.storage.pending_pieces().await.unwrap(), vec![1]);
-        assert_eq!(b.storage.pending_pieces().await.unwrap(), vec![0, 1]);
+        assert_eq!(a_storage.pending_pieces().await.unwrap(), vec![1]);
+        assert_eq!(b_storage.pending_pieces().await.unwrap(), vec![0, 1]);
     }
 }

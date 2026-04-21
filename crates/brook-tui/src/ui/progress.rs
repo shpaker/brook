@@ -46,7 +46,24 @@ impl<'a> Widget for ProgressBar<'a> {
             return;
         }
         let width = area.width as usize;
-        let total = self.progress.bytes_total.max(1) as f64;
+        // `bytes_total == 0` — размер неизвестен (streaming/unknown-size).
+        // Рисуем indeterminate-бар: сплошная заливка `▒` без «готовой» зоны.
+        if self.progress.bytes_total == 0 {
+            let style = if self.no_color {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            for x in 0..width {
+                let cell = buf
+                    .cell_mut((area.x + x as u16, area.y))
+                    .expect("cell in area");
+                cell.set_char('▒');
+                cell.set_style(style);
+            }
+            return;
+        }
+        let total = self.progress.bytes_total as f64;
         let done = (self.progress.bytes_done as f64 / total).clamp(0.0, 1.0);
         let done_cells = (done * width as f64).round() as usize;
         let done_cells = done_cells.min(width);

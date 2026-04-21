@@ -14,6 +14,7 @@ pub mod mock_fetch;
 pub use memory_piece_storage::{
     MemoryPieceStorage,
     MemoryPieceStorageFactory,
+    MemoryStreamStorage,
 };
 pub use memory_queue_store::MemoryTQueueStore;
 pub use memory_tracking::{
