@@ -14,6 +14,7 @@ pub mod paths;
 pub mod piece_attempts;
 pub mod pieces;
 pub mod plan;
+pub mod sandbox;
 pub mod workers;
 
 pub use error::{

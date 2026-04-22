@@ -16,8 +16,8 @@ use brook_proto::brook::v1::{
     WatchProgressRequest,
 };
 use tokio::sync::mpsc;
-use tonic::transport::Channel;
 
+use crate::connect::AuthedChannel;
 use crate::events::{
     StreamEvent,
     UiEvent,
@@ -28,7 +28,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Запускает обе watch-задачи. Возвращает пару `JoinHandle`, абортом
 /// которых UI-task глушит стримы при выходе.
 pub fn spawn(
-    channel: Channel,
+    channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
     let file_tx = tx.clone();
@@ -38,7 +38,7 @@ pub fn spawn(
     (file, progress)
 }
 
-async fn run_file(channel: Channel, tx: mpsc::UnboundedSender<UiEvent>) {
+async fn run_file(channel: AuthedChannel, tx: mpsc::UnboundedSender<UiEvent>) {
     let mut backoff = Duration::from_secs(1);
     let mut attempt: u32 = 0;
     loop {
@@ -86,7 +86,7 @@ async fn run_file(channel: Channel, tx: mpsc::UnboundedSender<UiEvent>) {
     }
 }
 
-async fn run_progress(channel: Channel, tx: mpsc::UnboundedSender<UiEvent>) {
+async fn run_progress(channel: AuthedChannel, tx: mpsc::UnboundedSender<UiEvent>) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let mut client = BrookServiceClient::new(channel.clone());

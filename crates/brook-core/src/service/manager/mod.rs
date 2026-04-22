@@ -122,7 +122,7 @@ impl Default for ManagerConfig {
 ///
 /// `WR`/`AR` — репозитории воркеров и попыток piece'ов. Дефолты
 /// ([`NoopWorkerRepo`] / [`NoopAttemptRepo`]) — для тестов и кейсов,
-/// где аналитика журнала не нужна; prod-подключение (brookd)
+/// где аналитика журнала не нужна; prod-подключение (brook-daemon)
 /// подставляет SQLite-адаптеры явно через [`DownloadManager::with_tracking`].
 pub struct DownloadManager<PF, QS, F, WR = NoopWorkerRepo, AR = NoopAttemptRepo>
 where
@@ -217,8 +217,8 @@ where
     AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
     /// Собрать менеджер с явными репозиториями воркеров и попыток —
-    /// prod-путь brookd, где `workers` и `piece_attempts` пишутся в
-    /// общую `brook.db`.
+    /// prod-путь brook-daemon, где `workers` и `piece_attempts` пишутся
+    /// в общую `brook.db`.
     pub fn with_tracking(
         factory: Arc<PF>,
         queue: Arc<QS>,

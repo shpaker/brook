@@ -17,29 +17,40 @@ brook/                            # workspace root
 │   ├── brook-proto/              # build.rs → prost + tonic stubs
 │   ├── brook-core/               # гексагональное ядро: domain + ports (+ services); без сети и диска
 │   ├── brook-http/               # HTTP-адаптер: reqwest + middleware, реализует HTTP-порты ядра
-│   ├── brook-api/                # gRPC-сервер (tonic), обёртка над core
-│   ├── brookd/                   # MVP-бинарь: демон, поднимает core + api + адаптеры
-│   └── brook-tui/                # MVP-бинарь: ratatui gRPC-клиент (имя бинаря — `brook`)
+│   ├── brook-api/                # gRPC-сервер (tonic), обёртка над core + bearer-auth interceptor
+│   ├── brook-runtime/            # общие для демона и TUI примитивы: endpoint-файл, константы
+│   ├── brook-daemon/             # lib: серверный стек (конфиг, storage-адаптеры, bootstrap)
+│   ├── brook-tui/                # lib: ratatui gRPC-клиент
+│   └── brook/                    # единственный [[bin]] — диспетч `brook` / `brook server`
 └── docs/
 ```
 
 ## Процессная модель
 
-Два процесса: демон `brookd` и TUI-клиент `brook` общаются только по gRPC. Это не оптимизация на будущее, а условие целостности контракта: UI равноправен с любым другим клиентом.
+Единственный бинарь `brook` со clap-диспетчером. Без подкоманды он — TUI-клиент; `brook server …` поднимает демона. Процессов по-прежнему два (демон и клиент); общение — только gRPC. Это не оптимизация на будущее, а условие целостности контракта: UI равноправен с любым другим клиентом.
 
-### `brookd` (демон)
+### Режимы запуска
+
+- **`brook server --directory <DIR> [--host H] [--port P] [--client-pass …]`** — демон. `--directory` обязателен: это корень песочницы (см. [Песочница](#песочница-target_dir)). `--host`/`--port` перекрывают YAML; при `port = 0` ядро выбирает свободный порт, и актуальный адрес пишется в `.brook.endpoint` для авто-обнаружения клиентом. `--client-pass` включает bearer-аутентификацию (см. [Аутентификация](#аутентификация-bearer)); пароль можно передать через env `BROOK_CLIENT_PASS`, чтобы он не оседал в истории шелла.
+- **`brook`** — TUI к локальному демону. Клиент ищет `.brook.endpoint` в CWD (адрес + порт), падает на дефолтный loopback-порт, если файла нет. Если демон не отвечает — `brook` поднимает его сам через `current_exe() server --directory <default>` (без `--port` — ephemeral bind + sidecar endpoint). Флаг `spawned_self` запоминает, что демон наш: при выходе модалка `QuitConfirm` предлагает остановить его вместе с TUI (см. [docs/ux.md](ux.md)).
+- **`brook --remote HOST:PORT [--pass …]`** — TUI к удалённому демону. Локального автоспавна нет. `--pass` обязателен, если сервер поднят с `--client-pass`; если пароль не передан, TUI запрашивает его на TTY через `rpassword` до первого коннекта. На выходе ничего не гасится — чужим демоном клиент не распоряжается.
+
+### `brook server` (демон)
 1. Берёт single-instance lock на `.brook.lock` в CWD (флок).
 2. Читает `./brook.yaml` (при первом запуске создаёт файл с дефолтами).
 3. Открывает `./brook.db` (SQLite) и прогоняет миграции очереди.
-4. Применяет настройки из YAML в `DownloadManager` и `brook-api`.
-5. Поднимает `DownloadManager` (`brook-core`) — асинхронная задача.
-6. Запускает gRPC-сервер (`brook-api`) на `<bind>:<port>` из YAML — асинхронная задача.
-7. Работает до `SIGTERM` / `SIGINT`.
+4. Применяет настройки из YAML + CLI-override (`--host`/`--port`/`--client-pass`) в `DownloadManager` и `brook-api`; канонизирует `--directory` и сохраняет как sandbox-root.
+5. Отказывается биндиться на не-loopback адрес без `--client-pass` — см. [Аутентификация](#аутентификация-bearer).
+6. Поднимает `DownloadManager` (`brook-core`) — асинхронная задача.
+7. Запускает gRPC-сервер (`brook-api`) с `AuthInterceptor` на `<host>:<port>`, пишет актуальный адрес в `.brook.endpoint` (атомарно через tempfile+rename).
+8. Работает до `SIGTERM` / `SIGINT`; на graceful shutdown удаляет `.brook.endpoint` и отпускает `.brook.lock`.
 
-### `brook` (TUI, крейт `brook-tui`)
-1. `tonic::Channel` на `127.0.0.1:<port>` (порт задаётся флагом `--port`, дефолт `7090`).
-2. Рендерит ratatui-UI, который является gRPC-клиентом к `brookd`.
-3. Если демон недоступен — сообщение в UI и подсказка запустить `brookd`; автостарт демона в MVP не делаем.
+### `brook` (TUI-режим)
+1. Разрешает адрес: `--remote` > sidecar `.brook.endpoint` > дефолтный loopback-порт.
+2. Если нужен пароль (remote без `--pass`, либо демон вернул `Unauthenticated` на probe) — спрашивает у TTY.
+3. Unary `GetSettings` как probe. Успех → продолжаем. `Unauthenticated` → prompt + retry. Transport-ошибка на локали → автоспавн (`brook server`) + поллинг `.brook.endpoint` до ~3 s.
+4. Открывает `tonic::Channel`, оборачивает `InterceptedService` c `BearerInterceptor` (пароль уходит в каждый вызов в metadata `authorization: bearer …`).
+5. Рендерит ratatui-UI, который является gRPC-клиентом к демону.
 
 **UI никогда не дёргает `DownloadManager` напрямую** — только через API. Завтра любой другой клиент (локальный или удалённый) работает по тому же контракту.
 
@@ -50,7 +61,7 @@ brook/                            # workspace root
 - **Domain** — сущности и value-объекты: идентификатор загрузки, спецификация задачи (url, target_dir, воркеры), конечный автомат состояний, снимок прогресса, агрегат `Download` (spec + runtime-поля), события от engine к подписчикам и команды от клиента к engine. Это чистые типы без I/O и без зависимостей на внешний мир.
 - **Ports** — трейты, через которые ядро обращается наружу: [`TPieceStorage`](#абстракция-хранилища-tpiecestorage) и `TPieceStorageFactory` для хранения кусков, [`TQueueStore`](#абстракция-очереди-queuestore) для персистентности очереди, `THttpInspect` и `TRangeFetch` для сетевого ввода-вывода. Это *outbound*-порты: ядро — клиент (вызывает методы), адаптер — сервер (реализует).
 - **Services** (появятся на этапе 1.3+) — application-координаторы [`DownloadManager`](#downloadmanager-один-на-процесс) и [`DownloadEngine`](#downloadengine-один-на-загрузку). Используют domain и ports, сами I/O не трогают.
-- **Adapters** живут **вне** `brook-core`: SQLite-реализации (`SqliteTQueueStore`, `LocalPieceStorage`) — в `brookd`; HTTP-адаптер (`HttpInspectClient`, `RangeFetchClient`) — в отдельном крейте `brook-http`, `brookd` подключает его как зависимость; gRPC-адаптер — в `brook-api`. Тестовые in-memory адаптеры (`MemoryTQueueStore`, `MemoryPieceStorage`) — в test utils самого `brook-core`, но отдельным модулем, не подмешанным в продовый код.
+- **Adapters** живут **вне** `brook-core`: SQLite-реализации (`SqliteTQueueStore`, `LocalPieceStorage`) — в `brook-daemon`; HTTP-адаптер (`HttpInspectClient`, `RangeFetchClient`) — в отдельном крейте `brook-http`, `brook-daemon` подключает его как зависимость; gRPC-адаптер — в `brook-api`. Тестовые in-memory адаптеры (`MemoryTQueueStore`, `MemoryPieceStorage`) — в test utils самого `brook-core`, но отдельным модулем, не подмешанным в продовый код.
 
 Что это даёт: ядро тестируется без сети и без диска (порты подменяются in-memory или `wiremock`-адаптерами); смена бэкенда хранилища или HTTP-клиента не требует изменений в ядре; статическая гарантия — если файл лежит в `brook-core`, у него нет зависимости на `rusqlite` или `reqwest` (проверяется через `cargo tree -p brook-core`).
 
@@ -74,7 +85,7 @@ brook/                            # workspace root
 - Получает `TPieceStorageFactory` при инициализации — создаёт экземпляр `TPieceStorage` для каждой новой загрузки.
 - Получает `TQueueStore` при инициализации — не знает, где и как хранится очередь (см. [ниже](#абстракция-очереди-queuestore)).
 
-`brook-core` — **чистая библиотека**: нет зависимостей на БД, файловую систему или ОС. Всё I/O-специфичное скрыто за трейтами и живёт снаружи (в `brookd`).
+`brook-core` — **чистая библиотека**: нет зависимостей на БД, файловую систему или ОС. Всё I/O-специфичное скрыто за трейтами и живёт снаружи (в `brook-daemon`).
 
 ### Почему именно так
 Один `DownloadEngine` на загрузку, один менеджер на процесс — стандартная актор-модель: каждый engine изолирован, тестируется отдельно, падает независимо. Менеджер — единственная точка координации. `TPieceStorage` и `TQueueStore` как трейты позволяют переиспользовать `brook-core` без привязки к диску, SQLite или конкретной ОС.
@@ -89,7 +100,7 @@ brook/                            # workspace root
 
 | Реализация | Где живёт | Назначение |
 |---|---|---|
-| `LocalPieceStorage` | `brookd` | Основная: `pwrite` в `.data.brook`; карта piece'ов — в общей `brook.db` (таблица `pieces`) |
+| `LocalPieceStorage` | `brook-daemon` | Основная: `pwrite` в `.data.brook`; карта piece'ов — в общей `brook.db` (таблица `pieces`) |
 | `MemoryPieceStorage` | `brook-core` (test utils) | In-memory, для юнит-тестов без диска |
 | `S3PieceStorage` | внешний крейт | S3 multipart upload; локальный SQLite хранит ETag и part number |
 
@@ -103,7 +114,7 @@ brook/                            # workspace root
 
 | Реализация | Где живёт | Назначение |
 |---|---|---|
-| `SqliteFileRepository` | `brookd` | Основная: таблицы `files` / `file_settings` / `state_changes` в `./brook.db` (см. [Схема `brook.db`](#схема-brookdb)) |
+| `SqliteFileRepository` | `brook-daemon` | Основная: таблицы `files` / `file_settings` / `state_changes` в `./brook.db` (см. [Схема `brook.db`](#схема-brookdb)) |
 | `MemoryTQueueStore` | `brook-core` (test utils) | In-memory, для юнит-тестов без диска |
 
 ## Раскладка на диске
@@ -174,7 +185,7 @@ brook/                            # workspace root
 
 - **Чистый перезапуск процесса**: читаем `pieces` для `file_id`, докачиваем всё, что не `done`. Runtime-статус `in_progress` не персистится — после рестарта трактуется как `pending`.
 - **`.data.brook` удалён или inspect-поля в `file_settings` не совпали с текущими заголовками источника** (сменился `total_size`, `etag`, `last_modified` или число строк в `pieces` не равно ожидаемому `piece_count`): доверять `.data.brook` нечем. `LocalPieceStorage::open` вычищает piece-строки загрузки (`delete_all(id)`), пересоздаёт `.data.brook`, заново преаллоцирует и инициализирует piece-таблицу.
-- **`brook.db` повреждена**: это провал уровня демона, а не одной загрузки — `brookd` не поднимется, чиним БД отдельно.
+- **`brook.db` повреждена**: это провал уровня демона, а не одной загрузки — `brook server` не поднимется, чиним БД отдельно.
 
 ## Схема `brook.db`
 
@@ -186,7 +197,7 @@ brook/                            # workspace root
 - **`pieces`** — карта piece'ов всех активных загрузок; скоуп по `file_id`. В БД живут только `pending` и `done` — runtime-состояние `in_progress` на диск не попадает (после рестарта трактуется как `pending`).
 - **`states`**, **`reason_codes`** — справочники с natural-key. Сидятся при миграции `user_version = 1` через `INSERT OR IGNORE`.
 
-Все дочерние таблицы каскадно удаляются при удалении строки из `files` (`ON DELETE CASCADE` на FK). SQL за пределы адаптерного слоя (`SqliteFileRepository`, `SqlitePieceRepository` в `brookd`) не утекает: `brook-core` видит только порты `TQueueStore` / `TPieceStorage`, а `cargo tree -p brook-core` не тянет `rusqlite`.
+Все дочерние таблицы каскадно удаляются при удалении строки из `files` (`ON DELETE CASCADE` на FK). SQL за пределы адаптерного слоя (`SqliteFileRepository`, `SqlitePieceRepository` в `brook-daemon`) не утекает: `brook-core` видит только порты `TQueueStore` / `TPieceStorage`, а `cargo tree -p brook-core` не тянет `rusqlite`.
 
 ## Сеть и устойчивость
 
@@ -229,30 +240,52 @@ brook/                            # workspace root
 
 ### Single-instance lock
 
-Два `brookd` в одной CWD — гонка за `brook.db`, глобальную очередь, `.data.brook` в целевой папке. На старте `brookd` — `flock(LOCK_EX | LOCK_NB)` на `.brook.lock` в CWD. Вторая копия — exit с сообщением «brookd уже запущен в этой директории». TUI-клиент `brook` лок не берёт — сколько угодно клиентов могут одновременно подключаться к одному демону.
+Два `brook server` в одной CWD — гонка за `brook.db`, глобальную очередь, `.data.brook` в целевой папке. На старте демона — `flock(LOCK_EX | LOCK_NB)` на `.brook.lock` в CWD. Вторая копия — exit с сообщением «brook-daemon already running in this directory». TUI лок не берёт — сколько угодно клиентов могут одновременно подключаться к одному демону.
+
+### Песочница (`target_dir`)
+
+`brook server --directory <ROOT>` канонизирует путь один раз на старте и хранит как `sandbox_root: Arc<PathBuf>`. Любой `spec.target_dir` от клиента (в том числе через proto) проходит через `TPathPolicy::check_target_dir` перед любым I/O:
+
+1. Относительный путь приклеивается к корню (`root.join(target_dir)`), чтобы `canonicalize` не резолвил его относительно CWD демона.
+2. Канонизируется самый длинный существующий префикс (через `fs::canonicalize`); оставшийся «виртуальный» хвост прикладывается лексически с обработкой `.`/`..`. Это ловит и симлинки в любой точке цепочки, и `../..`-эскейпы над несуществующим путём.
+3. Результат обязан `starts_with(sandbox_root)` — иначе `core::Error::PathEscapesRoot { attempted }` → gRPC `PermissionDenied`.
+
+Песочница действует на всё, что пишет демон: целевой файл, `.data.brook`, любые вспомогательные артефакты. `--directory` — обязательный флаг без дефолта, чтобы случай «забыл ограничить» не случался молча; для автоспавна TUI подставляет `~/Downloads`.
+
+### Аутентификация (bearer)
+
+Опциональный пароль клиента живёт только в памяти демона (`Runtime.client_pass: Option<Arc<String>>`), не пишется в `brook.db` и в `brook.yaml`. `--client-pass` передаётся CLI-флагом или через env `BROOK_CLIENT_PASS`.
+
+- **Сервер** — `brook-api::AuthInterceptor` включает `trace_interceptor` (корреляция) и, если задан ожидаемый токен, сверяет заголовок `authorization: bearer <pass>` через `subtle::ConstantTimeEq`. Без токена или с неверным — `Unauthenticated`.
+- **Клиент** (TUI) — `brook-tui::connect::BearerInterceptor` кладёт тот же заголовок в каждый unary/streaming-запрос. Тип `AuthedChannel = InterceptedService<Channel, BearerInterceptor>` протащен через весь клиентский код, так что забыть приложить пароль невозможно.
+- **Non-loopback guard** — `build_runtime` отказывается биндиться, если `host.is_loopback() == false` и `--client-pass` не задан. Это правило срабатывает до `TcpListener::bind`: без пароля наружу нельзя даже случайно. `0.0.0.0` и `::` считаются не-loopback корректно (`is_unspecified()` ≠ `is_loopback()`).
 
 ### Проверки перед стартом загрузки
 
 - `statvfs` на целевую ФС: свободного места ≥ размер файла. Иначе — `FAILED` с понятной ошибкой, без попытки `F_PREALLOCATE`.
-- Путь назначения — под `default_dir` из конфига либо явно заданный абсолютный путь; защита от path traversal.
+- `TPathPolicy::check_target_dir` на `spec.target_dir` (см. [Песочница](#песочница-target_dir)) — до любого I/O.
+
+### Endpoint-файл (`.brook.endpoint`)
+
+После успешного `bind` `brook server` атомарно пишет `.brook.endpoint` в CWD: JSON `{ host, port }` — это позволяет TUI подхватить даже ephemeral-порт (`--port 0`) без хардкода. Формат и атомарная запись (tempfile + rename в той же директории) живут в `brook-runtime::endpoint`, константы (имя файла, дефолтный порт, имя заголовка, bearer-префикс) — в `brook-runtime::constants`. На graceful shutdown демон удаляет файл; если сайдкар остался от мёртвого процесса, TUI удаляет его перед автоспавном.
 
 ### Graceful shutdown
 
-`SIGTERM` / `SIGINT` в `brookd`:
+`SIGTERM` / `SIGINT` в демоне:
 1. Прекращаем приём новых команд через gRPC.
 2. Пауза всех `DownloadEngine` — каждый доводит in-flight куски до batch-границы.
 3. Финальный `fsync(.data.brook)` + batch-коммит piece-строк в `brook.db` для каждой активной загрузки.
-4. Закрываем gRPC-сервер, `./brook.db`, лог-writer, отпускаем `.brook.lock`.
+4. Закрываем gRPC-сервер, `./brook.db`, лог-writer, удаляем `.brook.endpoint`, отпускаем `.brook.lock`.
 5. Exit 0.
 
-В TUI `brook` — `q` просто закрывает клиент, демон продолжает работать. Закрытие клиента при активных загрузках никак их не останавливает.
+В TUI `q` открывает модалку `QuitConfirm`. Если TUI сам поднимал демон (`can_stop_daemon = true`), предлагается пункт «остановить демон» — он шлёт `Shutdown` RPC и ждёт закрытия стрима; иначе пункт скрыт и клиент просто закрывается, демон продолжает работать. Закрытие клиента при активных загрузках не останавливает их, если пункт «stop daemon» не выбран.
 
 Без graceful shutdown на ctrl-c демона — теряем до 16 `done`-кусков трафика на каждую активную загрузку (перекачаются после рестарта).
 
 ## API-слой (`brook-api`)
 - Генерируется из `.proto` через `tonic-build` в build.rs `brook-proto`.
 - Тонкая обёртка вокруг `DownloadManager`: proto ↔ core.
-- Запускается как фоновая задача бинаря `brookd`.
+- Запускается как фоновая задача серверного стека (подкоманда `brook server`).
 - Контракт — [api.md](api.md).
 
 ### Поток событий и Watch
@@ -269,7 +302,7 @@ brook/                            # workspace root
 
 ## UI-слой (`brook-tui`, бинарь `brook`)
 - `ratatui` + `crossterm`.
-- gRPC-клиент (`tonic::Channel`) к `brookd` на `127.0.0.1:<port>` (флаг `--port`, дефолт 7090).
+- gRPC-клиент (`tonic::Channel`, обёрнутый в `InterceptedService` с `BearerInterceptor`) к демону. Адрес: `--remote HOST:PORT` > sidecar `.brook.endpoint` в CWD > дефолтный loopback-порт. `--port` перекрывает sidecar.
 - Две точки взаимодействия:
   - Команды — unary (`add`, `pause`, ...).
   - События — две параллельные подписки на server-streaming (`WatchFile` + `WatchProgress`); фоновые задачи питают view-model.
@@ -278,7 +311,7 @@ brook/                            # workspace root
 
 ## Конфигурация
 
-Вся конфигурация живёт в YAML-файле `./brook.yaml` рядом с `brook.db` и `.brook.lock`. В SQLite её нет — `brook.db` хранит только очередь загрузок. При первом старте `brookd` создаёт `brook.yaml` с дефолтами и комментариями. На каждом старте `brookd` читает файл и применяет значения в `DownloadManager` и `brook-api`. Изменения на лету не поддерживаются — правки требуют рестарта демона.
+Вся конфигурация живёт в YAML-файле `./brook.yaml` рядом с `brook.db` и `.brook.lock`. В SQLite её нет — `brook.db` хранит только очередь загрузок. При первом старте `brook server` создаёт `brook.yaml` с дефолтами и комментариями. На каждом старте демон читает файл и применяет значения в `DownloadManager` и `brook-api`. CLI-флаги `brook server` (`--host`, `--port`, `--client-pass`, `--directory`) перекрывают соответствующие значения YAML. Изменения на лету не поддерживаются — правки требуют рестарта демона.
 
 Ключи делятся на два класса:
 
@@ -296,14 +329,14 @@ brook/                            # workspace root
 | `download.default_dir`        | `~/Downloads`         | `target_dir` (пустой → дефолт) | дефолтная папка назначения   |
 | `download.on_duplicate_url`   | `ask`                 | —                         | `ask` / `skip` / `add`            |
 | `api.port`                    | `7090`                | —                         | порт gRPC                         |
-| `api.bind`                    | `127.0.0.1`           | —                         | bind-адрес (только loopback в MVP)|
+| `api.bind`                    | `127.0.0.1`           | —                         | bind-адрес; не-loopback требует `--client-pass` |
 | `log.dir`                     | `~/Library/Logs/brook`| —                         | каталог JSON-логов                |
 | `log.rotate_count`            | `10`                  | —                         | файлов в ротации                  |
 | `log.rotate_size_mb`          | `50`                  | —                         | размер файла до ротации           |
 
-`~` в путях раскрывается в `$HOME` на старте. Невалидное значение → ошибка старта `brookd` с явным сообщением и именем ключа. Неизвестный ключ — ошибка парса (strict mode), чтобы опечатки не проходили молча.
+`~` в путях раскрывается в `$HOME` на старте. Невалидное значение → ошибка старта `brook server` с явным сообщением и именем ключа. Неизвестный ключ — ошибка парса (strict mode), чтобы опечатки не проходили молча.
 
-Для каждой загрузки `brookd` собирает **effective-конфиг нарезки**: берёт дефолты из YAML и перекрывает полями `DownloadSpec` там, где клиент их прислал. Степень двойки, `min ≤ max`, `target_count ≥ 1` валидируются в том же месте.
+Для каждой загрузки демон собирает **effective-конфиг нарезки**: берёт дефолты из YAML и перекрывает полями `DownloadSpec` там, где клиент их прислал. Степень двойки, `min ≤ max`, `target_count ≥ 1` валидируются в том же месте.
 
 ## Словарь статусов
 

@@ -6,19 +6,21 @@
 //! Слой `brook-api` не содержит бизнес-логики: он транслирует proto-запросы
 //! в вызовы `DownloadManager` и обратно. Вся реальная работа (очередь,
 //! движки, broadcast событий) живёт в `brook-core`. Биндинг сокета и
-//! настройка `tonic::transport::Server` — дело `brookd`.
+//! настройка `tonic::transport::Server` — дело `brook-daemon`.
 //!
 //! Публичный API:
 //! - [`BrookService`] — реализация proto-сервиса `brook.v1.BrookService`.
-//! - Re-export [`BrookServiceServer`] — чтобы `brookd` подключил сервис
-//!   одной строчкой (`BrookServiceServer::new(BrookService::new(manager))`).
+//! - Re-export [`BrookServiceServer`] — чтобы `brook-daemon` подключил
+//!   сервис одной строчкой (`BrookServiceServer::new(BrookService::new(manager))`).
 //! - [`trace::trace_interceptor`] — tonic-интерцептор, прокидывающий
 //!   `session_id`/`request_id` в `tracing::Span`.
 
+pub mod auth;
 pub mod mapper;
 pub mod service;
 pub mod trace;
 
+pub use auth::AuthInterceptor;
 pub use brook_proto::brook::v1::brook_service_server::BrookServiceServer;
 pub use service::{
     ApiSettings,

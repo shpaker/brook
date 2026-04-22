@@ -6,6 +6,10 @@
 //! Тесты из `tests/` компилируются каждый в свой бинарь — этот модуль
 //! подключается как `mod common;` и живёт per-crate (не публичный).
 
+use std::path::{
+    Path,
+    PathBuf,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +28,9 @@ use brook_core::{
     DownloadManager,
     EngineConfig,
     ManagerConfig,
+    Result as CoreResult,
     RetryPolicy,
+    TPathPolicy,
 };
 use brook_proto::brook::v1::brook_service_client::BrookServiceClient;
 use tokio::net::TcpListener;
@@ -36,6 +42,15 @@ use tonic::transport::{
 
 pub type TestManager =
     DownloadManager<MemoryPieceStorageFactory, MemoryTQueueStore, MockRangeFetch>;
+
+/// No-op `TPathPolicy` для тестов — ядро-тесты не заморочены песочницей.
+struct AllowAnyPath;
+
+impl TPathPolicy for AllowAnyPath {
+    fn check_target_dir(&self, target_dir: &Path) -> CoreResult<PathBuf> {
+        Ok(target_dir.to_path_buf())
+    }
+}
 
 #[allow(dead_code)] // поля трогаются из разных test-бинарей, не каждый использует всё.
 pub struct TestHarness {
@@ -114,7 +129,13 @@ impl HarnessBuilder {
         };
         let manager = Arc::new(DownloadManager::new(factory, queue, fetch, cfg));
         let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let service = BrookService::new(Arc::clone(&manager), ApiSettings::default(), shutdown_tx);
+        let policy: Arc<dyn TPathPolicy> = Arc::new(AllowAnyPath);
+        let service = BrookService::new(
+            Arc::clone(&manager),
+            ApiSettings::default(),
+            policy,
+            shutdown_tx,
+        );
         let server = BrookServiceServer::new(service);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

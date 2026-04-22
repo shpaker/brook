@@ -1,4 +1,4 @@
-//! Единый тип ошибок storage-слоя `brookd`.
+//! Единый тип ошибок storage-слоя `brook-daemon`.
 //!
 //! До этого каждый модуль (`pieces`, `files`, `db`, `paths`) имел свою
 //! thiserror-enum, а `local.rs` бросал `brook_core::Error::Other(format!(...))`
@@ -24,7 +24,7 @@ use super::files::FilesError;
 use super::paths::PathError;
 use super::pieces::PiecesError;
 
-/// Ошибки storage-слоя `brookd`. Внутренний тип: наружу не экспортируется,
+/// Ошибки storage-слоя `brook-daemon`. Внутренний тип: наружу не экспортируется,
 /// на границе портов конвертируется в [`brook_core::Error`].
 #[derive(Debug, Error)]
 pub enum StorageError {

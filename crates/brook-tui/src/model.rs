@@ -4,10 +4,7 @@
 //! публичные — ViewModel живёт целиком внутри крейта, инкапсуляция тут
 //! только раздувала бы код.
 
-use std::collections::{
-    HashMap,
-    HashSet,
-};
+use std::collections::HashMap;
 use std::time::{
     Duration,
     Instant,
@@ -134,17 +131,19 @@ pub enum Mode {
     ConfirmDelete {
         ids: Vec<String>,
     },
+    /// Подтверждение перезапуска упавшей загрузки. Space на Failed
+    /// больше не дёргает retry молча — сначала спрашиваем.
+    ConfirmRetry {
+        ids: Vec<String>,
+    },
     /// Демон не знает id, по которому TUI пытался pause/resume. Предлагаем
     /// либо пере-загрузить (re-add по сохранённым URL/folder), либо
     /// удалить призрак из локального ViewModel.
     Ghost {
         ids: Vec<String>,
     },
-    Help {
-        scroll: u16,
-    },
-    /// На выходе из TUI: гасить `brookd`, которого мы же подняли, или
-    /// оставить крутиться в фоне.
+    /// На выходе из TUI: гасить демон, которого мы же подняли
+    /// (`can_stop_daemon = true`), или оставить крутиться в фоне.
     QuitConfirm,
 }
 
@@ -208,29 +207,28 @@ impl AddModal {
 pub struct ViewModel {
     pub downloads: IndexMap<String, DownloadRow>,
     pub cursor: usize,
-    /// Якорь для Shift-расширения диапазона.
-    pub anchor: Option<usize>,
-    /// Id выделенных строк (stable при переупорядочивании списка).
-    pub selected: HashSet<String>,
     pub connection: ConnectionState,
     pub toast: Option<Toast>,
     pub port: u16,
     pub settings: proto::GetSettingsResponse,
     pub mode: Mode,
+    /// Можем ли мы предложить «остановить демон» в `QuitConfirm`.
+    /// `true` — только если TUI сам запустил локального демона; для
+    /// remote-сессий и случаев, когда демон уже крутился — `false`.
+    pub can_stop_daemon: bool,
 }
 
 impl ViewModel {
-    pub fn new(port: u16, settings: proto::GetSettingsResponse) -> Self {
+    pub fn new(port: u16, settings: proto::GetSettingsResponse, can_stop_daemon: bool) -> Self {
         Self {
             downloads: IndexMap::new(),
             cursor: 0,
-            anchor: None,
-            selected: HashSet::new(),
             connection: ConnectionState::Reconnecting { attempt: 1 },
             toast: None,
             port,
             settings,
             mode: Mode::Normal,
+            can_stop_daemon,
         }
     }
 
@@ -278,8 +276,6 @@ impl ViewModel {
     pub fn reset(&mut self) {
         self.downloads.clear();
         self.cursor = 0;
-        self.anchor = None;
-        self.selected.clear();
     }
 
     /// Идентификаторы в отображаемом порядке с учётом сортировки и
@@ -309,16 +305,10 @@ impl ViewModel {
         }
     }
 
-    /// Список id, на которые действуют bulk-команды (`p`/`r`/`c`): если
-    /// есть выделенные — они, иначе одна строка под курсором.
+    /// Строка под курсором — цель одиночных команд (pause/resume/retry/delete).
+    /// Мультиселекшн удалён: операция всегда работает над одной записью.
     pub fn action_targets(&self) -> Vec<String> {
         let visible = self.visible_ids();
-        if !self.selected.is_empty() {
-            return visible
-                .into_iter()
-                .filter(|id| self.selected.contains(id))
-                .collect();
-        }
         let idx = self.cursor.min(visible.len().saturating_sub(1));
         visible.get(idx).cloned().into_iter().collect()
     }
@@ -329,7 +319,6 @@ impl ViewModel {
     pub fn drop_rows(&mut self, ids: &[String]) {
         for id in ids {
             self.downloads.shift_remove(id);
-            self.selected.remove(id);
         }
         let visible_len = self.visible_ids().len();
         self.clamp_cursor(visible_len);
@@ -347,40 +336,6 @@ impl ViewModel {
             .values()
             .find(|r| r.url == url && r.status != proto::FileStatus::Cancelled)
             .map(|r| r.id.clone())
-    }
-
-    /// Расширяет выделение от `anchor` до `cursor`. Если якоря нет —
-    /// ставит якорь в текущую позицию и помечает её.
-    pub fn extend_selection(&mut self, visible_len: usize) {
-        if visible_len == 0 {
-            return;
-        }
-        let visible = self.visible_ids();
-        let cur = self.cursor.min(visible_len - 1);
-        let anchor = *self.anchor.get_or_insert(cur);
-        let (lo, hi) = if anchor <= cur {
-            (anchor, cur)
-        } else {
-            (cur, anchor)
-        };
-        self.selected.clear();
-        for id in visible.iter().take(hi + 1).skip(lo) {
-            self.selected.insert(id.clone());
-        }
-    }
-
-    /// Toggle выделения текущей строки, фиксирует anchor на ней.
-    pub fn toggle_select_here(&mut self) {
-        let visible = self.visible_ids();
-        if visible.is_empty() {
-            return;
-        }
-        let idx = self.cursor.min(visible.len() - 1);
-        self.anchor = Some(idx);
-        let id = &visible[idx];
-        if !self.selected.remove(id) {
-            self.selected.insert(id.clone());
-        }
     }
 }
 

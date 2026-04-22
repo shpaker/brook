@@ -18,20 +18,23 @@
 
 ## API (gRPC)
 - **Единственный путь** между UI и движком — gRPC. Схема в `brook-proto`. См. [api.md](api.md).
-- Сервер (`brookd`) слушает только `127.0.0.1` (loopback).
+- Сервер (`brook server`) по умолчанию слушает `127.0.0.1`; non-loopback bind требует `--client-pass` (bearer-auth).
 - Контракт: unary команды (`Add`, `Pause`, `Resume`, `Cancel`, `List`, bulk `PauseAll`/`ResumeAll`) + server-streaming событий (progress, state changes).
 - Settings через API в MVP не входят — см. раздел «Конфигурация» ниже.
 
 ## Процессы
-- **`brookd`** — демон, содержит `brook-core` и `brook-api`. Берёт single-instance lock в CWD, открывает `brook.db`, слушает gRPC. Без UI.
-- **`brook`** (крейт `brook-tui`) — ratatui-клиент. gRPC к `brookd` на `127.0.0.1:<port>` (флаг `--port`, дефолт 7090). Клиентов можно запускать сколько угодно — все видят одно состояние через `Watch`.
+Единственный бинарь `brook` с clap-диспетчером. Без подкоманды — TUI; `brook server …` — демон.
+
+- **`brook server --directory <DIR>`** — демон, содержит `brook-core` и `brook-api`. Берёт single-instance lock в CWD, открывает `brook.db`, слушает gRPC, пишет в `.brook.endpoint` актуальный `{host, port}`. `--directory` задаёт корень песочницы (см. [architecture.md#песочница-target_dir](architecture.md#песочница-target_dir)). `--client-pass` включает bearer-auth (см. [architecture.md#аутентификация-bearer](architecture.md#аутентификация-bearer)).
+- **`brook`** — TUI-клиент (крейт `brook-tui`). Читает `.brook.endpoint` из CWD; если демон не отвечает — поднимает его сам через `current_exe() server`. Клиентов можно запускать сколько угодно — все видят одно состояние через `Watch`.
+- **`brook --remote HOST:PORT [--pass …]`** — TUI к удалённому демону. Автоспавна нет; пароль спрашивается на TTY, если не передан.
 
 ## Конфигурация (БД)
 - TOML-файлов нет. Вся конфигурация — в таблице `settings` внутри `./brook.db`.
-- `brookd` на первом старте создаёт БД и сидит `settings` дефолтами.
+- `brook server` на первом старте создаёт БД и сидит `settings` дефолтами.
 - Параметры: дефолты загрузок (воркеры, параллельность, папка), порт API, пути логов, поведение при дубликатах. Ключи — [architecture.md#конфигурация](architecture.md#конфигурация).
 - Правка в MVP — через SQL при остановленном демоне. API-методов и hot-reload нет.
-- Невалидное значение → ошибка старта `brookd` с явным сообщением.
+- Невалидное значение → ошибка старта `brook server` с явным сообщением.
 
 ## UI — `brook` (ratatui)
 - Клавиатурное управление в терминале.

@@ -4,8 +4,10 @@ members = [
     "crates/brook-core",
     "crates/brook-http",
     "crates/brook-api",
-    "crates/brookd",
+    "crates/brook-runtime",
+    "crates/brook-daemon",
     "crates/brook-tui",
+    "crates/brook",
 ]
 resolver = "2"
 
@@ -42,7 +44,9 @@ fs4                = "0.13"
 tempfile           = "3"
 serde              = { version = "1", features = ["derive"] }
 serde_yaml         = "0.9"
-clap               = { version = "4", features = ["derive"] }
+clap               = { version = "4", features = ["derive", "env"] }
 indexmap           = "2"
 tokio-stream       = "0.1"
 arboard            = { version = "3", default-features = false }
+subtle             = "2"
+rpassword          = "7"

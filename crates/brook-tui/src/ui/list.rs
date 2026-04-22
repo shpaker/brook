@@ -40,14 +40,7 @@ pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
             width: area.width,
             height: CARD_HEIGHT,
         };
-        card::draw(
-            f,
-            card_area,
-            row,
-            idx == cursor,
-            vm.selected.contains(&ids[idx]),
-            no_color,
-        );
+        card::draw(f, card_area, row, idx == cursor, no_color);
     }
 }
 

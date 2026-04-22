@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-brook-proto  = { path = "../brook-proto" }
-brook-core   = { path = "../brook-core" }
-tonic        = { workspace = true }
+brook-proto    = { path = "../brook-proto" }
+brook-core     = { path = "../brook-core" }
+brook-runtime  = { path = "../brook-runtime" }
+tonic          = { workspace = true }
+subtle         = { workspace = true }
 tokio        = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync", "net"] }
 prost        = { workspace = true }

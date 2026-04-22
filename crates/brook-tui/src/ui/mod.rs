@@ -1,6 +1,7 @@
-//! Рендер TUI. Одна внешняя rounded-рамка с двумя pipe-tab'ами
-//! (`| brook |` сверху, `| ? help |` снизу), внутри — плоский список
-//! карточек. Модалки и overlay'и идут поверх.
+//! Рендер TUI. Одна внешняя rounded-рамка с двумя bracket-сегментами
+//! (`[ brook | addr ]` сверху, `[ ␣ action | a add | d delete | ? help
+//! ]` снизу), внутри — плоский список карточек. Модалки и overlay'и
+//! идут поверх.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -44,7 +45,7 @@ pub fn draw(f: &mut Frame, vm: &ViewModel) {
         .border_type(BorderType::Rounded)
         .border_style(border_style)
         .title(chrome::top_title(vm))
-        .title_bottom(chrome::help_tab());
+        .title_bottom(chrome::hints_bar(chrome::action_word(vm)));
     if let Some(toast) = chrome::toast_line(vm) {
         block = block.title_bottom(toast);
     }

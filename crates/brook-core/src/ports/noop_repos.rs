@@ -11,7 +11,7 @@
 //! `DownloadManager` / `DownloadEngine`: если вызывающему аналитика
 //! попыток не нужна (тесты ядра, in-memory harness'ы), он собирает
 //! менеджер без персистентных репозиториев — все методы превращаются
-//! в `Ok(())`. Production-путь (brookd) подставляет SQLite-репозитории.
+//! в `Ok(())`. Production-путь (brook-daemon) подставляет SQLite-репозитории.
 
 use std::future::Future;
 

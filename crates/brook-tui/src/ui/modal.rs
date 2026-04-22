@@ -1,4 +1,4 @@
-//! Модалки (§6.6) и help-overlay (§6.7).
+//! Модалки (§6.6).
 //!
 //! Рендер-инфраструктура: `centered` возвращает центрированный Rect
 //! под заданные размеры; `draw_*` функции печатают конкретные модалки
@@ -33,35 +33,14 @@ use crate::model::{
     ViewModel,
 };
 
-const HELP_LINES: &[&str] = &[
-    "navigation",
-    "  ↑ ↓ / j k       — move cursor",
-    "  g / G           — first / last",
-    "  Tab             — toggle selection",
-    "  Shift+↑↓ / J K  — extend selection",
-    "",
-    "actions",
-    "  Space           — primary action on cursor (pause/resume/retry/reveal)",
-    "  Enter           — reveal in Finder",
-    "  a               — add download",
-    "  d               — delete (with confirm)",
-    "",
-    "view",
-    "  ?               — this help",
-    "",
-    "misc",
-    "  q / Ctrl+C      — quit (choose: stop daemon / keep / cancel)",
-    "  Esc             — close modal / help",
-];
-
 pub fn draw_overlay(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     match &vm.mode {
         Mode::Normal => {}
         Mode::Add(m) => draw_add(f, m, no_color),
         Mode::Duplicate { form, existing_id } => draw_duplicate(f, vm, form, existing_id, no_color),
         Mode::ConfirmDelete { ids } => draw_confirm_delete(f, vm, ids, no_color),
+        Mode::ConfirmRetry { ids } => draw_confirm_retry(f, vm, ids, no_color),
         Mode::Ghost { ids } => draw_ghost(f, vm, ids, no_color),
-        Mode::Help { scroll } => draw_help(f, *scroll, no_color),
         Mode::QuitConfirm => draw_quit_confirm(f, vm, no_color),
     }
 }
@@ -204,6 +183,36 @@ fn draw_confirm_delete(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: 
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_confirm_retry(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
+    let area = centered(f.area(), 60, 7);
+    f.render_widget(Clear, area);
+    let block = block("retry download?", no_color);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let summary = if ids.len() == 1 {
+        vm.downloads
+            .get(&ids[0])
+            .map(|r| r.display_name().to_string())
+            .unwrap_or_else(|| ids[0].clone())
+    } else {
+        format!("{} downloads will be retried.", ids.len())
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(format!(" {summary}")),
+        Line::from(" download will resume from where it stopped."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "                    y · yes    n · no    Esc ",
+            hint_style(no_color),
+        ))
+        .alignment(Alignment::Left),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
     let area = centered(f.area(), 60, 8);
     f.render_widget(Clear, area);
@@ -217,13 +226,13 @@ fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
             .map(|r| r.display_name().to_string())
             .unwrap_or_else(|| ids[0].clone())
     } else {
-        format!("{} downloads are not known to brookd.", ids.len())
+        format!("{} downloads are not known to the daemon.", ids.len())
     };
 
     let lines = vec![
         Line::from(""),
         Line::from(format!(" {summary}")),
-        Line::from(" brookd has no record of it anymore."),
+        Line::from(" the daemon has no record of it anymore."),
         Line::from(""),
         Line::from(Span::styled(
             " r · redownload    d · delete    Esc · cancel ",
@@ -247,14 +256,21 @@ fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     } else {
         lines.push(Line::from(" no active downloads."));
     }
-    lines.push(Line::from(" [ quit + stop daemon ]"));
+    // Пункт «остановить демон» и соответствующий хинт скрываем, если
+    // TUI не поднимал демон сам (remote-сессия или внешне запущенный
+    // локальный процесс) — гасить чужой демон мы не имеем права.
+    if vm.can_stop_daemon {
+        lines.push(Line::from(" [ quit + stop daemon ]"));
+    }
     lines.push(Line::from(" [ quit, keep daemon ⏎ ]"));
     lines.push(Line::from(" [ cancel ␛ ]"));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " s · stop daemon    k / Enter · keep daemon    Esc · cancel ",
-        hint_style(no_color),
-    )));
+    let hint = if vm.can_stop_daemon {
+        " s · stop daemon    k / Enter · keep daemon    Esc · cancel "
+    } else {
+        " k / Enter · quit    Esc · cancel "
+    };
+    lines.push(Line::from(Span::styled(hint, hint_style(no_color))));
 
     let h = lines.len() as u16 + 2;
     let area = centered(f.area(), 62, h);
@@ -263,50 +279,6 @@ fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines), inner);
-}
-
-fn draw_help(f: &mut Frame, scroll: u16, no_color: bool) {
-    let full = f.area();
-    f.render_widget(Clear, full);
-    let block = block("help", no_color);
-    let inner = block.inner(full);
-    f.render_widget(block, full);
-
-    let lines: Vec<Line> = HELP_LINES
-        .iter()
-        .map(|s| {
-            if s.is_empty() {
-                Line::from("")
-            } else if !s.starts_with(' ') {
-                Line::from(Span::styled(
-                    (*s).to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from((*s).to_string())
-            }
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
-
-    // Подсказка выхода — в последней строке overlay'я.
-    let footer_area = Rect {
-        x: inner.x,
-        y: inner.y + inner.height.saturating_sub(1),
-        width: inner.width,
-        height: 1,
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            if f.area().height < 25 {
-                " ↑↓ scroll   Esc / ? / q · close "
-            } else {
-                " any key · close "
-            },
-            hint_style(no_color),
-        ))),
-        footer_area,
-    );
 }
 
 // Чтобы Mode::Duplicate можно было рендерить без лишнего заимствования.

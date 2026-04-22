@@ -12,12 +12,12 @@ use brook_proto::brook::v1::{
     ShutdownRequest,
 };
 use tokio::sync::mpsc::UnboundedSender;
-use tonic::transport::Channel;
 use tonic::{
     Code,
     Status,
 };
 
+use crate::connect::AuthedChannel;
 use crate::events::{
     AddForm,
     CmdOutcome,
@@ -35,7 +35,7 @@ const MAX_FILENAME_RETRIES: u32 = 100;
 /// Послать `Add` и, если демон вернул `AlreadyExists`, автоматически
 /// подобрать `<stem> (N).<ext>` и повторить вызов. UI-модалки для
 /// конфликта имени больше нет — политика жёстко «rename на клиенте».
-pub fn add(ch: Channel, tx: UnboundedSender<UiEvent>, form: AddForm) {
+pub fn add(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, form: AddForm) {
     tokio::spawn(async move {
         let mut client = BrookServiceClient::new(ch);
         // Базовое имя — хвост URL (после strip query/fragment). Если
@@ -147,19 +147,19 @@ fn id_request(id: &str) -> IdRequest {
     }
 }
 
-pub fn pause(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
+pub fn pause(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
     run_bulk(ch, tx, ids, "pause", |mut client, req| {
         Box::pin(async move { client.pause(req).await.map(|_| ()) })
     });
 }
 
-pub fn resume(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
+pub fn resume(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
     run_bulk(ch, tx, ids, "resume", |mut client, req| {
         Box::pin(async move { client.resume(req).await.map(|_| ()) })
     });
 }
 
-pub fn retry(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
+pub fn retry(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
     run_bulk(ch, tx, ids, "retry", |mut client, req| {
         Box::pin(async move { client.retry(req).await.map(|_| ()) })
     });
@@ -181,7 +181,7 @@ pub fn reveal_in_finder(target_dir: &str, filename: &str) {
 /// Remove идемпотентен на стороне демона (см. `manager::remove`): ghost
 /// id даст `Ok`. Успешно обработанные id отдаём UI, чтобы тот дропнул
 /// их из ViewModel — событий по удалению демон не генерит.
-pub fn remove(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
+pub fn remove(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
     tokio::spawn(async move {
         let mut removed: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -210,13 +210,13 @@ pub fn remove(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
 }
 
 type BulkFn = fn(
-    BrookServiceClient<Channel>,
+    BrookServiceClient<AuthedChannel>,
     IdRequest,
 )
     -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Status>> + Send>>;
 
 fn run_bulk(
-    ch: Channel,
+    ch: AuthedChannel,
     tx: UnboundedSender<UiEvent>,
     ids: Vec<String>,
     op: &'static str,
@@ -258,7 +258,7 @@ fn short_id(id: &str) -> &str {
 /// Послать `Shutdown` RPC и по завершении (успех или ошибка) отправить
 /// `UiEvent::Quit`. Ошибки игнорируем намеренно: цель — выйти из TUI;
 /// если демон не отозвался, висеть в модалке смысла нет.
-pub fn shutdown_daemon(ch: Channel, tx: UnboundedSender<UiEvent>) {
+pub fn shutdown_daemon(ch: AuthedChannel, tx: UnboundedSender<UiEvent>) {
     tokio::spawn(async move {
         let mut client = BrookServiceClient::new(ch);
         let _ = client.shutdown(ShutdownRequest {}).await;

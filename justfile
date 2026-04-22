@@ -10,23 +10,26 @@ default:
 build:
     cargo build
 
-# Собрать демон
-build-d:
-    cargo build -p brookd
+# Собрать весь workspace (в т.ч. единый бинарь brook)
+build-bin:
+    cargo build -p brook
 
-# Собрать TUI-клиент
-build-tui:
-    cargo build -p brook-tui
-
-# === run ===
-
-# Запустить демон (CWD = рабочая директория; появятся brook.db и .brook.lock)
+# Алиас: запустить демон через `brook server` (CWD = рабочая директория;
+# появятся brook.db и .brook.lock)
 run-d *ARGS:
-    cargo run -p brookd -- {{ARGS}}
+    cargo run -p brook -- server {{ARGS}}
 
-# Запустить TUI-клиент
+# Алиас: запустить TUI-клиент (`brook`)
 run-tui *ARGS:
-    cargo run -p brook-tui -- {{ARGS}}
+    cargo run -p brook -- {{ARGS}}
+
+# Запустить `brook` с произвольными аргументами диспетчера
+run *ARGS:
+    cargo run -p brook -- {{ARGS}}
+
+# Запустить `brook server ...` напрямую
+run-server *ARGS:
+    cargo run -p brook -- server {{ARGS}}
 
 # === test ===
 

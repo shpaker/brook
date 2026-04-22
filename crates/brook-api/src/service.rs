@@ -11,6 +11,7 @@ use brook_core::{
     DownloadManager,
     NoopAttemptRepo,
     NoopWorkerRepo,
+    TPathPolicy,
     TPieceAttemptRepo,
     TPieceStorageFactory,
     TQueueStore,
@@ -36,7 +37,7 @@ use crate::mapper;
 ///
 /// Generics совпадают с `DownloadManager` ради zero-cost: никакого
 /// `dyn`-диспатча, конкретный тип фабрики/очереди/fetch'а известен в
-/// месте сборки (в `brookd` или в тестах).
+/// месте сборки (в `brook-daemon` или в тестах).
 pub struct BrookService<PF, QS, F, WR = NoopWorkerRepo, AR = NoopAttemptRepo>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
@@ -48,15 +49,20 @@ where
 {
     manager: Arc<DownloadManager<PF, QS, F, WR, AR>>,
     settings: ApiSettings,
-    // Сюда уходит «тик» от `Shutdown` RPC. `brookd` получает его через
-    // парный `Receiver` и встраивает в select с SIGTERM/SIGINT. Broadcast
-    // выбран ради `Sender::send` без ownership'а — в сервисе только
-    // клонируемый `Sender`, состояние канала остаётся у демона.
+    /// Sandbox-политика для `target_dir` в `Add`. Проверяется
+    /// **синхронно** до enqueue — чтобы клиент сразу увидел
+    /// `PermissionDenied`, а не висящую `Failed`-запись. Фабрика также
+    /// проверит путь в `prepare()` (defense in depth).
+    path_policy: Arc<dyn TPathPolicy>,
+    // Сюда уходит «тик» от `Shutdown` RPC. Серверный стек получает его
+    // через парный `Receiver` и встраивает в select с SIGTERM/SIGINT.
+    // Broadcast выбран ради `Sender::send` без ownership'а — в сервисе
+    // только клонируемый `Sender`, состояние канала остаётся у демона.
     shutdown_tx: broadcast::Sender<()>,
 }
 
 /// Рантайм-снимок `brook.yaml`, которым обслуживается `GetSettings`.
-/// `brookd` собирает его из `DaemonRuntime` на старте; в тестах
+/// `brook-daemon` собирает его из `DaemonRuntime` на старте; в тестах
 /// `default()` даёт разумные значения.
 #[derive(Debug, Clone)]
 pub struct ApiSettings {
@@ -85,11 +91,13 @@ where
     pub fn new(
         manager: Arc<DownloadManager<PF, QS, F, WR, AR>>,
         settings: ApiSettings,
+        path_policy: Arc<dyn TPathPolicy>,
         shutdown_tx: broadcast::Sender<()>,
     ) -> Self {
         Self {
             manager,
             settings,
+            path_policy,
             shutdown_tx,
         }
     }
@@ -120,7 +128,15 @@ where
             .into_inner()
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
-        let spec = mapper::spec_from_proto(spec)?;
+        let mut spec = mapper::spec_from_proto(spec)?;
+        // Сразу клэмпим target_dir — клиент должен увидеть
+        // PermissionDenied синхронно, а не через Failed-переход
+        // после prepare(). Канонизированный путь уходит в очередь,
+        // factory потом проверит его ещё раз как страховку.
+        spec.target_dir = self
+            .path_policy
+            .check_target_dir(&spec.target_dir)
+            .map_err(mapper::core_err_to_status)?;
         let id = self
             .manager
             .add(spec)

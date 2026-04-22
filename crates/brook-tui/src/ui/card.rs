@@ -21,31 +21,26 @@ use crate::ui::progress::progress_line;
 /// Высота одной карточки: 3 строки содержимого + 1 пустой разделитель.
 pub const CARD_HEIGHT: u16 = 4;
 
-/// Ширина левого «желоба» перед контентом: ticker(2) + glyph(1) +
-/// spaces(3) = 6. Для 2-й и 3-й строк glyph заменяется пробелами.
-const GUTTER: u16 = 6;
-/// Правый margin: action(1) + spaces(2) = 3. Используется только для
-/// первой строки; meta/progress растягиваются до (area.width − GUTTER).
-const RIGHT_MARGIN: u16 = 3;
+/// Ширина левого «желоба» перед контентом: ticker(1) + 2 пробела = 3.
+/// Контент всех трёх строк начинается с одной колонки; на 3-й строке
+/// первым символом контента идёт status-glyph, а сама подпись — через
+/// один пробел после него.
+const GUTTER: u16 = 3;
+/// Правый блок первой строки: `␣  <action>  ` = 6 колонок. Для Cancelled
+/// рисуются шесть пробелов — чтобы правый край не «прыгал».
+const RIGHT_MARGIN: u16 = 6;
 
-pub fn draw(
-    f: &mut Frame,
-    area: Rect,
-    row: &DownloadRow,
-    is_cursor: bool,
-    is_selected: bool,
-    no_color: bool,
-) {
+pub fn draw(f: &mut Frame, area: Rect, row: &DownloadRow, is_cursor: bool, no_color: bool) {
     if area.height == 0 || area.width < GUTTER + RIGHT_MARGIN + 4 {
         return;
     }
-    let ticker = ticker_span(is_cursor, is_selected, no_color);
+    let ticker = ticker_span(is_cursor, no_color);
 
-    let line1 = title_line(row, ticker.clone(), area.width, no_color);
-    let line2 = meta_line(row, ticker.clone(), area.width);
     let content_width = area.width.saturating_sub(GUTTER);
-    let line3_bar = progress_line(row, content_width);
-    let line3 = prefix_with_ticker(ticker, line3_bar);
+    let line1 = title_line(row, ticker.clone(), area.width, no_color);
+    let line2_bar = progress_line(row, content_width);
+    let line2 = prefix_with_ticker(ticker.clone(), line2_bar);
+    let line3 = meta_line(row, ticker, area.width);
 
     let lines = vec![line1, line2, line3];
     f.render_widget(
@@ -59,11 +54,9 @@ pub fn draw(
     );
 }
 
-fn ticker_span(is_cursor: bool, is_selected: bool, no_color: bool) -> Span<'static> {
+fn ticker_span(is_cursor: bool, no_color: bool) -> Span<'static> {
     let (ch, color) = if is_cursor {
         ('▌', Color::Cyan)
-    } else if is_selected {
-        ('▌', Color::DarkGray)
     } else {
         (' ', Color::Reset)
     };
@@ -71,7 +64,7 @@ fn ticker_span(is_cursor: bool, is_selected: bool, no_color: bool) -> Span<'stat
     if !no_color && ch != ' ' {
         style = style.fg(color);
     }
-    Span::styled(format!("{ch} "), style)
+    Span::styled(ch.to_string(), style)
 }
 
 fn dim<S: Into<String>>(s: S) -> Span<'static> {
@@ -88,7 +81,6 @@ fn title_line(
     width: u16,
     _no_color: bool,
 ) -> Line<'static> {
-    let glyph = status_glyph(row.status);
     let action = action_glyph(row.status);
 
     let name_is_dim = matches!(
@@ -96,11 +88,8 @@ fn title_line(
         FileStatus::Done | FileStatus::Failed | FileStatus::Cancelled
     );
 
-    // Доступная ширина под имя: width - ticker(2) - glyph-block(4) - action-block(3).
-    let name_space = width
-        .saturating_sub(2) // ticker
-        .saturating_sub(4) // glyph + 3 spaces
-        .saturating_sub(3) as usize; // action + 2 spaces right margin
+    // ticker(1) + gutter(2) + name + pad + right(6) = width.
+    let name_space = width.saturating_sub(GUTTER).saturating_sub(RIGHT_MARGIN) as usize;
     let name = format::right_ellipsis(row.display_name(), name_space);
     let name_pad = name_space.saturating_sub(name.chars().count());
 
@@ -110,32 +99,56 @@ fn title_line(
         Style::default()
     };
 
-    Line::from(vec![
+    let mut spans = vec![
         ticker,
-        dim(format!("{glyph}   ")),
+        Span::raw("  "),
         Span::styled(name, name_style),
-        Span::raw(" ".repeat(name_pad + 1)),
-        dim(action.to_string()),
-        dim("  "),
-    ])
+        Span::raw(" ".repeat(name_pad)),
+    ];
+    spans.extend(right_hint(action));
+    Line::from(spans)
+}
+
+/// Правый хинт 1-й строки: `␣  <action>  ` (6 колонок). Для статусов без
+/// действия (Cancelled/Unspecified) — шесть пробелов, чтобы ширина
+/// осталась фиксированной и список не дёргался.
+fn right_hint(action: &'static str) -> Vec<Span<'static>> {
+    if action == " " {
+        vec![Span::raw("      ")]
+    } else {
+        vec![
+            dim("␣  ".to_string()),
+            dim(action.to_string()),
+            dim("  ".to_string()),
+        ]
+    }
 }
 
 fn meta_line(row: &DownloadRow, ticker: Span<'static>, width: u16) -> Line<'static> {
-    let content_width = width.saturating_sub(GUTTER) as usize;
+    // После gutter идут glyph(1) + space(1), затем текст. Под сам текст
+    // остаётся content_width - 2.
+    let text_width = width.saturating_sub(GUTTER).saturating_sub(2) as usize;
     let (text, is_err) = meta_text(row);
-    let trimmed = format::right_ellipsis(&text, content_width);
-    let span = if is_err {
+    let trimmed = format::right_ellipsis(&text, text_width);
+    let value = if is_err {
         err_span(trimmed)
     } else {
         dim(trimmed)
     };
-    Line::from(vec![ticker, Span::raw("    "), span])
+    let glyph = status_glyph(row.status);
+    Line::from(vec![
+        ticker,
+        Span::raw("  "),
+        dim(glyph.to_string()),
+        Span::raw(" "),
+        value,
+    ])
 }
 
 fn prefix_with_ticker(ticker: Span<'static>, inner: Line<'static>) -> Line<'static> {
     let mut spans = Vec::with_capacity(inner.spans.len() + 2);
     spans.push(ticker);
-    spans.push(Span::raw("    "));
+    spans.push(Span::raw("  "));
     spans.extend(inner.spans);
     Line::from(spans)
 }
