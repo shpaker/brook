@@ -8,11 +8,10 @@ use brook_proto::brook::v1 as proto;
 use common::HarnessBuilder;
 use tokio_stream::StreamExt;
 
-fn spec(url: &str) -> proto::DownloadSpec {
-    proto::DownloadSpec {
+fn spec(url: &str) -> proto::FileSpec {
+    proto::FileSpec {
         url: url.into(),
         target_dir: "/tmp".into(),
-        workers: 2,
         ..Default::default()
     }
 }
@@ -43,7 +42,7 @@ async fn initial_snapshots_delivered() {
 
     let mut stream = h
         .client
-        .watch(proto::WatchRequest {})
+        .watch_file(proto::WatchFileRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -56,8 +55,8 @@ async fn initial_snapshots_delivered() {
             .expect("stream ended")
             .expect("event ok");
         match ev.kind {
-            Some(proto::event::Kind::Snapshot(s)) => {
-                let id = s.download.as_ref().and_then(|d| d.id.clone()).unwrap();
+            Some(proto::file_event::Kind::Snapshot(s)) => {
+                let id = s.file.as_ref().and_then(|d| d.id.clone()).unwrap();
                 seen.insert(id.value);
             }
             other => panic!("expected snapshot, got {other:?}"),
@@ -82,7 +81,7 @@ async fn watch_forwards_state_changes() {
         .unwrap();
     let mut stream = h
         .client
-        .watch(proto::WatchRequest {})
+        .watch_file(proto::WatchFileRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -108,9 +107,9 @@ async fn watch_forwards_state_changes() {
             .expect("timeout")
             .expect("stream ended")
             .expect("event ok");
-        if let Some(proto::event::Kind::StatusChanged(sc)) = ev.kind {
+        if let Some(proto::file_event::Kind::StatusChanged(sc)) = ev.kind {
             assert_eq!(sc.id.unwrap().value, id.value);
-            assert_eq!(sc.status, proto::DownloadStatus::Paused as i32);
+            assert_eq!(sc.status, proto::FileStatus::Paused as i32);
             saw = true;
             break;
         }
@@ -150,7 +149,7 @@ async fn lagged_client_gets_reconciliation() {
 
     let mut stream = h
         .client
-        .watch(proto::WatchRequest {})
+        .watch_file(proto::WatchFileRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -161,7 +160,10 @@ async fn lagged_client_gets_reconciliation() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(matches!(first.kind, Some(proto::event::Kind::Snapshot(_))));
+    assert!(matches!(
+        first.kind,
+        Some(proto::file_event::Kind::Snapshot(_))
+    ));
 
     // Спамим команды, НЕ читая stream. Клиентский tonic-ресивер заполнится
     // и broadcast-источник вынужден будет сбросить часть событий.

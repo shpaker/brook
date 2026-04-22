@@ -18,8 +18,8 @@ use std::collections::{
 use std::sync::Mutex;
 
 use crate::domain::{
-    DownloadId,
-    DownloadSpec,
+    FileId,
+    FileSpec,
 };
 use crate::error::{
     Error,
@@ -335,8 +335,8 @@ impl TPieceStorageFactory for MemoryPieceStorageFactory {
 
     async fn prepare(
         &self,
-        _id: DownloadId,
-        spec: &DownloadSpec,
+        _id: FileId,
+        spec: &FileSpec,
     ) -> Result<PreparedDownload<Self::Storage, Self::StreamStorage>> {
         let resolved_filename = spec
             .filename
@@ -458,9 +458,9 @@ mod tests {
     #[tokio::test]
     async fn factory_creates_independent_storages() {
         let factory = MemoryPieceStorageFactory::new(2, 3);
-        let spec = DownloadSpec::new("https://example.com/a", "/tmp");
-        let a = factory.prepare(DownloadId::new(), &spec).await.unwrap();
-        let b = factory.prepare(DownloadId::new(), &spec).await.unwrap();
+        let spec = FileSpec::new("https://example.com/a", "/tmp");
+        let a = factory.prepare(FileId::new(), &spec).await.unwrap();
+        let b = factory.prepare(FileId::new(), &spec).await.unwrap();
 
         match a.mode {
             PreparedMode::Known {

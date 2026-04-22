@@ -13,7 +13,7 @@ use std::future::Future;
 
 use crate::domain::{
     AttemptId,
-    DownloadId,
+    FileId,
     WorkerId,
 };
 use crate::error::Result;
@@ -38,7 +38,7 @@ pub trait TPieceAttemptRepo: Send + Sync {
     /// engine-слою ядра неоткуда знать DB-UUID piece'а, да и незачем.
     fn start(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
         piece_number: u32,
         worker_id: WorkerId,
     ) -> impl Future<Output = Result<AttemptRecord>> + Send;
@@ -59,7 +59,7 @@ pub trait TPieceAttemptRepo: Send + Sync {
     /// Перевести все `running`-попытки файла в `paused`.
     fn pause_all_running_for_file(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Перевести все `running`-попытки любого файла в `paused`.

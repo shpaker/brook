@@ -19,11 +19,7 @@ Table files {
 }
 
 Table file_settings {
-  file_id            text [pk, note: 'FK → files.id; 1:1']
-  workers            integer [not null]
-  piece_target_count integer
-  piece_size_min     integer
-  piece_size_max     integer
+  file_id       text [pk, note: 'FK → files.id; 1:1']
   // inspect-derived (NULL до prepare). total_size/piece_size остаются NULL
   // в streaming-режиме (неизвестный Content-Length) — тогда движок идёт
   // append-потоком, piece-строк в `pieces` не заводит.

@@ -6,12 +6,12 @@
 //!
 //! ## Взаимодействие с внешним миром
 //!
-//! - Вход: [`DownloadCommand`] через mpsc (`EngineHandle::pause/resume/cancel`).
-//! - Выход: [`DownloadEvent`] через broadcast — `Progress`, `StateChanged`,
-//!   `Completed`, `Failed`. Канал — `broadcast` (а не `mpsc`), чтобы одно
-//!   событие видели все подписчики (gRPC `Watch` потребителей может быть
-//!   несколько), и без backpressure (engine не должен останавливаться, если
-//!   клиент тупит).
+//! - Вход: [`FileCommand`] через mpsc (`EngineHandle::pause/resume/cancel`).
+//! - Выход: два broadcast-канала — [`FileLifecycleEvent`] (смены статусов,
+//!   `Completed`, `Failed`) и [`ProgressEvent`] (прогресс-тики). Каналы
+//!   разделены, чтобы высокочастотный прогресс не конкурировал по
+//!   capacity с редкими lifecycle-событиями. `broadcast` (а не `mpsc`) —
+//!   одно событие видят все подписчики, без backpressure на engine.
 //!
 //! ## Воркеры и work-stealing
 //!
@@ -30,7 +30,7 @@
 //! ## Агрегация `Progress`
 //!
 //! Раз в `progress_interval` (по умолчанию 200 мс) супервизор читает
-//! атомарный `bytes_done` и отправляет [`DownloadEvent::Progress`]. Частота
+//! атомарный `bytes_done` и отправляет [`ProgressEvent::Tick`]. Частота
 //! эмита ≤ `1 / progress_interval`, тем самым Watch-клиенты не захлёбываются.
 //!
 //! ## Retry
@@ -47,7 +47,10 @@ use std::sync::atomic::{
     AtomicU64,
     Ordering,
 };
-use std::time::Duration;
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use futures_util::StreamExt;
 use tokio::sync::{
@@ -65,12 +68,13 @@ use tracing::{
 
 use crate::domain::{
     AttemptId,
-    DownloadCommand,
-    DownloadEvent,
-    DownloadId,
-    DownloadSpec,
+    FileCommand,
+    FileId,
+    FileLifecycleEvent,
+    FileSpec,
     FileStatus,
     Progress,
+    ProgressEvent,
     WorkerId,
 };
 use crate::ports::{
@@ -99,7 +103,7 @@ use crate::service::retry::{
 /// преаллокации и SQLite-индекса.
 #[derive(Debug, Clone)]
 pub struct EngineInputs {
-    pub spec: DownloadSpec,
+    pub spec: FileSpec,
     pub total_size: u64,
     /// Размер «обычного» piece'а. Последний piece может быть короче, если
     /// `total_size` не кратен `piece_size` — это считается помощником
@@ -116,7 +120,7 @@ pub struct EngineInputs {
 /// Входные данные стриминг-движка (unknown-size / no-Range).
 #[derive(Debug, Clone)]
 pub struct StreamingEngineInputs {
-    pub spec: DownloadSpec,
+    pub spec: FileSpec,
     /// URL после цепочки редиректов (см. [`EngineInputs::effective_url`]).
     pub effective_url: Option<String>,
 }
@@ -177,30 +181,30 @@ impl Default for EngineConfig {
 /// Дроп handle'а **не** останавливает задачу автоматически — менеджер обязан
 /// явно прислать `Cancel`, иначе engine продолжит работу до успеха / fail.
 pub struct EngineHandle {
-    id: DownloadId,
-    cmd_tx: mpsc::UnboundedSender<DownloadCommand>,
+    id: FileId,
+    cmd_tx: mpsc::UnboundedSender<FileCommand>,
     join: JoinHandle<()>,
 }
 
 impl EngineHandle {
-    pub fn id(&self) -> DownloadId {
+    pub fn id(&self) -> FileId {
         self.id
     }
 
     /// Послать команду движку. Возвращает `false`, если задача уже завершилась
     /// и канал закрыт (команду применять некому).
-    pub fn send(&self, cmd: DownloadCommand) -> bool {
+    pub fn send(&self, cmd: FileCommand) -> bool {
         self.cmd_tx.send(cmd).is_ok()
     }
 
     pub fn pause(&self) -> bool {
-        self.send(DownloadCommand::Pause)
+        self.send(FileCommand::Pause)
     }
     pub fn resume(&self) -> bool {
-        self.send(DownloadCommand::Resume)
+        self.send(FileCommand::Resume)
     }
     pub fn cancel(&self) -> bool {
-        self.send(DownloadCommand::Cancel)
+        self.send(FileCommand::Cancel)
     }
 
     /// Дождаться завершения задачи движка.
@@ -250,21 +254,29 @@ enum WorkerMsg {
 /// Фасад старта движка.
 pub struct DownloadEngine;
 
+/// Пара broadcast-receiver'ов, которые отдаёт `DownloadEngine::spawn` —
+/// один для lifecycle-событий, второй для прогресс-тиков. Менеджер
+/// разливает их в соответствующие broadcast-шины наружу.
+pub struct EngineSubscriptions {
+    pub lifecycle: broadcast::Receiver<FileLifecycleEvent>,
+    pub progress: broadcast::Receiver<ProgressEvent>,
+}
+
 impl DownloadEngine {
-    /// Запустить движок для указанной загрузки.
+    /// Запустить движок для указанного файла.
     ///
-    /// Возвращает [`EngineHandle`] для управления и подписчика-receiver для
-    /// событий. Дополнительных подписчиков можно получать через
-    /// `events.resubscribe()`.
+    /// Возвращает [`EngineHandle`] для управления и [`EngineSubscriptions`]
+    /// с двумя broadcast-receiver'ами (lifecycle / progress).
+    /// Дополнительных подписчиков можно получать через `.resubscribe()`.
     pub fn spawn<S, F, WR, AR>(
-        id: DownloadId,
+        id: FileId,
         inputs: EngineInputs,
         config: EngineConfig,
         storage: Arc<S>,
         fetch: Arc<F>,
         workers_repo: Arc<WR>,
         attempts_repo: Arc<AR>,
-    ) -> (EngineHandle, broadcast::Receiver<DownloadEvent>)
+    ) -> (EngineHandle, EngineSubscriptions)
     where
         S: TPieceStorage + Send + Sync + 'static,
         F: TRangeFetch + Send + Sync + 'static,
@@ -272,7 +284,8 @@ impl DownloadEngine {
         AR: TPieceAttemptRepo + Send + Sync + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (events_tx, events_rx) = broadcast::channel(config.events_capacity);
+        let (lifecycle_tx, lifecycle_rx) = broadcast::channel(config.events_capacity);
+        let (progress_tx, progress_rx) = broadcast::channel(config.events_capacity);
 
         let join = tokio::spawn(run_engine(
             id,
@@ -283,10 +296,17 @@ impl DownloadEngine {
             workers_repo,
             attempts_repo,
             cmd_rx,
-            events_tx,
+            lifecycle_tx,
+            progress_tx,
         ));
 
-        (EngineHandle { id, cmd_tx, join }, events_rx)
+        (
+            EngineHandle { id, cmd_tx, join },
+            EngineSubscriptions {
+                lifecycle: lifecycle_rx,
+                progress: progress_rx,
+            },
+        )
     }
 
     /// Запустить стриминг-движок для загрузки с неизвестным `Content-Length`.
@@ -298,14 +318,14 @@ impl DownloadEngine {
     /// - `Progress.bytes_total = 0` как сигнал «размер неизвестен»;
     ///   TUI рендерит indeterminate-gauge.
     pub fn spawn_streaming<SS, F, WR, AR>(
-        id: DownloadId,
+        id: FileId,
         inputs: StreamingEngineInputs,
         config: EngineConfig,
         stream: Arc<SS>,
         fetch: Arc<F>,
         workers_repo: Arc<WR>,
         attempts_repo: Arc<AR>,
-    ) -> (EngineHandle, broadcast::Receiver<DownloadEvent>)
+    ) -> (EngineHandle, EngineSubscriptions)
     where
         SS: TStreamStorage + Send + Sync + 'static,
         F: TRangeFetch + Send + Sync + 'static,
@@ -313,7 +333,8 @@ impl DownloadEngine {
         AR: TPieceAttemptRepo + Send + Sync + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (events_tx, events_rx) = broadcast::channel(config.events_capacity);
+        let (lifecycle_tx, lifecycle_rx) = broadcast::channel(config.events_capacity);
+        let (progress_tx, progress_rx) = broadcast::channel(config.events_capacity);
 
         let join = tokio::spawn(run_streaming_engine(
             id,
@@ -324,24 +345,32 @@ impl DownloadEngine {
             workers_repo,
             attempts_repo,
             cmd_rx,
-            events_tx,
+            lifecycle_tx,
+            progress_tx,
         ));
 
-        (EngineHandle { id, cmd_tx, join }, events_rx)
+        (
+            EngineHandle { id, cmd_tx, join },
+            EngineSubscriptions {
+                lifecycle: lifecycle_rx,
+                progress: progress_rx,
+            },
+        )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_engine<S, F, WR, AR>(
-    id: DownloadId,
+    id: FileId,
     inputs: EngineInputs,
     config: EngineConfig,
     storage: Arc<S>,
     fetch: Arc<F>,
     workers_repo: Arc<WR>,
     attempts_repo: Arc<AR>,
-    mut cmd_rx: mpsc::UnboundedReceiver<DownloadCommand>,
-    events_tx: broadcast::Sender<DownloadEvent>,
+    mut cmd_rx: mpsc::UnboundedReceiver<FileCommand>,
+    events_tx: broadcast::Sender<FileLifecycleEvent>,
+    progress_tx: broadcast::Sender<ProgressEvent>,
 ) where
     S: TPieceStorage + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
@@ -357,7 +386,7 @@ async fn run_engine<S, F, WR, AR>(
         Err(e) => {
             warn!(%id, error = %e, "failed to read pending pieces");
             emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(DownloadEvent::Failed {
+            let _ = events_tx.send(FileLifecycleEvent::Failed {
                 id,
                 error: format!("pending_pieces: {e}"),
             });
@@ -372,12 +401,12 @@ async fn run_engine<S, F, WR, AR>(
         match storage.finalize().await {
             Ok(()) => {
                 emit_status(&events_tx, id, FileStatus::Done);
-                let _ = events_tx.send(DownloadEvent::Completed { id });
+                let _ = events_tx.send(FileLifecycleEvent::Completed { id });
             }
             Err(e) => {
                 warn!(%id, error = %e, "finalize failed");
                 emit_status(&events_tx, id, FileStatus::Failed);
-                let _ = events_tx.send(DownloadEvent::Failed {
+                let _ = events_tx.send(FileLifecycleEvent::Failed {
                     id,
                     error: format!("finalize: {e}"),
                 });
@@ -406,7 +435,7 @@ async fn run_engine<S, F, WR, AR>(
 
     // Решаем, сколько воркеров пустить. No-Range — строго один.
     let worker_count = if inputs.accepts_ranges {
-        inputs.spec.workers.max(1) as usize
+        crate::compute_workers(inputs.total_size).max(1) as usize
     } else {
         1
     };
@@ -420,7 +449,7 @@ async fn run_engine<S, F, WR, AR>(
         Err(e) => {
             warn!(%id, error = %e, "ensure_slots failed");
             emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(DownloadEvent::Failed {
+            let _ = events_tx.send(FileLifecycleEvent::Failed {
                 id,
                 error: format!("ensure_slots: {e}"),
             });
@@ -474,6 +503,7 @@ async fn run_engine<S, F, WR, AR>(
     // Главный цикл супервизора.
     let mut progress_tick = tokio::time::interval(config.progress_interval);
     progress_tick.tick().await; // первый tick — мгновенный, пропускаем.
+    let mut speed_meter = SpeedMeter::new(Duration::from_secs(3));
     let mut pieces_committed: usize = 0;
     let mut final_outcome: Option<Outcome> = None;
     // Маппинг (worker_id, piece_number) → AttemptId для открытых попыток.
@@ -488,21 +518,23 @@ async fn run_engine<S, F, WR, AR>(
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
-                    DownloadCommand::Pause => {
+                    FileCommand::Pause => {
                         if *state_rx.borrow() == RunState::Running {
                             info!(%id, "pausing");
                             let _ = state_tx.send(RunState::Paused);
                             emit_status(&events_tx, id, FileStatus::Paused);
+                            speed_meter.reset();
                         }
                     }
-                    DownloadCommand::Resume => {
+                    FileCommand::Resume => {
                         if *state_rx.borrow() == RunState::Paused {
                             info!(%id, "resuming");
                             let _ = state_tx.send(RunState::Running);
                             emit_status(&events_tx, id, FileStatus::Running);
+                            speed_meter.reset();
                         }
                     }
-                    DownloadCommand::Cancel => {
+                    FileCommand::Cancel => {
                         info!(%id, "cancelling");
                         let _ = state_tx.send(RunState::Stopping);
                         final_outcome = Some(Outcome::Cancelled);
@@ -519,8 +551,9 @@ async fn run_engine<S, F, WR, AR>(
                             break;
                         }
                         pieces_committed += 1;
-                        emit_progress(&events_tx, id, &bytes_done, &inputs,
-                                      pieces_committed as u32, total_pieces);
+                        emit_progress(&progress_tx, id, &bytes_done, &inputs,
+                                      pieces_committed as u32, total_pieces,
+                                      &mut speed_meter);
                     }
                     WorkerMsg::Failed(err) => {
                         warn!(%id, error = %err, "worker reported failure");
@@ -556,8 +589,9 @@ async fn run_engine<S, F, WR, AR>(
                 }
             }
             _ = progress_tick.tick() => {
-                emit_progress(&events_tx, id, &bytes_done, &inputs,
-                              pieces_committed as u32, total_pieces);
+                emit_progress(&progress_tx, id, &bytes_done, &inputs,
+                              pieces_committed as u32, total_pieces,
+                              &mut speed_meter);
             }
             else => {
                 // Все воркеры и command-канал закрылись — работа окончена.
@@ -681,20 +715,21 @@ async fn run_engine<S, F, WR, AR>(
                     info!(%id, "download completed");
                     // Финальный Progress — «100%».
                     emit_progress(
-                        &events_tx,
+                        &progress_tx,
                         id,
                         &bytes_done,
                         &inputs,
                         total_pieces,
                         total_pieces,
+                        &mut speed_meter,
                     );
                     emit_status(&events_tx, id, FileStatus::Done);
-                    let _ = events_tx.send(DownloadEvent::Completed { id });
+                    let _ = events_tx.send(FileLifecycleEvent::Completed { id });
                 }
                 Err(e) => {
                     warn!(%id, error = %e, "finalize failed");
                     emit_status(&events_tx, id, FileStatus::Failed);
-                    let _ = events_tx.send(DownloadEvent::Failed {
+                    let _ = events_tx.send(FileLifecycleEvent::Failed {
                         id,
                         error: format!("finalize: {e}"),
                     });
@@ -704,7 +739,7 @@ async fn run_engine<S, F, WR, AR>(
         Outcome::Failed(err) => {
             warn!(%id, error = %err, "download failed");
             emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(DownloadEvent::Failed { id, error: err });
+            let _ = events_tx.send(FileLifecycleEvent::Failed { id, error: err });
         }
         Outcome::Cancelled => {
             info!(%id, "download cancelled — aborting storage");
@@ -720,28 +755,94 @@ enum Outcome {
     Cancelled,
 }
 
-fn emit_status(tx: &broadcast::Sender<DownloadEvent>, id: DownloadId, status: FileStatus) {
-    let _ = tx.send(DownloadEvent::StatusChanged { id, status });
+fn emit_status(tx: &broadcast::Sender<FileLifecycleEvent>, id: FileId, status: FileStatus) {
+    let _ = tx.send(FileLifecycleEvent::StatusChanged { id, status });
 }
 
 fn emit_progress(
-    tx: &broadcast::Sender<DownloadEvent>,
-    id: DownloadId,
+    tx: &broadcast::Sender<ProgressEvent>,
+    id: FileId,
     bytes_done: &AtomicU64,
     inputs: &EngineInputs,
     pieces_done: u32,
     pieces_total: u32,
+    meter: &mut SpeedMeter,
 ) {
     let done = bytes_done.load(Ordering::Relaxed);
+    meter.observe(Instant::now(), done);
+    let remaining = inputs.total_size.saturating_sub(done);
     let progress = Progress {
         bytes_done: done,
         bytes_total: inputs.total_size,
         pieces_done,
         pieces_total,
-        speed_bps: 0.0,
-        eta_secs: None,
+        speed_bps: meter.speed_bps(),
+        eta_secs: if inputs.total_size > 0 {
+            meter.eta_secs(remaining)
+        } else {
+            None
+        },
     };
-    let _ = tx.send(DownloadEvent::Progress { id, progress });
+    let _ = tx.send(ProgressEvent::Tick { id, progress });
+}
+
+/// Сглаженная скорость по экспоненциальному среднему (EMA).
+///
+/// Каждое наблюдение `(t, bytes_done)` превращается в мгновенную скорость
+/// `Δbytes/Δt`, затем сливается в `smoothed` с весом `α = 1 - exp(-Δt/τ)`.
+/// τ ≈ 3 с — компромисс: достаточно быстро реагирует на изменение,
+/// но не прыгает от отдельных piece-коммитов.
+///
+/// `reset()` обнуляет историю — используется при Pause/Resume, чтобы
+/// первое наблюдение после возобновления стало новой точкой отсчёта
+/// (иначе дыра в Δt даст «мгновенную скорость = Δbytes / долгий Δt»,
+/// т. е. резкое занижение).
+struct SpeedMeter {
+    tau: Duration,
+    last: Option<(Instant, u64)>,
+    smoothed: Option<f64>,
+}
+
+impl SpeedMeter {
+    fn new(tau: Duration) -> Self {
+        Self {
+            tau,
+            last: None,
+            smoothed: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last = None;
+        self.smoothed = None;
+    }
+
+    fn observe(&mut self, now: Instant, bytes: u64) {
+        if let Some((t_prev, b_prev)) = self.last {
+            let dt = now.saturating_duration_since(t_prev).as_secs_f64();
+            if dt > 0.0 && bytes >= b_prev {
+                let instant = (bytes - b_prev) as f64 / dt;
+                let alpha = 1.0 - (-dt / self.tau.as_secs_f64()).exp();
+                self.smoothed = Some(match self.smoothed {
+                    Some(s) => alpha * instant + (1.0 - alpha) * s,
+                    None => instant,
+                });
+            }
+        }
+        self.last = Some((now, bytes));
+    }
+
+    fn speed_bps(&self) -> f64 {
+        self.smoothed.unwrap_or(0.0)
+    }
+
+    fn eta_secs(&self, remaining: u64) -> Option<u64> {
+        let s = self.smoothed?;
+        if s < 1.0 {
+            return None;
+        }
+        Some((remaining as f64 / s).round() as u64)
+    }
 }
 
 /// Достать следующий piece из очереди с учётом паузы/стопа. Возвращает
@@ -1207,15 +1308,16 @@ where
 /// Resume стартуем заново (storage труцируется).
 #[allow(clippy::too_many_arguments)]
 async fn run_streaming_engine<SS, F, WR, AR>(
-    id: DownloadId,
+    id: FileId,
     inputs: StreamingEngineInputs,
     config: EngineConfig,
     stream: Arc<SS>,
     fetch: Arc<F>,
     workers_repo: Arc<WR>,
     _attempts_repo: Arc<AR>,
-    mut cmd_rx: mpsc::UnboundedReceiver<DownloadCommand>,
-    events_tx: broadcast::Sender<DownloadEvent>,
+    mut cmd_rx: mpsc::UnboundedReceiver<FileCommand>,
+    events_tx: broadcast::Sender<FileLifecycleEvent>,
+    progress_tx: broadcast::Sender<ProgressEvent>,
 ) where
     SS: TStreamStorage + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
@@ -1234,7 +1336,7 @@ async fn run_streaming_engine<SS, F, WR, AR>(
         Err(e) => {
             warn!(%id, error = %e, "ensure_slots failed");
             emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(DownloadEvent::Failed {
+            let _ = events_tx.send(FileLifecycleEvent::Failed {
                 id,
                 error: format!("ensure_slots: {e}"),
             });
@@ -1264,16 +1366,16 @@ async fn run_streaming_engine<SS, F, WR, AR>(
                     tokio::select! {
                         Some(cmd) = cmd_rx.recv() => {
                             match cmd {
-                                DownloadCommand::Resume => {
+                                FileCommand::Resume => {
                                     let _ = state_tx.send(RunState::Running);
                                     emit_status(&events_tx, id, FileStatus::Running);
                                 }
-                                DownloadCommand::Cancel => {
+                                FileCommand::Cancel => {
                                     let _ = state_tx.send(RunState::Stopping);
                                     final_outcome = Some(Outcome::Cancelled);
                                     break 'outer;
                                 }
-                                DownloadCommand::Pause => {}
+                                FileCommand::Pause => {}
                             }
                         }
                         _ = state_rx.changed() => {}
@@ -1313,15 +1415,15 @@ async fn run_streaming_engine<SS, F, WR, AR>(
                 biased;
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
-                        DownloadCommand::Pause => {
+                        FileCommand::Pause => {
                             let _ = state_tx.send(RunState::Paused);
                             emit_status(&events_tx, id, FileStatus::Paused);
                             // Уронить стрим — соединение закроется.
                             drop(byte_stream);
                             continue 'outer;
                         }
-                        DownloadCommand::Resume => {}
-                        DownloadCommand::Cancel => {
+                        FileCommand::Resume => {}
+                        FileCommand::Cancel => {
                             let _ = state_tx.send(RunState::Stopping);
                             final_outcome = Some(Outcome::Cancelled);
                             break 'outer;
@@ -1329,7 +1431,7 @@ async fn run_streaming_engine<SS, F, WR, AR>(
                     }
                 }
                 _ = progress_tick.tick() => {
-                    emit_progress_streaming(&events_tx, id, &bytes_done);
+                    emit_progress_streaming(&progress_tx, id, &bytes_done);
                 }
                 chunk = byte_stream.next() => {
                     match chunk {
@@ -1398,14 +1500,14 @@ async fn run_streaming_engine<SS, F, WR, AR>(
         Outcome::Completed => match stream.finalize().await {
             Ok(()) => {
                 info!(%id, "streaming download completed");
-                emit_progress_streaming(&events_tx, id, &bytes_done);
+                emit_progress_streaming(&progress_tx, id, &bytes_done);
                 emit_status(&events_tx, id, FileStatus::Done);
-                let _ = events_tx.send(DownloadEvent::Completed { id });
+                let _ = events_tx.send(FileLifecycleEvent::Completed { id });
             }
             Err(e) => {
                 warn!(%id, error = %e, "streaming finalize failed");
                 emit_status(&events_tx, id, FileStatus::Failed);
-                let _ = events_tx.send(DownloadEvent::Failed {
+                let _ = events_tx.send(FileLifecycleEvent::Failed {
                     id,
                     error: format!("finalize: {e}"),
                 });
@@ -1414,7 +1516,7 @@ async fn run_streaming_engine<SS, F, WR, AR>(
         Outcome::Failed(err) => {
             warn!(%id, error = %err, "streaming download failed");
             emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(DownloadEvent::Failed { id, error: err });
+            let _ = events_tx.send(FileLifecycleEvent::Failed { id, error: err });
         }
         Outcome::Cancelled => {
             info!(%id, "streaming download cancelled");
@@ -1425,8 +1527,8 @@ async fn run_streaming_engine<SS, F, WR, AR>(
 }
 
 fn emit_progress_streaming(
-    tx: &broadcast::Sender<DownloadEvent>,
-    id: DownloadId,
+    tx: &broadcast::Sender<ProgressEvent>,
+    id: FileId,
     bytes_done: &AtomicU64,
 ) {
     let done = bytes_done.load(Ordering::Relaxed);
@@ -1439,7 +1541,7 @@ fn emit_progress_streaming(
         speed_bps: 0.0,
         eta_secs: None,
     };
-    let _ = tx.send(DownloadEvent::Progress { id, progress });
+    let _ = tx.send(ProgressEvent::Tick { id, progress });
 }
 
 #[cfg(all(test, feature = "test-utils"))]
@@ -1453,9 +1555,10 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        DownloadEvent,
-        DownloadId,
-        DownloadSpec,
+        FileId,
+        FileLifecycleEvent,
+        FileSpec,
+        ProgressEvent,
     };
     use crate::ports::{
         InspectError,
@@ -1642,15 +1745,10 @@ mod tests {
 
     fn inputs_range(plan: TestPlan) -> EngineInputs {
         EngineInputs {
-            spec: DownloadSpec {
+            spec: FileSpec {
                 url: "https://test/f".into(),
                 target_dir: "/tmp".into(),
                 filename: Some("f".into()),
-                workers: 2,
-                piece_target_count: None,
-                piece_size_min: None,
-                piece_size_max: None,
-                on_file_exists_override: Default::default(),
             },
             total_size: plan.total(),
             piece_size: plan.piece_size,
@@ -1660,14 +1758,16 @@ mod tests {
         }
     }
 
-    async fn collect_events(mut rx: broadcast::Receiver<DownloadEvent>) -> Vec<DownloadEvent> {
+    async fn collect_events(
+        mut rx: broadcast::Receiver<FileLifecycleEvent>,
+    ) -> Vec<FileLifecycleEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.recv().await {
             let terminal = matches!(
                 ev,
-                DownloadEvent::Completed { .. }
-                    | DownloadEvent::Failed { .. }
-                    | DownloadEvent::StatusChanged {
+                FileLifecycleEvent::Completed { .. }
+                    | FileLifecycleEvent::Failed { .. }
+                    | FileLifecycleEvent::StatusChanged {
                         status: FileStatus::Cancelled,
                         ..
                     }
@@ -1688,8 +1788,14 @@ mod tests {
         };
         let storage = Arc::new(MemoryPieceStorage::new(3, 20));
         let fetch = Arc::new(MockFetch::always_ok(plan));
-        let (handle, rx) = DownloadEngine::spawn(
-            DownloadId::new(),
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
+            FileId::new(),
             inputs_range(plan),
             fast_config(),
             storage.clone(),
@@ -1702,7 +1808,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, DownloadEvent::Completed { .. }))
+                .any(|e| matches!(e, FileLifecycleEvent::Completed { .. }))
         );
         let snap = storage.snapshot();
         assert!(snap.finalized);
@@ -1718,8 +1824,14 @@ mod tests {
         let storage = Arc::new(MemoryPieceStorage::new(2, 20));
         let fetch = Arc::new(MockFetch::always_ok(plan));
         fetch.set_piece_plan(0, vec![Outcome::Transient500, Outcome::Transient500]);
-        let (handle, rx) = DownloadEngine::spawn(
-            DownloadId::new(),
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
+            FileId::new(),
             inputs_range(plan),
             fast_config(),
             storage.clone(),
@@ -1732,7 +1844,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, DownloadEvent::Completed { .. }))
+                .any(|e| matches!(e, FileLifecycleEvent::Completed { .. }))
         );
         assert!(storage.snapshot().finalized);
     }
@@ -1747,8 +1859,14 @@ mod tests {
         let fetch = Arc::new(MockFetch::always_ok(plan));
         // Первая попытка — отдали 10 байт и отключились; вторая — полный piece.
         fetch.set_piece_plan(0, vec![Outcome::Truncated(10)]);
-        let (handle, rx) = DownloadEngine::spawn(
-            DownloadId::new(),
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
+            FileId::new(),
             inputs_range(plan),
             fast_config(),
             storage.clone(),
@@ -1769,8 +1887,14 @@ mod tests {
         };
         let storage = Arc::new(MemoryPieceStorage::new(6, 20));
         let fetch = Arc::new(MockFetch::always_ok(plan).with_delay(Duration::from_millis(30)));
-        let (handle, mut rx) = DownloadEngine::spawn(
-            DownloadId::new(),
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: mut rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
+            FileId::new(),
             inputs_range(plan),
             fast_config(),
             storage.clone(),
@@ -1789,13 +1913,13 @@ mod tests {
         let mut saw_completed = false;
         while let Ok(ev) = rx.recv().await {
             match ev {
-                DownloadEvent::StatusChanged {
+                FileLifecycleEvent::StatusChanged {
                     status: FileStatus::Paused,
                     ..
                 } => {
                     saw_paused = true;
                 }
-                DownloadEvent::Completed { .. } => {
+                FileLifecycleEvent::Completed { .. } => {
                     saw_completed = true;
                     break;
                 }
@@ -1815,8 +1939,14 @@ mod tests {
         };
         let storage = Arc::new(MemoryPieceStorage::new(6, 20));
         let fetch = Arc::new(MockFetch::always_ok(plan).with_delay(Duration::from_millis(30)));
-        let (handle, mut rx) = DownloadEngine::spawn(
-            DownloadId::new(),
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: mut rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
+            FileId::new(),
             inputs_range(plan),
             fast_config(),
             storage.clone(),
@@ -1830,7 +1960,7 @@ mod tests {
         while let Ok(ev) = rx.recv().await {
             if matches!(
                 ev,
-                DownloadEvent::StatusChanged {
+                FileLifecycleEvent::StatusChanged {
                     status: FileStatus::Cancelled,
                     ..
                 }
@@ -1854,8 +1984,14 @@ mod tests {
         let mut cfg = fast_config();
         cfg.progress_interval = Duration::from_millis(200);
         let start = std::time::Instant::now();
-        let (handle, mut rx) = DownloadEngine::spawn(
-            DownloadId::new(),
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: mut rx,
+                progress: mut progress_rx,
+            },
+        ) = DownloadEngine::spawn(
+            FileId::new(),
             inputs_range(plan),
             cfg,
             storage.clone(),
@@ -1864,12 +2000,21 @@ mod tests {
             noop_repos().1,
         );
         let mut progress_count = 0;
-        while let Ok(ev) = rx.recv().await {
-            if matches!(ev, DownloadEvent::Progress { .. }) {
-                progress_count += 1;
-            }
-            if matches!(ev, DownloadEvent::Completed { .. }) {
-                break;
+        loop {
+            tokio::select! {
+                p = progress_rx.recv() => {
+                    if let Ok(ProgressEvent::Tick { .. }) = p {
+                        progress_count += 1;
+                    }
+                }
+                l = rx.recv() => {
+                    match l {
+                        Ok(FileLifecycleEvent::Completed { .. }) => break,
+                        Ok(FileLifecycleEvent::Failed { .. }) => break,
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
             }
         }
         handle.join.await.unwrap();
@@ -1892,9 +2037,14 @@ mod tests {
         let fetch = Arc::new(MockFetch::always_ok(plan));
         let mut inputs = inputs_range(plan);
         inputs.accepts_ranges = false;
-        inputs.spec.workers = 4;
-        let (handle, rx) = DownloadEngine::spawn(
-            DownloadId::new(),
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
+            FileId::new(),
             inputs,
             fast_config(),
             storage.clone(),
@@ -1907,7 +2057,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, DownloadEvent::Completed { .. }))
+                .any(|e| matches!(e, FileLifecycleEvent::Completed { .. }))
         );
         // Всего один fetch_full вызов (без ретраев).
         assert_eq!(fetch.calls.load(Ordering::Relaxed), 1);
@@ -1938,13 +2088,19 @@ mod tests {
         };
         let workers = Arc::new(MemoryWorkerRepo::new());
         let attempts = Arc::new(MemoryAttemptRepo::new());
-        let file_id = DownloadId::new();
+        let file_id = FileId::new();
 
         // Сессия 1: медленный fetch — снимаем её до финализации
         // (drop handle на половине работы).
         let storage1 = Arc::new(MemoryPieceStorage::new(4, 20));
         let fetch1 = Arc::new(MockFetch::always_ok(plan).with_delay(Duration::from_millis(200)));
-        let (handle1, _rx1) = DownloadEngine::spawn(
+        let (
+            handle1,
+            EngineSubscriptions {
+                lifecycle: _rx1,
+                progress: _progress_rx1,
+            },
+        ) = DownloadEngine::spawn(
             file_id,
             inputs_range(plan),
             fast_config(),
@@ -1959,7 +2115,10 @@ mod tests {
         handle1.join.abort();
         let _ = handle1.join.await;
         let first_ids: Vec<_> = workers.by_file(file_id).iter().map(|w| w.id).collect();
-        assert_eq!(first_ids.len(), 2);
+        // `compute_workers` на малых test-size даёт 1 воркера; важна не
+        // мощность, а disjoint-свойство между сессиями.
+        let per_session = crate::compute_workers(plan.total()) as usize;
+        assert_eq!(first_ids.len(), per_session);
         // Строки всё ещё `running` — engine не успел их перевести.
         for w in workers.by_file(file_id) {
             assert_eq!(w.status, WorkerStatus::Running);
@@ -1968,7 +2127,13 @@ mod tests {
         // Сессия 2: свежий storage и быстрый fetch.
         let storage2 = Arc::new(MemoryPieceStorage::new(4, 20));
         let fetch2 = Arc::new(MockFetch::always_ok(plan));
-        let (handle2, rx2) = DownloadEngine::spawn(
+        let (
+            handle2,
+            EngineSubscriptions {
+                lifecycle: rx2,
+                progress: _progress_rx2,
+            },
+        ) = DownloadEngine::spawn(
             file_id,
             inputs_range(plan),
             fast_config(),
@@ -1981,13 +2146,13 @@ mod tests {
         handle2.join.await.unwrap();
 
         let all = workers.by_file(file_id);
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), per_session * 2);
         let second_ids: Vec<_> = all
             .iter()
             .filter(|w| !first_ids.contains(&w.id))
             .map(|w| w.id)
             .collect();
-        assert_eq!(second_ids.len(), 2);
+        assert_eq!(second_ids.len(), per_session);
         for w in all {
             if first_ids.contains(&w.id) {
                 assert_eq!(w.status, WorkerStatus::Paused);
@@ -2003,7 +2168,7 @@ mod tests {
     async fn crash_recovery_sweep_paves_the_way_for_next_session() {
         let workers = Arc::new(MemoryWorkerRepo::new());
         let attempts = Arc::new(MemoryAttemptRepo::new());
-        let file_id = DownloadId::new();
+        let file_id = FileId::new();
 
         // Эмулируем 3 «залипших» running-воркера.
         let stale = workers.ensure_slots(file_id, 3).await.unwrap();
@@ -2028,7 +2193,13 @@ mod tests {
         };
         let storage = Arc::new(MemoryPieceStorage::new(1, 20));
         let fetch = Arc::new(MockFetch::always_ok(plan));
-        let (handle, rx) = DownloadEngine::spawn(
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
             file_id,
             inputs_range(plan),
             fast_config(),
@@ -2074,11 +2245,16 @@ mod tests {
 
         let workers = Arc::new(MemoryWorkerRepo::new());
         let attempts = Arc::new(MemoryAttemptRepo::new());
-        let file_id = DownloadId::new();
+        let file_id = FileId::new();
 
-        let mut inputs = inputs_range(plan);
-        inputs.spec.workers = 1;
-        let (handle, rx) = DownloadEngine::spawn(
+        let inputs = inputs_range(plan);
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
             file_id,
             inputs,
             fast_config(),
@@ -2114,9 +2290,15 @@ mod tests {
         let fetch = Arc::new(MockFetch::always_ok(plan).with_delay(Duration::from_millis(50)));
         let workers = Arc::new(MemoryWorkerRepo::new());
         let attempts = Arc::new(MemoryAttemptRepo::new());
-        let file_id = DownloadId::new();
+        let file_id = FileId::new();
 
-        let (handle, mut rx) = DownloadEngine::spawn(
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: mut rx,
+                progress: _progress_rx,
+            },
+        ) = DownloadEngine::spawn(
             file_id,
             inputs_range(plan),
             fast_config(),
@@ -2132,7 +2314,7 @@ mod tests {
         while let Ok(ev) = rx.recv().await {
             if matches!(
                 ev,
-                DownloadEvent::StatusChanged {
+                FileLifecycleEvent::StatusChanged {
                     status: FileStatus::Cancelled,
                     ..
                 }
@@ -2159,10 +2341,12 @@ mod tests {
         assert_eq!(still_running, 0);
     }
 
-    /// `max_workers` меняется между сессиями: 4 → 2. Первый набор — paused,
-    /// второй — 2 свежих записи со `slot_index` 0, 1.
+    /// Две сессии подряд на один файл: первый набор воркеров → paused/done,
+    /// вторая сессия создаёт свежие worker-строки. Количество воркеров
+    /// теперь выводится из `total_size` (`compute_workers`) и между
+    /// сессиями совпадает, поэтому проверяем только, что identity свежая.
     #[tokio::test]
-    async fn worker_count_change_between_sessions() {
+    async fn worker_rows_are_fresh_between_sessions() {
         let plan = TestPlan {
             piece_size: 20,
             count: 2,
@@ -2171,11 +2355,16 @@ mod tests {
         let fetch = Arc::new(MockFetch::always_ok(plan));
         let workers = Arc::new(MemoryWorkerRepo::new());
         let attempts = Arc::new(MemoryAttemptRepo::new());
-        let file_id = DownloadId::new();
+        let file_id = FileId::new();
 
-        let mut inputs1 = inputs_range(plan);
-        inputs1.spec.workers = 4;
-        let (h1, rx1) = DownloadEngine::spawn(
+        let inputs1 = inputs_range(plan);
+        let (
+            h1,
+            EngineSubscriptions {
+                lifecycle: rx1,
+                progress: _progress_rx1,
+            },
+        ) = DownloadEngine::spawn(
             file_id,
             inputs1,
             fast_config(),
@@ -2187,12 +2376,18 @@ mod tests {
         let _ = collect_events(rx1).await;
         h1.join.await.unwrap();
         let first_ids: Vec<_> = workers.by_file(file_id).iter().map(|w| w.id).collect();
-        assert_eq!(first_ids.len(), 4);
+        assert!(!first_ids.is_empty());
+        let first_count = first_ids.len();
 
         let storage2 = Arc::new(MemoryPieceStorage::new(2, 20));
-        let mut inputs2 = inputs_range(plan);
-        inputs2.spec.workers = 2;
-        let (h2, rx2) = DownloadEngine::spawn(
+        let inputs2 = inputs_range(plan);
+        let (
+            h2,
+            EngineSubscriptions {
+                lifecycle: rx2,
+                progress: _progress_rx2,
+            },
+        ) = DownloadEngine::spawn(
             file_id,
             inputs2,
             fast_config(),
@@ -2205,11 +2400,8 @@ mod tests {
         h2.join.await.unwrap();
 
         let all = workers.by_file(file_id);
-        assert_eq!(all.len(), 6, "4 старых + 2 свежих");
+        assert_eq!(all.len(), first_count * 2, "старые + свежие идентичности");
         let fresh: Vec<_> = all.iter().filter(|w| !first_ids.contains(&w.id)).collect();
-        assert_eq!(fresh.len(), 2);
-        let mut slots: Vec<_> = fresh.iter().map(|w| w.slot_index).collect();
-        slots.sort_unstable();
-        assert_eq!(slots, vec![0, 1]);
+        assert_eq!(fresh.len(), first_count);
     }
 }

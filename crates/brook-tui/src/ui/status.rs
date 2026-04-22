@@ -3,7 +3,7 @@
 //! Строка 1: `brook · ●/◐/○ 127.0.0.1:<port> [attempt N]`.
 //! Строка 2: счётчики + `↓ <speed>`, с адаптивным сужением.
 
-use brook_proto::brook::v1::DownloadStatus;
+use brook_proto::brook::v1::FileStatus;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{
@@ -64,13 +64,13 @@ fn line_counters(vm: &ViewModel, width: usize) -> Line<'static> {
     let mut speed = 0.0_f64;
     for r in vm.downloads.values() {
         match r.status {
-            DownloadStatus::Running => {
+            FileStatus::Running => {
                 running += 1;
                 speed += r.progress.speed_bps;
             }
-            DownloadStatus::Pending => queued += 1,
-            DownloadStatus::Paused => paused += 1,
-            DownloadStatus::Retrying => retrying += 1,
+            FileStatus::Pending => queued += 1,
+            FileStatus::Paused => paused += 1,
+            FileStatus::Retrying => retrying += 1,
             _ => {}
         }
     }

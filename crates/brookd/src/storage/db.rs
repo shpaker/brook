@@ -112,10 +112,6 @@ CREATE TABLE IF NOT EXISTS files (
 
 CREATE TABLE IF NOT EXISTS file_settings (
     file_id            TEXT    PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-    workers            INTEGER NOT NULL,
-    piece_target_count INTEGER,
-    piece_size_min     INTEGER,
-    piece_size_max     INTEGER,
     total_size         INTEGER,
     piece_size         INTEGER,
     etag               TEXT,

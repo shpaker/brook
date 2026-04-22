@@ -21,8 +21,8 @@
 use std::future::Future;
 
 use crate::domain::{
-    DownloadId,
-    DownloadSpec,
+    FileId,
+    FileSpec,
 };
 use crate::error::Result;
 use crate::ports::RangeGuard;
@@ -156,7 +156,7 @@ pub trait TPieceStorageFactory: Send + Sync {
     /// через общий `SharedDb`.
     fn prepare(
         &self,
-        id: DownloadId,
-        spec: &DownloadSpec,
+        id: FileId,
+        spec: &FileSpec,
     ) -> impl Future<Output = Result<PreparedDownload<Self::Storage, Self::StreamStorage>>> + Send;
 }

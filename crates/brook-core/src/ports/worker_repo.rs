@@ -12,7 +12,7 @@
 use std::future::Future;
 
 use crate::domain::{
-    DownloadId,
+    FileId,
     WorkerId,
 };
 use crate::error::Result;
@@ -23,7 +23,7 @@ use crate::error::Result;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRecord {
     pub id: WorkerId,
-    pub file_id: DownloadId,
+    pub file_id: FileId,
     pub slot_index: usize,
     pub started_at: i64,
     pub finished_at: Option<i64>,
@@ -40,7 +40,7 @@ pub trait TWorkerRepo: Send + Sync {
     /// `0..n-1`, и возвращаются вызывающему.
     fn ensure_slots(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
         n: usize,
     ) -> impl Future<Output = Result<Vec<WorkerRecord>>> + Send;
 
@@ -64,7 +64,7 @@ pub trait TWorkerRepo: Send + Sync {
     /// Используется, когда engine ставит файл на паузу.
     fn pause_all_running_for_file(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Перевести всех `running`-воркеров любого файла в `paused`.

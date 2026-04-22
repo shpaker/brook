@@ -5,18 +5,18 @@ import "google/protobuf/timestamp.proto";
 
 // Основной сервис управления загрузками.
 service BrookService {
-  // Получить список всех загрузок.
+  // Получить список всех файлов.
   rpc List(ListRequest) returns (ListResponse);
-  // Добавить новую загрузку.
+  // Добавить новый файл в очередь.
   rpc Add(AddRequest) returns (AddResponse);
-  // Удалить загрузку по идентификатору.
+  // Удалить файл по идентификатору.
   rpc Remove(RemoveRequest) returns (RemoveResponse);
 
-  // Поставить загрузку на паузу.
+  // Поставить загрузку файла на паузу.
   rpc Pause(IdRequest) returns (StatusResponse);
-  // Возобновить приостановленную загрузку.
+  // Возобновить приостановленную загрузку файла.
   rpc Resume(IdRequest) returns (StatusResponse);
-  // Отменить загрузку.
+  // Отменить загрузку файла.
   rpc Cancel(IdRequest) returns (StatusResponse);
 
   // Поставить все загрузки на паузу.
@@ -24,8 +24,12 @@ service BrookService {
   // Возобновить все приостановленные загрузки.
   rpc ResumeAll(ResumeAllRequest) returns (StatusResponse);
 
-  // Server-streaming: события по всем известным загрузкам.
-  rpc Watch(WatchRequest) returns (stream Event);
+  // Server-streaming: события жизненного цикла по всем файлам (status,
+  // snapshot, completed, failed).
+  rpc WatchFile(WatchFileRequest) returns (stream FileEvent);
+
+  // Server-streaming: тики прогресса по всем файлам.
+  rpc WatchProgress(WatchProgressRequest) returns (stream ProgressTick);
 
   // Настройки демона — дефолты и политики — для префилла модалок клиента.
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
@@ -37,156 +41,116 @@ service BrookService {
   rpc Shutdown(ShutdownRequest) returns (StatusResponse);
 }
 
-// Уникальный идентификатор загрузки (UUID в виде строки).
-message DownloadId {
+// Уникальный идентификатор файла (UUID в виде строки).
+message FileId {
   string value = 1;
 }
 
-// Параметры создаваемой загрузки.
-message DownloadSpec {
+// Параметры создаваемого файла.
+message FileSpec {
   string url = 1;
   // Директория назначения.
   string target_dir = 2;
   // Явно заданное имя файла (пусто — вывести из Content-Disposition/URL).
   optional string filename = 3;
-  // Сколько параллельных воркеров. `0` — сервер подставит дефолт.
-  uint32 workers = 4;
-
-  // Override'ы piece-параметров. `None` — брать дефолт из конфига демона.
-  // Целевое число piece'ов на файл (алгоритм нарезки, см. architecture.md).
-  optional uint32 piece_target_count = 5;
-  // Минимальный размер piece'а в байтах (должен быть степенью двойки).
-  optional uint64 piece_size_min = 6;
-  // Максимальный размер piece'а в байтах (должен быть степенью двойки).
-  optional uint64 piece_size_max = 7;
-
-  // Что делать, если целевой файл уже существует. `UNSPECIFIED` —
-  // поведение по умолчанию сервера (`FileExists`-ошибка, решение
-  // принимает клиент). `RENAME` — сервер подбирает `<name> (N).<ext>`.
-  // `OVERWRITE` — сервер удаляет существующий файл перед стартом.
-  OnFileExistsOverride on_file_exists_override = 8;
 }
 
-// Политика для клиента: что делать, когда `Add` упирается в существующий
-// файл на диске. Клиент получает `UNSPECIFIED`-ошибку, показывает модалку,
-// и повторяет `Add` с явно выставленным override.
-enum OnFileExistsOverride {
-  ON_FILE_EXISTS_OVERRIDE_UNSPECIFIED = 0;
-  ON_FILE_EXISTS_OVERRIDE_RENAME = 1;
-  ON_FILE_EXISTS_OVERRIDE_OVERWRITE = 2;
+// Статус файла.
+enum FileStatus {
+  FILE_STATUS_UNSPECIFIED = 0;
+  FILE_STATUS_PENDING = 1;
+  FILE_STATUS_RUNNING = 2;
+  FILE_STATUS_PAUSED = 3;
+  FILE_STATUS_RETRYING = 4;
+  FILE_STATUS_DONE = 5;
+  FILE_STATUS_FAILED = 6;
+  FILE_STATUS_CANCELLED = 7;
 }
 
-// Статус загрузки.
-enum DownloadStatus {
-  DOWNLOAD_STATUS_UNSPECIFIED = 0;
-  DOWNLOAD_STATUS_PENDING = 1;
-  DOWNLOAD_STATUS_RUNNING = 2;
-  DOWNLOAD_STATUS_PAUSED = 3;
-  DOWNLOAD_STATUS_RETRYING = 4;
-  DOWNLOAD_STATUS_DONE = 5;
-  DOWNLOAD_STATUS_FAILED = 6;
-  DOWNLOAD_STATUS_CANCELLED = 7;
-}
-
-// Текущий прогресс загрузки.
-message Progress {
-  uint64 bytes_done = 1;
-  // 0, если размер неизвестен.
-  uint64 bytes_total = 2;
-  uint32 pieces_done = 3;
-  uint32 pieces_total = 4;
-  double speed_bps = 5;
-  // Отсутствует, если неизвестно.
-  optional uint64 eta_secs = 6;
-}
-
-// Полное состояние загрузки.
-message Download {
-  DownloadId id = 1;
-  DownloadSpec spec = 2;
-  DownloadStatus status = 3;
-  Progress progress = 4;
+// Полное состояние файла. Без прогресса — прогресс отдельным стримом
+// WatchProgress.
+message File {
+  FileId id = 1;
+  FileSpec spec = 2;
+  FileStatus status = 3;
   // Номер текущей попытки (с 1).
-  uint32 attempt = 5;
+  uint32 attempt = 4;
   // Заполняется только для FAILED / RETRYING.
-  optional string error = 6;
-  google.protobuf.Timestamp created_at = 7;
-  google.protobuf.Timestamp updated_at = 8;
+  optional string error = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
 }
 
-// Тик прогресса.
-message ProgressEvent {
-  DownloadId id = 1;
-  Progress progress = 2;
-}
-
-// Смена статуса.
+// Смена статуса файла.
 message StatusChangedEvent {
-  DownloadId id = 1;
-  DownloadStatus status = 2;
+  FileId id = 1;
+  FileStatus status = 2;
 }
 
-// Обновление отдельного куска — для чанкового прогрессбара.
-message WorkerUpdateEvent {
-  DownloadId id = 1;
-  uint32 piece_index = 2;
-  // Доля скачанного в этом piece'е, 0.0..=1.0.
-  float fraction = 3;
-}
-
-// Загрузка успешно завершена.
+// Файл успешно скачан.
 message CompletedEvent {
-  DownloadId id = 1;
+  FileId id = 1;
 }
 
-// Загрузка упала окончательно.
+// Файл окончательно упал.
 message FailedEvent {
-  DownloadId id = 1;
+  FileId id = 1;
   string error = 2;
 }
 
-// Полный снимок — initial-sync для Watch и реконсиляция после Lagged.
+// Полный снимок — initial-sync для WatchFile и реконсиляция после Lagged.
 message SnapshotEvent {
-  Download download = 1;
+  File file = 1;
 }
 
-// Событие в Watch-стриме. Формы варьируются в `kind`.
-message Event {
+// Событие жизненного цикла файла. Формы варьируются в `kind`.
+message FileEvent {
   oneof kind {
-    ProgressEvent progress = 1;
+    SnapshotEvent snapshot = 1;
     StatusChangedEvent status_changed = 2;
-    WorkerUpdateEvent worker_update = 3;
-    CompletedEvent completed = 4;
-    FailedEvent failed = 5;
-    SnapshotEvent snapshot = 6;
+    CompletedEvent completed = 3;
+    FailedEvent failed = 4;
   }
+}
+
+// Тик прогресса по одному файлу.
+message ProgressTick {
+  FileId file_id = 1;
+  // Доля скачанного, 0.0..=1.0.
+  double progress = 2;
+  uint64 bytes_done = 3;
+  // 0, если размер неизвестен.
+  uint64 bytes_total = 4;
+  double speed_bps = 5;
+  // Отсутствует, если неизвестно.
+  optional uint64 eta_secs = 6;
 }
 
 message ListRequest {
 }
 
 message ListResponse {
-  repeated Download downloads = 1;
+  repeated File files = 1;
 }
 
 message AddRequest {
-  DownloadSpec spec = 1;
+  FileSpec spec = 1;
 }
 
 message AddResponse {
-  DownloadId id = 1;
+  FileId id = 1;
 }
 
 message RemoveRequest {
-  DownloadId id = 1;
+  FileId id = 1;
 }
 
 message RemoveResponse {
 }
 
-// Запрос по идентификатору загрузки.
+// Запрос по идентификатору файла.
 message IdRequest {
-  DownloadId id = 1;
+  FileId id = 1;
 }
 
 // Универсальный ответ об успехе или ошибке операции.
@@ -196,8 +160,12 @@ message StatusResponse {
   string message = 2;
 }
 
-// Параметры подписки (зарезервировано для будущих фильтров).
-message WatchRequest {
+// Параметры подписки на события жизненного цикла файлов.
+message WatchFileRequest {
+}
+
+// Параметры подписки на прогресс-тики.
+message WatchProgressRequest {
 }
 
 // Пустой запрос для массовых операций (оставлен как именованный для
@@ -224,18 +192,12 @@ enum OnDuplicateUrlPolicy {
   ON_DUPLICATE_URL_POLICY_ADD = 3;
 }
 
-enum OnFileExistsPolicy {
-  ON_FILE_EXISTS_POLICY_UNSPECIFIED = 0;
-  ON_FILE_EXISTS_POLICY_ASK = 1;
-  ON_FILE_EXISTS_POLICY_RENAME = 2;
-  ON_FILE_EXISTS_POLICY_OVERWRITE = 3;
-}
-
 message GetSettingsResponse {
-  // Дефолты для префилла Add-модалки (`target_dir` / `workers`).
+  // Дефолты для префилла Add-модалки (`target_dir`). Число воркеров
+  // демон считает по размеру файла и наружу не экспонирует.
   string default_dir = 1;
-  uint32 default_workers = 2;
-  uint32 max_workers = 3;
+  reserved 2, 3;
+  reserved "default_workers", "max_workers";
   uint32 max_concurrent = 4;
 
   // Дефолты нарезки (для справочного отображения; TUI в MVP их не меняет).
@@ -243,7 +205,7 @@ message GetSettingsResponse {
   uint64 piece_size_min = 6;
   uint64 piece_size_max = 7;
 
-  // Политики конфликтов из `brook.yaml`.
+  // Политика конфликта URL из `brook.yaml`. Политика конфликта имени
+  // файла (rename) хардкодится демоном и в API не экспонируется.
   OnDuplicateUrlPolicy on_duplicate_url = 8;
-  OnFileExistsPolicy on_file_exists = 9;
 }

@@ -6,9 +6,9 @@
 //! 2. Пробуем открыть gRPC-канал к `127.0.0.1:<port>` и вызвать
 //!    `GetSettings` (лёгкая unary-проба). Если коннект не удался —
 //!    пытаемся поднять соседний бинарь `brookd` и подождать, пока он
-//!    поднимется (fixed-backoff до ~3s). Флаг `spawned_daemon` доедет
-//!    до `app::run`, чтобы на выходе TUI показать модалку «гасить
-//!    демон или нет».
+//!    поднимется (fixed-backoff до ~3s). Независимо от того, сам ли TUI
+//!    поднял демон, на выходе модалка предлагает три варианта:
+//!    остановить демон / оставить работать / отмена.
 //! 3. Поднимаем alternate screen + raw mode, защищаясь RAII-guard'ом
 //!    `TerminalGuard` (восстановит экран даже при panic через Drop).
 //! 4. Гоняем event-loop из `app::run` до `q`.
@@ -77,25 +77,17 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     let endpoint = format!("http://127.0.0.1:{}", cli.port);
-    let (channel, settings, spawned_daemon) = match probe(&endpoint).await {
-        Ok((ch, s)) => (ch, s, false),
+    let (channel, settings) = match probe(&endpoint).await {
+        Ok((ch, s)) => (ch, s),
         Err(_) => {
             // Первый коннект не прошёл — поднимаем демона сами и ждём.
             spawn_daemon().context("spawn brookd")?;
-            let (ch, s) = wait_for_daemon(&endpoint).await?;
-            (ch, s, true)
+            wait_for_daemon(&endpoint).await?
         }
     };
 
     let mut guard = TerminalGuard::enter().context("enter alternate screen")?;
-    let res = app::run(
-        &mut guard.terminal,
-        channel,
-        settings,
-        cli.port,
-        spawned_daemon,
-    )
-    .await;
+    let res = app::run(&mut guard.terminal, channel, settings, cli.port).await;
     drop(guard); // явно — чтобы экран восстановился до печати ошибки.
     res
 }

@@ -17,7 +17,7 @@ use std::future::Future;
 
 use crate::domain::{
     AttemptId,
-    DownloadId,
+    FileId,
     WorkerId,
 };
 use crate::error::Result;
@@ -38,7 +38,7 @@ pub struct NoopWorkerRepo;
 impl TWorkerRepo for NoopWorkerRepo {
     fn ensure_slots(
         &self,
-        _file_id: DownloadId,
+        _file_id: FileId,
         _n: usize,
     ) -> impl Future<Output = Result<Vec<WorkerRecord>>> + Send {
         async { Ok(Vec::new()) }
@@ -66,7 +66,7 @@ impl TWorkerRepo for NoopWorkerRepo {
 
     fn pause_all_running_for_file(
         &self,
-        _file_id: DownloadId,
+        _file_id: FileId,
     ) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
@@ -84,7 +84,7 @@ pub struct NoopAttemptRepo;
 impl TPieceAttemptRepo for NoopAttemptRepo {
     fn start(
         &self,
-        _file_id: DownloadId,
+        _file_id: FileId,
         _piece_number: u32,
         worker_id: WorkerId,
     ) -> impl Future<Output = Result<AttemptRecord>> + Send {
@@ -126,7 +126,7 @@ impl TPieceAttemptRepo for NoopAttemptRepo {
 
     fn pause_all_running_for_file(
         &self,
-        _file_id: DownloadId,
+        _file_id: FileId,
     ) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }

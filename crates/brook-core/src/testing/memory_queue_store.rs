@@ -11,9 +11,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use crate::domain::{
-    Download,
-    DownloadId,
     FailureReason,
+    File,
+    FileId,
     FileStatus,
 };
 use crate::error::{
@@ -22,11 +22,11 @@ use crate::error::{
 };
 use crate::ports::TQueueStore;
 
-/// In-memory очередь. Клонирует `Download` при каждой операции, чтобы
+/// In-memory очередь. Клонирует `File` при каждой операции, чтобы
 /// вызывающий не получал доступ к внутренним структурам под замком.
 #[derive(Default)]
 pub struct MemoryTQueueStore {
-    inner: Mutex<HashMap<DownloadId, Download>>,
+    inner: Mutex<HashMap<FileId, File>>,
 }
 
 impl MemoryTQueueStore {
@@ -45,17 +45,17 @@ impl MemoryTQueueStore {
 }
 
 impl TQueueStore for MemoryTQueueStore {
-    async fn load_all(&self) -> Result<Vec<Download>> {
+    async fn load_all(&self) -> Result<Vec<File>> {
         let inner = self.inner.lock().expect("mutex poisoned");
         // Сортируем по `created_at` — даёт стабильный порядок в ассертах,
         // и совпадает с тем, как позже будет вести себя SQL-реализация
         // (`ORDER BY created_at`).
-        let mut all: Vec<Download> = inner.values().cloned().collect();
+        let mut all: Vec<File> = inner.values().cloned().collect();
         all.sort_by_key(|d| d.created_at);
         Ok(all)
     }
 
-    async fn insert(&self, download: &Download) -> Result<()> {
+    async fn insert(&self, download: &File) -> Result<()> {
         let mut inner = self.inner.lock().expect("mutex poisoned");
         if inner.contains_key(&download.id) {
             return Err(Error::Other(format!("duplicate id: {}", download.id)));
@@ -66,7 +66,7 @@ impl TQueueStore for MemoryTQueueStore {
 
     async fn update_status(
         &self,
-        id: DownloadId,
+        id: FileId,
         status: FileStatus,
         reason: Option<FailureReason>,
     ) -> Result<()> {
@@ -75,7 +75,7 @@ impl TQueueStore for MemoryTQueueStore {
         entry.status = status;
         entry.updated_at = SystemTime::now();
         // Для удобства юнит-тестов: если reason пришёл, отражаем
-        // его в `Download.error` (эта колонка и так пишется
+        // его в `File.error` (эта колонка и так пишется
         // боевым SqliteQueueRepository при переходе в Failed).
         if let Some(r) = reason {
             entry.error = Some(r.to_string());
@@ -83,7 +83,7 @@ impl TQueueStore for MemoryTQueueStore {
         Ok(())
     }
 
-    async fn remove(&self, id: DownloadId) -> Result<()> {
+    async fn remove(&self, id: FileId) -> Result<()> {
         let mut inner = self.inner.lock().expect("mutex poisoned");
         inner.remove(&id).ok_or(Error::NotFound)?;
         Ok(())
@@ -93,10 +93,10 @@ impl TQueueStore for MemoryTQueueStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::DownloadSpec;
+    use crate::domain::FileSpec;
 
-    fn make(url: &str) -> Download {
-        Download::new(DownloadId::new(), DownloadSpec::new(url, "/tmp"))
+    fn make(url: &str) -> File {
+        File::new(FileId::new(), FileSpec::new(url, "/tmp"))
     }
 
     #[tokio::test]
@@ -146,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn update_missing_errors() {
         let store = MemoryTQueueStore::new();
-        let missing = DownloadId::new();
+        let missing = FileId::new();
         assert!(matches!(
             store.update_status(missing, FileStatus::Paused, None).await,
             Err(Error::NotFound)
@@ -156,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn remove_missing_errors() {
         let store = MemoryTQueueStore::new();
-        let missing = DownloadId::new();
+        let missing = FileId::new();
         assert!(matches!(store.remove(missing).await, Err(Error::NotFound)));
     }
 }

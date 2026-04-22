@@ -11,10 +11,7 @@ use anyhow::{
     Context,
     Result,
 };
-use brook_proto::brook::v1::{
-    GetSettingsResponse,
-    OnFileExistsOverride,
-};
+use brook_proto::brook::v1::GetSettingsResponse;
 use crossterm::event::{
     Event as CEvent,
     KeyCode,
@@ -51,7 +48,6 @@ pub async fn run(
     channel: Channel,
     settings: GetSettingsResponse,
     port: u16,
-    spawned_daemon: bool,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
 
@@ -61,7 +57,7 @@ pub async fn run(
     let input_tx = tx.clone();
     std::thread::spawn(move || input_loop(input_tx));
 
-    let watch_handle = watch::spawn(channel.clone(), tx.clone());
+    let (watch_file_handle, watch_progress_handle) = watch::spawn(channel.clone(), tx.clone());
 
     let tick_tx = tx.clone();
     let tick_handle = tokio::spawn(async move {
@@ -91,7 +87,7 @@ pub async fn run(
         let _ = signal_tx.send(UiEvent::Quit);
     });
 
-    let mut vm = ViewModel::new(port, settings, spawned_daemon);
+    let mut vm = ViewModel::new(port, settings);
     terminal.draw(|f| ui::draw(f, &vm)).context("draw")?;
 
     while let Some(ev) = rx.recv().await {
@@ -106,7 +102,8 @@ pub async fn run(
         terminal.draw(|f| ui::draw(f, &vm)).context("draw")?;
     }
 
-    watch_handle.abort();
+    watch_file_handle.abort();
+    watch_progress_handle.abort();
     tick_handle.abort();
     signal_handle.abort();
     drop(rx);
@@ -165,10 +162,18 @@ fn handle_event(
 
 fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
     match outcome {
-        CmdOutcome::Ok | CmdOutcome::AddAccepted => {
+        CmdOutcome::Ok => {
             // Тихий успех. Watch-стрим сам отобразит новое состояние.
             if matches!(vm.mode, Mode::Add(_)) {
                 vm.mode = Mode::Normal;
+            }
+        }
+        CmdOutcome::AddAccepted { renamed_to } => {
+            if matches!(vm.mode, Mode::Add(_)) {
+                vm.mode = Mode::Normal;
+            }
+            if let Some(name) = renamed_to {
+                vm.set_toast(format!("saved as {name}"));
             }
         }
         CmdOutcome::Error(msg) => {
@@ -177,9 +182,6 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
             } else {
                 vm.set_toast(msg);
             }
-        }
-        CmdOutcome::AddFileExists { form } => {
-            vm.mode = Mode::FileExists { form };
         }
         CmdOutcome::Removed { ids } => {
             vm.drop_rows(&ids);
@@ -216,10 +218,6 @@ fn handle_key(
         }
         Mode::Duplicate { .. } => {
             handle_key_duplicate(vm, k, channel.clone(), tx.clone());
-            false
-        }
-        Mode::FileExists { .. } => {
-            handle_key_file_exists(vm, k, channel.clone(), tx.clone());
             false
         }
         Mode::ConfirmDelete { .. } => {
@@ -280,7 +278,7 @@ fn handle_key_normal(
             let (to_resume, to_pause): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
                 vm.downloads
                     .get(id)
-                    .map(|r| r.status == brook_proto::brook::v1::DownloadStatus::Paused)
+                    .map(|r| r.status == brook_proto::brook::v1::FileStatus::Paused)
                     .unwrap_or(false)
             });
             if !to_resume.is_empty() {
@@ -339,7 +337,7 @@ fn handle_key_add(
                 return;
             }
             let form = AddForm { url, folder };
-            command::add(channel, tx, form, OnFileExistsOverride::Unspecified);
+            command::add(channel, tx, form);
         }
         _ => {}
     }
@@ -368,31 +366,7 @@ fn handle_key_duplicate(
         }
         KeyCode::Char('a') => {
             vm.mode = Mode::Normal;
-            command::add(channel, tx, form, OnFileExistsOverride::Unspecified);
-        }
-        _ => {}
-    }
-}
-
-fn handle_key_file_exists(
-    vm: &mut ViewModel,
-    k: KeyEvent,
-    channel: Channel,
-    tx: mpsc::UnboundedSender<UiEvent>,
-) {
-    let Mode::FileExists { form } = &vm.mode else {
-        return;
-    };
-    let form = form.clone();
-    match k.code {
-        KeyCode::Esc => vm.mode = Mode::Normal,
-        KeyCode::Char('r') => {
-            vm.mode = Mode::Normal;
-            command::add(channel, tx, form, OnFileExistsOverride::Rename);
-        }
-        KeyCode::Char('o') => {
-            vm.mode = Mode::Normal;
-            command::add(channel, tx, form, OnFileExistsOverride::Overwrite);
+            command::add(channel, tx, form);
         }
         _ => {}
     }
@@ -453,12 +427,7 @@ fn handle_key_ghost(
             vm.drop_rows(&ids);
             vm.mode = Mode::Normal;
             for form in forms {
-                command::add(
-                    channel.clone(),
-                    tx.clone(),
-                    form,
-                    OnFileExistsOverride::Unspecified,
-                );
+                command::add(channel.clone(), tx.clone(), form);
             }
         }
         _ => {}
@@ -471,33 +440,25 @@ fn handle_key_quit_confirm(
     channel: Channel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
+    // Три варианта (docs/ux.md → раздел «Quit»):
+    //   s        — выход с остановкой демона (Shutdown RPC → Quit)
+    //   k / Enter — выход без остановки демона (демон продолжает работать)
+    //   Esc      — отмена, остаёмся в TUI
     match k.code {
         KeyCode::Esc => {
             vm.mode = Mode::Normal;
             false
         }
-        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-            if vm.spawned_daemon {
-                // Сам RPC уходит в фон; по его завершении в канал падает
-                // `UiEvent::Quit` и мы выйдем из цикла. Даже если Shutdown
-                // ответил ошибкой — закрываемся, чтобы не зависнуть в
-                // модалке; демон всё равно уже получил сигнал или не
-                // получил — но TUI здесь бесполезен.
-                command::shutdown_daemon(channel, tx);
-                vm.mode = Mode::Normal;
-                false
-            } else {
-                true
-            }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            // Сам RPC уходит в фон; по его завершении в канал падает
+            // `UiEvent::Quit` и мы выйдем из цикла. Даже если Shutdown
+            // ответил ошибкой — закрываемся, чтобы не зависнуть в
+            // модалке.
+            command::shutdown_daemon(channel, tx);
+            vm.mode = Mode::Normal;
+            false
         }
-        KeyCode::Char('n') | KeyCode::Char('N') => {
-            if vm.spawned_daemon {
-                true
-            } else {
-                vm.mode = Mode::Normal;
-                false
-            }
-        }
+        KeyCode::Enter | KeyCode::Char('k') | KeyCode::Char('K') => true,
         _ => false,
     }
 }

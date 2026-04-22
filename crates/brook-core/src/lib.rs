@@ -9,7 +9,7 @@
 //! - *Adapters* — реализации `ports` — живут **вне** `brook-core`:
 //!   SQLite/HTTP — в `brookd`, gRPC — в `brook-api`.
 //!
-//! Публичный API намеренно плоский: `brook_core::DownloadId`,
+//! Публичный API намеренно плоский: `brook_core::FileId`,
 //! `brook_core::TPieceStorage` и т.п. Внутренняя раскладка по папкам —
 //! чтобы слои не смешивались; перекроить модули без breaking change легко.
 
@@ -26,20 +26,21 @@ pub mod testing;
 pub use domain::{
     AttemptId,
     AttemptStatus,
-    Download,
-    DownloadCommand,
-    DownloadEvent,
-    DownloadId,
-    DownloadSpec,
     FailureReason,
+    File,
+    FileCommand,
+    FileId,
+    FileLifecycleEvent,
+    FileSpec,
     FileStatus,
-    OnFileExistsOverride,
+    MAX_WORKERS,
     PieceStatus,
     Progress,
+    ProgressEvent,
     ReasonCode,
     WorkerId,
     WorkerStatus,
-    default_workers,
+    compute_workers,
 };
 pub use error::{
     Error,
@@ -74,6 +75,7 @@ pub use service::{
     EngineConfig,
     EngineHandle,
     EngineInputs,
+    EngineSubscriptions,
     ManagerConfig,
     RetryDecision,
     RetryPolicy,

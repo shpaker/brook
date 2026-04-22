@@ -26,10 +26,10 @@ use brook_core::testing::{
     MemoryTQueueStore,
 };
 use brook_core::{
-    DownloadEvent,
     DownloadManager,
-    DownloadSpec,
     EngineConfig,
+    FileLifecycleEvent,
+    FileSpec,
     ManagerConfig,
     RangeGuard,
     RetryPolicy,
@@ -79,9 +79,9 @@ fn spin_up_manager(
 /// Подождать первое терминальное событие (`Completed` / `Failed`) по id.
 /// Ошибка таймаута — чтобы тест падал явно, а не висел.
 async fn await_terminal(
-    rx: &mut broadcast::Receiver<DownloadEvent>,
+    rx: &mut broadcast::Receiver<FileLifecycleEvent>,
     timeout: Duration,
-) -> DownloadEvent {
+) -> FileLifecycleEvent {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline
@@ -95,7 +95,9 @@ async fn await_terminal(
             Ok(Err(broadcast::error::RecvError::Closed)) => panic!("event channel closed"),
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Ok(ev)) => match &ev {
-                DownloadEvent::Completed { .. } | DownloadEvent::Failed { .. } => return ev,
+                FileLifecycleEvent::Completed { .. } | FileLifecycleEvent::Failed { .. } => {
+                    return ev;
+                }
                 _ => continue,
             },
         }
@@ -162,23 +164,18 @@ async fn midstream_abort_retries_and_completes() {
 
     let factory = MemoryPieceStorageFactory::new(1, 32);
     let manager = spin_up_manager(factory);
-    let mut events = manager.subscribe();
+    let mut events = manager.subscribe_lifecycle();
 
-    let spec = DownloadSpec {
+    let spec = FileSpec {
         url: format!("{}/f", server.uri()),
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
-        workers: 1,
-        piece_target_count: None,
-        piece_size_min: None,
-        piece_size_max: None,
-        on_file_exists_override: Default::default(),
     };
     let _id = manager.add(spec).await.expect("add ok");
 
     let ev = await_terminal(&mut events, Duration::from_secs(5)).await;
     assert!(
-        matches!(ev, DownloadEvent::Completed { .. }),
+        matches!(ev, FileLifecycleEvent::Completed { .. }),
         "expected Completed, got {ev:?}"
     );
 }
@@ -202,23 +199,18 @@ async fn server_500_retries_then_completes() {
 
     let factory = MemoryPieceStorageFactory::new(1, 16);
     let manager = spin_up_manager(factory);
-    let mut events = manager.subscribe();
+    let mut events = manager.subscribe_lifecycle();
 
-    let spec = DownloadSpec {
+    let spec = FileSpec {
         url: format!("{}/f", server.uri()),
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
-        workers: 1,
-        piece_target_count: None,
-        piece_size_min: None,
-        piece_size_max: None,
-        on_file_exists_override: Default::default(),
     };
     manager.add(spec).await.expect("add ok");
 
     let ev = await_terminal(&mut events, Duration::from_secs(5)).await;
     assert!(
-        matches!(ev, DownloadEvent::Completed { .. }),
+        matches!(ev, FileLifecycleEvent::Completed { .. }),
         "expected Completed, got {ev:?}"
     );
 }
@@ -240,23 +232,18 @@ async fn etag_change_fails_download() {
     let factory =
         MemoryPieceStorageFactory::new(1, 16).with_guard(Some(RangeGuard::Etag("\"v1\"".into())));
     let manager = spin_up_manager(factory);
-    let mut events = manager.subscribe();
+    let mut events = manager.subscribe_lifecycle();
 
-    let spec = DownloadSpec {
+    let spec = FileSpec {
         url: format!("{}/f", server.uri()),
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
-        workers: 1,
-        piece_target_count: None,
-        piece_size_min: None,
-        piece_size_max: None,
-        on_file_exists_override: Default::default(),
     };
     manager.add(spec).await.expect("add ok");
 
     let ev = await_terminal(&mut events, Duration::from_secs(5)).await;
     assert!(
-        matches!(ev, DownloadEvent::Failed { .. }),
+        matches!(ev, FileLifecycleEvent::Failed { .. }),
         "expected Failed, got {ev:?}"
     );
 }
@@ -278,23 +265,18 @@ async fn no_content_length_uses_full_stream_fallback() {
     // accepts_ranges=false переводит engine в no-Range.
     let factory = MemoryPieceStorageFactory::new(1, 64).with_accepts_ranges(false);
     let manager = spin_up_manager(factory);
-    let mut events = manager.subscribe();
+    let mut events = manager.subscribe_lifecycle();
 
-    let spec = DownloadSpec {
+    let spec = FileSpec {
         url: format!("{}/f", server.uri()),
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
-        workers: 1,
-        piece_target_count: None,
-        piece_size_min: None,
-        piece_size_max: None,
-        on_file_exists_override: Default::default(),
     };
     manager.add(spec).await.expect("add ok");
 
     let ev = await_terminal(&mut events, Duration::from_secs(5)).await;
     assert!(
-        matches!(ev, DownloadEvent::Completed { .. }),
+        matches!(ev, FileLifecycleEvent::Completed { .. }),
         "expected Completed, got {ev:?}"
     );
 }
@@ -348,18 +330,13 @@ async fn peak_rss_under_150mb_10_parallel_engines() {
         .await;
 
     let manager = spin_up_manager(MemoryPieceStorageFactory::new(pieces, piece_size));
-    let mut events = manager.subscribe();
+    let mut events = manager.subscribe_lifecycle();
 
     for _ in 0..10 {
-        let spec = DownloadSpec {
+        let spec = FileSpec {
             url: format!("{}/f", server.uri()),
             target_dir: "/tmp".into(),
             filename: Some("f.bin".into()),
-            workers: 4,
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: Default::default(),
         };
         manager.add(spec).await.expect("add ok");
     }
@@ -374,8 +351,10 @@ async fn peak_rss_under_150mb_10_parallel_engines() {
             panic!("perf test: only {completed}/10 finished before timeout");
         }
         match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Ok(DownloadEvent::Completed { .. })) => completed += 1,
-            Ok(Ok(DownloadEvent::Failed { error, .. })) => panic!("perf test failure: {error}"),
+            Ok(Ok(FileLifecycleEvent::Completed { .. })) => completed += 1,
+            Ok(Ok(FileLifecycleEvent::Failed { error, .. })) => {
+                panic!("perf test failure: {error}")
+            }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) => panic!("events channel closed"),
             _ => continue,

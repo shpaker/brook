@@ -12,6 +12,7 @@ pub use engine::{
     EngineConfig,
     EngineHandle,
     EngineInputs,
+    EngineSubscriptions,
     StreamingEngineInputs,
 };
 pub use manager::{

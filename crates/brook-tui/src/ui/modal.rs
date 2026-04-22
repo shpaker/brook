@@ -4,7 +4,7 @@
 //! под заданные размеры; `draw_*` функции печатают конкретные модалки
 //! поверх уже нарисованного UI (Clear + Block + Paragraph).
 
-use brook_proto::brook::v1::DownloadStatus;
+use brook_proto::brook::v1::FileStatus;
 use ratatui::Frame;
 use ratatui::layout::{
     Alignment,
@@ -49,7 +49,7 @@ const HELP_LINES: &[&str] = &[
     "  ?               — this help",
     "",
     "misc",
-    "  q / Ctrl+C      — quit",
+    "  q / Ctrl+C      — quit (choose: stop daemon / keep / cancel)",
     "  Esc             — close modal / help",
 ];
 
@@ -58,11 +58,10 @@ pub fn draw_overlay(f: &mut Frame, vm: &ViewModel, no_color: bool) {
         Mode::Normal => {}
         Mode::Add(m) => draw_add(f, m, no_color),
         Mode::Duplicate { form, existing_id } => draw_duplicate(f, vm, form, existing_id, no_color),
-        Mode::FileExists { form } => draw_file_exists(f, form, no_color),
         Mode::ConfirmDelete { ids } => draw_confirm_delete(f, vm, ids, no_color),
         Mode::Ghost { ids } => draw_ghost(f, vm, ids, no_color),
         Mode::Help { scroll } => draw_help(f, *scroll, no_color),
-        Mode::QuitConfirm => draw_quit_confirm(f, vm.spawned_daemon, no_color),
+        Mode::QuitConfirm => draw_quit_confirm(f, vm, no_color),
     }
 }
 
@@ -174,26 +173,6 @@ fn draw_duplicate(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_file_exists(f: &mut Frame, form: &crate::events::AddForm, no_color: bool) {
-    let area = centered(f.area(), 60, 7);
-    f.render_widget(Clear, area);
-    let block = block("file exists", no_color);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let path = format!("{}/…", form.folder);
-    let lines = vec![
-        Line::from(""),
-        Line::from(format!(" target in {path} already exists.")),
-        Line::from(""),
-        Line::from(""),
-        Line::from(Span::styled(
-            " r · rename    o · overwrite    Esc · cancel ",
-            hint_style(no_color),
-        )),
-    ];
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
 fn draw_confirm_delete(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
     let area = centered(f.area(), 60, 7);
     f.render_widget(Clear, area);
@@ -253,36 +232,35 @@ fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_quit_confirm(f: &mut Frame, spawned_daemon: bool, no_color: bool) {
-    let area = centered(f.area(), 60, 7);
+fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
+    let running = vm
+        .downloads
+        .values()
+        .filter(|r| r.status == FileStatus::Running)
+        .count();
+
+    let mut lines: Vec<Line> = Vec::with_capacity(8);
+    lines.push(Line::from(""));
+    if running > 0 {
+        lines.push(Line::from(format!(" {running} downloads are running.")));
+    } else {
+        lines.push(Line::from(" no active downloads."));
+    }
+    lines.push(Line::from(" [ quit + stop daemon ]"));
+    lines.push(Line::from(" [ quit, keep daemon ⏎ ]"));
+    lines.push(Line::from(" [ cancel ␛ ]"));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " s · stop daemon    k / Enter · keep daemon    Esc · cancel ",
+        hint_style(no_color),
+    )));
+
+    let h = lines.len() as u16 + 2;
+    let area = centered(f.area(), 62, h);
     f.render_widget(Clear, area);
     let block = block("quit brook", no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
-
-    let lines = if spawned_daemon {
-        vec![
-            Line::from(""),
-            Line::from(" brookd was started by this TUI."),
-            Line::from(" shut it down on exit, or leave it running?"),
-            Line::from(""),
-            Line::from(Span::styled(
-                " y · shutdown    n · leave running    Esc · cancel ",
-                hint_style(no_color),
-            )),
-        ]
-    } else {
-        vec![
-            Line::from(""),
-            Line::from(" quit brook TUI?"),
-            Line::from(" brookd keeps running in the background."),
-            Line::from(""),
-            Line::from(Span::styled(
-                " y · quit    n/Esc · cancel ",
-                hint_style(no_color),
-            )),
-        ]
-    };
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -331,15 +309,15 @@ fn draw_help(f: &mut Frame, scroll: u16, no_color: bool) {
 }
 
 // Чтобы Mode::Duplicate можно было рендерить без лишнего заимствования.
-pub fn _state_name(s: DownloadStatus) -> &'static str {
+pub fn _state_name(s: FileStatus) -> &'static str {
     match s {
-        DownloadStatus::Running => "RUNNING",
-        DownloadStatus::Paused => "PAUSED",
-        DownloadStatus::Retrying => "RETRYING",
-        DownloadStatus::Pending => "QUEUED",
-        DownloadStatus::Done => "DONE",
-        DownloadStatus::Failed => "FAILED",
-        DownloadStatus::Cancelled => "CANCELLED",
-        DownloadStatus::Unspecified => "—",
+        FileStatus::Running => "RUNNING",
+        FileStatus::Paused => "PAUSED",
+        FileStatus::Retrying => "RETRYING",
+        FileStatus::Pending => "QUEUED",
+        FileStatus::Done => "DONE",
+        FileStatus::Failed => "FAILED",
+        FileStatus::Cancelled => "CANCELLED",
+        FileStatus::Unspecified => "—",
     }
 }

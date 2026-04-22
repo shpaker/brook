@@ -1,17 +1,17 @@
-//! Параметры создаваемой загрузки — что именно качать и куда.
+//! Параметры создаваемого файла — что именно качать и куда.
 //!
-//! `DownloadSpec` — неизменяемое описание задачи, которое приходит от клиента.
+//! `FileSpec` — неизменяемое описание задачи, которое приходит от клиента.
 //! После регистрации в очереди spec не меняется: все изменения живут в
-//! `DownloadState`/`Progress`/`Download`.
+//! `File`/`Progress`.
 
 use std::path::PathBuf;
 
-/// Спецификация одной загрузки.
+/// Спецификация одного файла.
 ///
 /// `PathBuf` (а не `String`) для путей — чтобы работало с платформенными
 /// разделителями и с non-UTF-8 путями на macOS/Linux.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DownloadSpec {
+pub struct FileSpec {
     /// Откуда качать (http/https).
     pub url: String,
     /// Директория назначения. Имя файла выбирается из `filename` или
@@ -19,38 +19,9 @@ pub struct DownloadSpec {
     pub target_dir: PathBuf,
     /// Явно заданное имя файла (None → определить на этапе probe).
     pub filename: Option<String>,
-    /// Сколько параллельных воркеров качают piece'ы этой загрузки.
-    pub workers: u32,
-    /// Override целевого числа piece'ов на файл. `None` — взять дефолт
-    /// демона (`DownloadDefaults::piece_target_count`).
-    pub piece_target_count: Option<u32>,
-    /// Override нижней границы `piece_size` в байтах. `None` — дефолт.
-    pub piece_size_min: Option<u64>,
-    /// Override верхней границы `piece_size` в байтах. `None` — дефолт.
-    pub piece_size_max: Option<u64>,
-    /// Что делать, если целевой файл уже существует. Транзиентный
-    /// request-time hint: при rename/overwrite фабрика разрешает
-    /// конфликт, после чего значение не используется и в очереди не
-    /// персистится (после рестарта считается `Unspecified`).
-    pub on_file_exists_override: OnFileExistsOverride,
 }
 
-/// Что делать, если целевой файл `<target_dir>/<filename>` уже существует
-/// в момент `Add`.
-///
-/// `Unspecified` — фабрика упирается в `Error::FileExists`; решение
-/// принимает клиент (TUI-модалка §6.6). `Rename` — фабрика подбирает
-/// свободное имя `<stem> (N).<ext>`. `Overwrite` — удаляет существующий
-/// файл до инициализации `.data.brook`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OnFileExistsOverride {
-    #[default]
-    Unspecified,
-    Rename,
-    Overwrite,
-}
-
-impl DownloadSpec {
+impl FileSpec {
     /// Конструктор с минимальным набором: URL + куда класть.
     /// Остальное — дефолты. Удобно в тестах и в TUI, где клиент сам
     /// заполнит только обязательное.
@@ -62,19 +33,37 @@ impl DownloadSpec {
             url: url.into(),
             target_dir: target_dir.into(),
             filename: None,
-            workers: default_workers(),
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: OnFileExistsOverride::Unspecified,
         }
     }
 }
 
-/// Дефолт по числу воркеров. Выносим в функцию, чтобы не дублировать в тестах
-/// и чтобы место для изменения было одно.
-pub const fn default_workers() -> u32 {
-    4
+/// Верхний предел числа воркеров на один файл. Фиксированный клэмп
+/// снимает необходимость в настройке `max_workers`: 12 подобрано так,
+/// чтобы у больших файлов получалось разумное число соединений, и при
+/// этом не упираться в типичный HTTP keep-alive лимит одного хоста.
+pub const MAX_WORKERS: u32 = 12;
+
+/// Сколько воркеров пустить на файл размером `total_size` байт.
+///
+/// Формула: `max(1, min(MAX_WORKERS, ceil(log2(ceil(size_mb / 10)))))`,
+/// где `size_mb = ceil(total_size / MiB)`. Логарифмический рост даёт
+/// плавную кривую: 100 MB → 4 воркера, 1 GB → 7, 10 GB → 10.
+pub fn compute_workers(total_size: u64) -> u32 {
+    if total_size == 0 {
+        return 1;
+    }
+    const MIB: u64 = 1024 * 1024;
+    let size_mb = total_size.div_ceil(MIB);
+    let scaled = size_mb.div_ceil(10);
+    if scaled <= 1 {
+        return 1;
+    }
+    // ceil(log2(n)) для n > 1: берём следующую степень двойки и её tz.
+    let ceil_log2 = scaled
+        .checked_next_power_of_two()
+        .map(|p| p.trailing_zeros())
+        .unwrap_or(64);
+    ceil_log2.clamp(1, MAX_WORKERS)
 }
 
 #[cfg(test)]
@@ -83,18 +72,44 @@ mod tests {
 
     #[test]
     fn new_fills_sensible_defaults() {
-        let spec = DownloadSpec::new("https://example.com/f", "/tmp");
+        let spec = FileSpec::new("https://example.com/f", "/tmp");
         assert_eq!(spec.url, "https://example.com/f");
         assert_eq!(spec.target_dir, PathBuf::from("/tmp"));
         assert_eq!(spec.filename, None);
-        assert_eq!(spec.workers, default_workers());
     }
 
     #[test]
     fn equality_is_structural() {
-        // Две `DownloadSpec` с одинаковыми полями считаются равными.
-        let a = DownloadSpec::new("https://a", "/d");
-        let b = DownloadSpec::new("https://a", "/d");
+        // Две `FileSpec` с одинаковыми полями считаются равными.
+        let a = FileSpec::new("https://a", "/d");
+        let b = FileSpec::new("https://a", "/d");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_workers_clamps_small_files_to_one() {
+        assert_eq!(compute_workers(0), 1);
+        assert_eq!(compute_workers(1), 1);
+        assert_eq!(compute_workers(5 * 1024 * 1024), 1);
+        assert_eq!(compute_workers(10 * 1024 * 1024), 1);
+    }
+
+    #[test]
+    fn compute_workers_follows_log_curve() {
+        // 40 MB → ceil(log2(4)) = 2
+        assert_eq!(compute_workers(40 * 1024 * 1024), 2);
+        // 100 MB → ceil(log2(10)) = 4
+        assert_eq!(compute_workers(100 * 1024 * 1024), 4);
+        // 1 GB → ceil(log2(103)) = 7
+        assert_eq!(compute_workers(1024 * 1024 * 1024), 7);
+        // 10 GB → ceil(log2(1024)) = 10
+        assert_eq!(compute_workers(10 * 1024 * 1024 * 1024), 10);
+    }
+
+    #[test]
+    fn compute_workers_clamps_to_max() {
+        // 1 TB — формула ушла бы выше 12, но клэмп держит её.
+        assert_eq!(compute_workers(1024 * 1024 * 1024 * 1024), MAX_WORKERS);
+        assert_eq!(compute_workers(u64::MAX), MAX_WORKERS);
     }
 }
