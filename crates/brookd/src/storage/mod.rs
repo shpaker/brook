@@ -5,6 +5,7 @@
 //! Сборка в `TPieceStorage` будет в 1.7.
 
 pub mod db;
+pub mod error;
 pub mod factory;
 pub mod files;
 pub mod fs;
@@ -14,3 +15,8 @@ pub mod piece_attempts;
 pub mod pieces;
 pub mod plan;
 pub mod workers;
+
+pub use error::{
+    StorageError,
+    StorageResult,
+};

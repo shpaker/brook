@@ -1,0 +1,587 @@
+//! `DownloadManager` — верхний координатор над множеством `DownloadEngine`'ов.
+//!
+//! Отвечает за:
+//! - реестр загрузок (`records`) и активных движков (`engines`);
+//! - ограничение параллельности (`max_concurrent`);
+//! - fan-in событий в два broadcast-канала —
+//!   `broadcast::Sender<FileLifecycleEvent>` (для `WatchFile`) и
+//!   `broadcast::Sender<ProgressEvent>` (для `WatchProgress`);
+//! - персистенцию состояний через [`TQueueStore`] (insert при `add`,
+//!   `update_state` при смене стейта);
+//! - восстановление очереди из [`TQueueStore`] при старте ([`DownloadManager::bootstrap`]).
+//!
+//! ## Структура модуля
+//!
+//! Публичный фасад (`DownloadManager`, `ManagerConfig`) и пользовательские
+//! команды (`add`/`remove`/`pause`/...) живут здесь. Внутренняя механика
+//! разнесена:
+//!
+//! - [`queue`] — продвижение очереди (`try_spawn_next`) и сам спавн движка
+//!   (`spawn_engine_impl`).
+//! - [`fanin`] — задачи-подписчики, слушающие broadcast каждого движка и
+//!   форвардящие события в общий канал менеджера (`fan_in_lifecycle` /
+//!   `fan_in_progress`).
+//!
+//! ## Модель конкурентности
+//!
+//! `Mutex<Inner>` — обычный `std::sync::Mutex`. Внутренние критсекции
+//! короткие и чисто CPU-шные (вставка в `HashMap`, `pop_front` из
+//! `VecDeque`), `.await` под локом не выполняется — значит async-mutex
+//! не нужен, а синхронный в tokio-контексте дешевле.
+//!
+//! «Медленные» операции (`factory.prepare`, `queue.insert/update_state`)
+//! всегда вызываются **вне** лока: из публичных async-методов либо из
+//! fan-in задачи, которая читает `broadcast::Receiver` от движка.
+//!
+//! ## Fan-in событий
+//!
+//! На каждый спаунингом движок создаётся маленький task, который:
+//! 1. Читает lifecycle-события из `broadcast::Receiver` движка.
+//! 2. Форвардит их в общий `lifecycle_tx` (для подписчиков `WatchFile`).
+//! 3. Обновляет `records[id]` (state/progress/error/updated_at).
+//! 4. На смене state — пишет в `TQueueStore`.
+//! 5. На терминальном событии — удаляет движок из `engines` и пробует
+//!    спаунить следующий из `waiting`.
+//!
+//! Задача держит `Arc<Shared>` — это создаёт временный «цикл» владения,
+//! который разрывается сам, когда task завершается.
+
+mod fanin;
+mod queue;
+
+#[cfg(all(test, feature = "test-utils"))]
+mod tests;
+
+use std::collections::{
+    HashMap,
+    VecDeque,
+};
+use std::sync::{
+    Arc,
+    Mutex,
+};
+use std::time::{
+    Duration,
+    SystemTime,
+};
+
+use tokio::sync::broadcast;
+use tracing::warn;
+
+use crate::domain::{
+    FailureReason,
+    File,
+    FileId,
+    FileLifecycleEvent,
+    FileSpec,
+    FileStatus,
+    ProgressEvent,
+    ReasonCode,
+};
+use crate::error::{
+    Error,
+    Result,
+};
+use crate::ports::{
+    NoopAttemptRepo,
+    NoopWorkerRepo,
+    TPieceAttemptRepo,
+    TPieceStorageFactory,
+    TQueueStore,
+    TRangeFetch,
+    TWorkerRepo,
+};
+use crate::service::engine::{
+    EngineConfig,
+    EngineHandle,
+};
+
+/// Конфигурация менеджера.
+#[derive(Clone)]
+pub struct ManagerConfig {
+    /// Максимум одновременно активных движков. Остальные держатся в `waiting`.
+    /// Дефолт 3 — согласован с MVP; финальное значение придёт из `settings` в 3.x.
+    pub max_concurrent: usize,
+    /// Ёмкость центрального broadcast-канала событий.
+    pub events_capacity: usize,
+    /// Конфигурация, которая прокидывается в каждый движок.
+    pub engine: EngineConfig,
+}
+
+impl Default for ManagerConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 3,
+            events_capacity: 1024,
+            engine: EngineConfig::default(),
+        }
+    }
+}
+
+/// Верхний координатор загрузок. Клонируется дёшево (внутри `Arc`).
+///
+/// `WR`/`AR` — репозитории воркеров и попыток piece'ов. Дефолты
+/// ([`NoopWorkerRepo`] / [`NoopAttemptRepo`]) — для тестов и кейсов,
+/// где аналитика журнала не нужна; prod-подключение (brookd)
+/// подставляет SQLite-адаптеры явно через [`DownloadManager::with_tracking`].
+pub struct DownloadManager<PF, QS, F, WR = NoopWorkerRepo, AR = NoopAttemptRepo>
+where
+    PF: TPieceStorageFactory + Send + Sync + 'static,
+    PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
+    QS: TQueueStore + Send + Sync + 'static,
+    F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
+{
+    pub(super) shared: Arc<Shared<PF, QS, F, WR, AR>>,
+}
+
+impl<PF, QS, F, WR, AR> Clone for DownloadManager<PF, QS, F, WR, AR>
+where
+    PF: TPieceStorageFactory + Send + Sync + 'static,
+    PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
+    QS: TQueueStore + Send + Sync + 'static,
+    F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+pub(super) struct Shared<PF, QS, F, WR, AR>
+where
+    PF: TPieceStorageFactory + Send + Sync + 'static,
+    PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
+    QS: TQueueStore + Send + Sync + 'static,
+    F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
+{
+    pub(super) factory: Arc<PF>,
+    pub(super) queue: Arc<QS>,
+    pub(super) fetch: Arc<F>,
+    pub(super) workers_repo: Arc<WR>,
+    pub(super) attempts_repo: Arc<AR>,
+    pub(super) inner: Mutex<Inner>,
+    pub(super) lifecycle_tx: broadcast::Sender<FileLifecycleEvent>,
+    pub(super) progress_tx: broadcast::Sender<ProgressEvent>,
+    pub(super) config: ManagerConfig,
+}
+
+pub(super) struct Inner {
+    pub(super) records: HashMap<FileId, File>,
+    pub(super) engines: HashMap<FileId, EngineHandle>,
+    /// Упорядоченная очередь id в ожидании слота. Id может быть и в
+    /// `Paused` (пользователь попросил pause до старта) — такие при
+    /// продвижении пропускаются.
+    pub(super) waiting: VecDeque<FileId>,
+}
+
+impl<PF, QS, F> DownloadManager<PF, QS, F, NoopWorkerRepo, NoopAttemptRepo>
+where
+    PF: TPieceStorageFactory + Send + Sync + 'static,
+    PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
+    QS: TQueueStore + Send + Sync + 'static,
+    F: TRangeFetch + Send + Sync + 'static,
+{
+    /// Собрать менеджер без аналитики воркеров/попыток (no-op репозитории).
+    /// Используется в юнит-тестах ядра и in-memory harness'ах.
+    pub fn new(factory: Arc<PF>, queue: Arc<QS>, fetch: Arc<F>, config: ManagerConfig) -> Self {
+        Self::with_tracking(
+            factory,
+            queue,
+            fetch,
+            Arc::new(NoopWorkerRepo),
+            Arc::new(NoopAttemptRepo),
+            config,
+        )
+    }
+}
+
+impl<PF, QS, F, WR, AR> DownloadManager<PF, QS, F, WR, AR>
+where
+    PF: TPieceStorageFactory + Send + Sync + 'static,
+    PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
+    QS: TQueueStore + Send + Sync + 'static,
+    F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
+{
+    /// Собрать менеджер с явными репозиториями воркеров и попыток —
+    /// prod-путь brookd, где `workers` и `piece_attempts` пишутся в
+    /// общую `brook.db`.
+    pub fn with_tracking(
+        factory: Arc<PF>,
+        queue: Arc<QS>,
+        fetch: Arc<F>,
+        workers_repo: Arc<WR>,
+        attempts_repo: Arc<AR>,
+        config: ManagerConfig,
+    ) -> Self {
+        let (lifecycle_tx, _) = broadcast::channel(config.events_capacity);
+        let (progress_tx, _) = broadcast::channel(config.events_capacity);
+        Self {
+            shared: Arc::new(Shared {
+                factory,
+                queue,
+                fetch,
+                workers_repo,
+                attempts_repo,
+                inner: Mutex::new(Inner {
+                    records: HashMap::new(),
+                    engines: HashMap::new(),
+                    waiting: VecDeque::new(),
+                }),
+                lifecycle_tx,
+                progress_tx,
+                config,
+            }),
+        }
+    }
+
+    /// Подписаться на поток lifecycle-событий (`WatchFile`).
+    pub fn subscribe_lifecycle(&self) -> broadcast::Receiver<FileLifecycleEvent> {
+        self.shared.lifecycle_tx.subscribe()
+    }
+
+    /// Подписаться на поток прогресс-тиков (`WatchProgress`).
+    pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressEvent> {
+        self.shared.progress_tx.subscribe()
+    }
+
+    /// Срез всех известных менеджеру загрузок — для Snapshot-реконсиляции
+    /// в `Watch`.
+    pub fn snapshot(&self) -> Vec<File> {
+        let inner = self.shared.inner.lock().expect("mutex poisoned");
+        inner.records.values().cloned().collect()
+    }
+
+    /// Загрузить очередь из `TQueueStore` и запустить продвижение.
+    ///
+    /// Не-терминальные состояния нормализуются: `Running`/`Retrying`
+    /// → `Queued` (движок не пережил рестарт демона), `Paused` и
+    /// `Queued` остаются как есть.
+    pub async fn bootstrap(&self) -> Result<()> {
+        let loaded = self.shared.queue.load_all().await?;
+        let mut to_fix: Vec<(FileId, FileStatus)> = Vec::new();
+        {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            for mut d in loaded {
+                let target = match d.status {
+                    FileStatus::Running | FileStatus::Retrying => {
+                        to_fix.push((d.id, FileStatus::Pending));
+                        FileStatus::Pending
+                    }
+                    s => s,
+                };
+                d.status = target;
+                if matches!(
+                    target,
+                    FileStatus::Pending | FileStatus::Paused | FileStatus::Retrying
+                ) && !matches!(target, FileStatus::Paused)
+                {
+                    inner.waiting.push_back(d.id);
+                }
+                inner.records.insert(d.id, d);
+            }
+        }
+        for (id, status) in to_fix {
+            if let Err(e) = self.shared.queue.update_status(id, status, None).await {
+                warn!(%id, error = %e, "bootstrap: failed to persist normalized state");
+            }
+        }
+        self.try_spawn_next().await;
+        Ok(())
+    }
+
+    /// Добавить новый файл. Возвращает его `FileId`.
+    pub async fn add(&self, spec: FileSpec) -> Result<FileId> {
+        let id = FileId::new();
+        let file = File::new(id, spec);
+        self.shared.queue.insert(&file).await?;
+        {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            inner.records.insert(id, file.clone());
+            inner.waiting.push_back(id);
+        }
+        // Уведомляем подписчиков WatchFile о новой записи до того, как
+        // движок начнёт слать `StatusChanged`: у клиента этого id ещё
+        // нет, и событие без предшествующего `Snapshot` было бы выброшено.
+        let _ = self.shared.lifecycle_tx.send(FileLifecycleEvent::Snapshot {
+            file: Box::new(file),
+        });
+        self.try_spawn_next().await;
+        Ok(id)
+    }
+
+    /// Удалить загрузку. Работает в любом состоянии: если engine активен
+    /// (running/paused) — сначала шлём `Cancel` и ждём, пока fan-in task
+    /// снимет запись из `engines`, затем чистим records/waiting/queue.
+    ///
+    /// Идемпотентно: если id ни в records, ни в queue — тоже Ok. Это важно
+    /// для клиента, у которого в ViewModel может остаться «призрак»
+    /// (например, при рассинхроне после рестарта демона): повторный
+    /// `Remove` должен починить состояние, а не ругаться NotFound'ом.
+    pub async fn remove(&self, id: FileId) -> Result<()> {
+        let was_active = {
+            let inner = self.shared.inner.lock().expect("mutex poisoned");
+            if let Some(handle) = inner.engines.get(&id) {
+                handle.cancel();
+                true
+            } else {
+                false
+            }
+        };
+        if was_active {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let inner = self.shared.inner.lock().expect("mutex poisoned");
+                if !inner.engines.contains_key(&id) {
+                    break;
+                }
+            }
+        }
+        let was_known = {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            let had_record = inner.records.remove(&id).is_some();
+            inner.waiting.retain(|x| *x != id);
+            had_record
+        };
+        match self.shared.queue.remove(id).await {
+            Ok(()) => Ok(()),
+            Err(Error::NotFound) if !was_known => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Поставить загрузку на паузу.
+    ///
+    /// Если движок уже запущен — команда `Pause` уезжает в engine; финальный
+    /// `StateChanged(Paused)` прилетит из движка.
+    /// Если загрузка ещё в `waiting` — сразу помечаем `Paused` и
+    /// убираем из `waiting` (движок не появится, пока не будет `Resume`).
+    pub async fn pause(&self, id: FileId) -> Result<()> {
+        let mut persist = None;
+        {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            if let Some(handle) = inner.engines.get(&id) {
+                handle.pause();
+                return Ok(());
+            }
+            inner.waiting.retain(|x| *x != id);
+            let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
+            if record.status.is_terminal() {
+                return Err(Error::Other("download is terminal".into()));
+            }
+            if record.status != FileStatus::Paused {
+                record.status = FileStatus::Paused;
+                record.updated_at = SystemTime::now();
+                persist = Some(FileStatus::Paused);
+                let _ = self
+                    .shared
+                    .lifecycle_tx
+                    .send(FileLifecycleEvent::StatusChanged {
+                        id,
+                        status: FileStatus::Paused,
+                    });
+            }
+        }
+        if let Some(status) = persist {
+            self.shared.queue.update_status(id, status, None).await?;
+        }
+        Ok(())
+    }
+
+    /// Возобновить загрузку.
+    ///
+    /// Если движок активен — прокидываем `Resume`.
+    /// Иначе — возвращаем в `waiting` и пытаемся спаунить.
+    pub async fn resume(&self, id: FileId) -> Result<()> {
+        let mut persist = None;
+        {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            if let Some(handle) = inner.engines.get(&id) {
+                handle.resume();
+                return Ok(());
+            }
+            let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
+            if record.status.is_terminal() {
+                return Err(Error::Other("download is terminal".into()));
+            }
+            if record.status != FileStatus::Pending {
+                record.status = FileStatus::Pending;
+                record.updated_at = SystemTime::now();
+                persist = Some(FileStatus::Pending);
+                let _ = self
+                    .shared
+                    .lifecycle_tx
+                    .send(FileLifecycleEvent::StatusChanged {
+                        id,
+                        status: FileStatus::Pending,
+                    });
+            }
+            if !inner.waiting.iter().any(|x| *x == id) {
+                inner.waiting.push_back(id);
+            }
+        }
+        if let Some(status) = persist {
+            self.shared.queue.update_status(id, status, None).await?;
+        }
+        self.try_spawn_next().await;
+        Ok(())
+    }
+
+    /// Отменить загрузку.
+    pub async fn cancel(&self, id: FileId) -> Result<()> {
+        let should_persist = {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            if let Some(handle) = inner.engines.get(&id) {
+                handle.cancel();
+                return Ok(());
+            }
+            inner.waiting.retain(|x| *x != id);
+            let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
+            if record.status.is_terminal() {
+                return Ok(()); // уже всё.
+            }
+            record.status = FileStatus::Cancelled;
+            record.updated_at = SystemTime::now();
+            let _ = self
+                .shared
+                .lifecycle_tx
+                .send(FileLifecycleEvent::StatusChanged {
+                    id,
+                    status: FileStatus::Cancelled,
+                });
+            true
+        };
+        if should_persist {
+            self.shared
+                .queue
+                .update_status(
+                    id,
+                    FileStatus::Cancelled,
+                    Some(FailureReason::new(ReasonCode::CancelledByUser)),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Поставить на паузу все активные и всё, что в `waiting`.
+    pub async fn pause_all(&self) -> Result<()> {
+        let ids: Vec<FileId> = {
+            let inner = self.shared.inner.lock().expect("mutex poisoned");
+            inner.records.keys().copied().collect()
+        };
+        for id in ids {
+            let _ = self.pause(id).await;
+        }
+        Ok(())
+    }
+
+    /// Остановить все активные движки и дождаться, пока каждый дойдёт до
+    /// `Paused` или терминального состояния.
+    ///
+    /// Возвращает `Err(Error::Other("shutdown timeout"))`, если `deadline`
+    /// истёк раньше, чем все active-движки успели коммитнуться. Engines в
+    /// этом случае будут дропнуты владельцем — in-flight piece-пачки без
+    /// коммита перекачаются при следующем старте.
+    pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
+        let active: Vec<FileId> = {
+            let inner = self.shared.inner.lock().expect("mutex poisoned");
+            inner.engines.keys().copied().collect()
+        };
+        if active.is_empty() {
+            return Ok(());
+        }
+        let _ = self.pause_all().await;
+        let shared = Arc::clone(&self.shared);
+        let wait = async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let all_drained = {
+                    let inner = shared.inner.lock().expect("mutex poisoned");
+                    active.iter().all(|id| match inner.records.get(id) {
+                        Some(d) => matches!(
+                            d.status,
+                            FileStatus::Paused
+                                | FileStatus::Done
+                                | FileStatus::Failed
+                                | FileStatus::Cancelled
+                        ),
+                        None => true,
+                    })
+                };
+                if all_drained {
+                    break;
+                }
+            }
+        };
+        match tokio::time::timeout(deadline, wait).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                warn!("shutdown deadline elapsed with engines still draining");
+                Err(Error::Other("shutdown timeout".into()))
+            }
+        }
+    }
+
+    /// Перезапустить упавшую загрузку: `Failed` → `Pending`, сбрасываем
+    /// текст ошибки и продвигаем очередь. На не-`Failed` записи — ошибка:
+    /// retry — это явный пользовательский жест после терминального падения.
+    pub async fn retry(&self, id: FileId) -> Result<()> {
+        {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
+            if record.status != FileStatus::Failed {
+                return Err(Error::Other("download is not in failed state".into()));
+            }
+            record.status = FileStatus::Pending;
+            record.error = None;
+            record.updated_at = SystemTime::now();
+            if !inner.waiting.iter().any(|x| *x == id) {
+                inner.waiting.push_back(id);
+            }
+            let _ = self
+                .shared
+                .lifecycle_tx
+                .send(FileLifecycleEvent::StatusChanged {
+                    id,
+                    status: FileStatus::Pending,
+                });
+        }
+        self.shared
+            .queue
+            .update_status(id, FileStatus::Pending, None)
+            .await?;
+        self.try_spawn_next().await;
+        Ok(())
+    }
+
+    /// Возобновить все `Paused`.
+    pub async fn resume_all(&self) -> Result<()> {
+        let ids: Vec<FileId> = {
+            let inner = self.shared.inner.lock().expect("mutex poisoned");
+            inner
+                .records
+                .iter()
+                .filter(|(_, d)| d.status == FileStatus::Paused)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in ids {
+            let _ = self.resume(id).await;
+        }
+        Ok(())
+    }
+}
