@@ -1,26 +1,17 @@
-//! [`LocalPieceStorage`] — реальная реализация [`TPieceStorage`] поверх
-//! файловой системы и общего [`SharedDb`].
+//! [`LocalPieceStorage`] — реализация [`TPieceStorage`] поверх файловой
+//! системы и общего [`SharedDb`].
 //!
-//! После миграции на единую `brook.db` (см. [docs/todo.md] §5) sidecar
-//! `<name>.index.brook` исчез: всё persisted-состояние piece'ов лежит
-//! в общей таблице `pieces`, scoping — по `file_id`. Рядом с таргетом
-//! остаётся только `<name>.data.brook` (после `finalize` → `<name>`).
+//! Вся persistent-геометрия piece'ов лежит в таблице `pieces`
+//! (shared `brook.db`), scoping — по `file_id`. Рядом с таргетом адаптер
+//! держит только `<name>.data.brook` (после `finalize` → `<name>`).
 //!
 //! ## Файлы на диске
 //!
-//! Для загрузки с `filename = "foo.iso"` в `target_dir = "/dl"` адаптер
-//! держит ровно два пути:
+//! Для загрузки с `filename = "foo.iso"` в `target_dir = "/dl"`:
 //! - `"/dl/foo.iso.data.brook"` — преаллоцированный на `total_size`
 //!   контейнер, куда воркеры пишут байты по offset'ам (`pwrite`).
 //! - `"/dl/foo.iso"` — целевой файл, появляется только после `finalize`
 //!   (атомарный `rename` из `.data.brook`).
-//!
-//! ## Геометрия piece'ов — арифметикой, без `PieceLayout`
-//!
-//! `offset_for(n) = n * piece_size`, `size_for(n) = min(piece_size,
-//! total_size - offset_for(n))`. Карта в БД больше не нужна — её
-//! роль играют два числа (`total_size`, `piece_size`) из
-//! `file_settings`.
 //!
 //! ## Почему `spawn_blocking` для file-операций
 //!
@@ -31,16 +22,10 @@
 //! идут через [`SqlitePieceRepository`] / [`SqliteFileRepository`] —
 //! у них уже есть свой `spawn_blocking` внутри [`SharedDb::with_conn`].
 //!
-//! [docs/todo.md]: ../../../../docs/todo.md
-//! [`SharedDb`]: super::db::SharedDb
-//! [`SharedDb::with_conn`]: super::db::SharedDb::with_conn
+//! [`SharedDb`]: crate::storage::db::SharedDb
+//! [`SharedDb::with_conn`]: crate::storage::db::SharedDb::with_conn
 
-use std::ffi::OsString;
-use std::fs::{
-    File,
-    OpenOptions,
-};
-use std::io;
+use std::fs::File;
 use std::path::{
     Path,
     PathBuf,
@@ -51,24 +36,26 @@ use std::sync::{
 };
 
 use brook_core::{
-    Error,
     FileId,
-    Result,
+    Result as CoreResult,
     TPieceStorage,
-    TStreamStorage,
 };
 
-use super::files::SqliteFileRepository;
-use super::fs::{
-    available_space,
-    preallocate,
-    pwrite_full,
+use super::layout::{
+    offset_for,
+    piece_count,
+    size_for,
+    with_suffix,
 };
-use super::paths::resolve_target;
-use super::pieces::{
-    PiecesError,
-    SqlitePieceRepository,
+use super::preallocate::open_or_preallocate;
+use crate::storage::error::{
+    StorageError,
+    StorageResult,
 };
+use crate::storage::files::SqliteFileRepository;
+use crate::storage::fs::pwrite_full;
+use crate::storage::paths::resolve_target;
+use crate::storage::pieces::SqlitePieceRepository;
 
 /// Локальное хранилище piece'ов одной загрузки.
 ///
@@ -120,24 +107,39 @@ impl LocalPieceStorage {
         piece_size: u64,
         pieces_repo: Arc<SqlitePieceRepository>,
         files_repo: Arc<SqliteFileRepository>,
-    ) -> Result<Self> {
+    ) -> CoreResult<Self> {
+        Ok(Self::open_inner(
+            target_dir,
+            filename,
+            id,
+            total_size,
+            piece_size,
+            pieces_repo,
+            files_repo,
+        )
+        .await?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_inner(
+        target_dir: &Path,
+        filename: &str,
+        id: FileId,
+        total_size: u64,
+        piece_size: u64,
+        pieces_repo: Arc<SqlitePieceRepository>,
+        files_repo: Arc<SqliteFileRepository>,
+    ) -> StorageResult<Self> {
         if piece_size == 0 {
-            return Err(Error::Other("piece_size must be > 0".into()));
+            return Err(StorageError::InvalidPieceSize);
         }
-        let target_path = resolve_target(target_dir, filename)
-            .map_err(|e| Error::Other(format!("invalid filename: {e}")))?;
+        let target_path = resolve_target(target_dir, filename)?;
         let data_path = with_suffix(&target_path, ".data.brook");
-        let target_dir_owned = target_dir.to_path_buf();
 
         // Решение «resume vs fresh» нуждается в двух async-проверках
         // через репозитории и одной sync-проверке (.data.brook на диске).
-        // sync-проверку делаем здесь же, под join'ом spawn_blocking
-        // ничего долгоиграющего нет — просто `Path::exists`.
-        let inspect = files_repo
-            .get_inspect_fields(id)
-            .await
-            .map_err(|e| Error::Other(format!("inspect fields: {e}")))?;
-        let stored_count = pieces_repo.count(id).await.map_err(piece_err)?;
+        let inspect = files_repo.get_inspect_fields(id).await.map_err(io_to_err)?;
+        let stored_count = pieces_repo.count(id).await?;
         let expected_count = piece_count(total_size, piece_size);
         let inspect_ok = matches!(
             &inspect,
@@ -154,48 +156,17 @@ impl LocalPieceStorage {
             inspect_ok && stored_count > 0 && stored_count == expected_count && data_exists;
 
         if !use_resume {
-            // Fresh-ветка: убираем возможные хвосты прошлых попыток,
-            // чтобы init и preallocate стартовали с пустого места.
+            // Fresh-ветка: убираем возможные хвосты прошлых попыток.
             // delete_all безопасен и при первом запуске (DELETE по
             // несуществующим строкам — no-op).
-            pieces_repo.delete_all(id).await.map_err(piece_err)?;
+            pieces_repo.delete_all(id).await?;
         }
 
-        // Файловая часть — целиком в spawn_blocking: statvfs, open,
-        // preallocate, fsync — все блокирующие.
-        let data_path_for_blocking = data_path.clone();
-        let data = tokio::task::spawn_blocking(move || -> Result<File> {
-            let free = available_space(&target_dir_owned)?;
-            if free < total_size {
-                return Err(Error::Io(io::Error::other(format!(
-                    "not enough free space: have {free}, need {total_size}"
-                ))));
-            }
-            if use_resume {
-                Ok(OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&data_path_for_blocking)?)
-            } else {
-                if data_path_for_blocking.exists() {
-                    std::fs::remove_file(&data_path_for_blocking)?;
-                }
-                let f = OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&data_path_for_blocking)?;
-                preallocate(&f, total_size)?;
-                Ok(f)
-            }
-        })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))??;
+        let data = open_or_preallocate(target_dir, &data_path, total_size, use_resume).await?;
 
         if !use_resume {
             let count = piece_count(total_size, piece_size);
-            pieces_repo.init(id, count).await.map_err(piece_err)?;
+            pieces_repo.init(id, count).await?;
         }
 
         Ok(Self {
@@ -213,152 +184,16 @@ impl LocalPieceStorage {
             piece_size,
         })
     }
-
-    /// Абсолютный offset piece'а `n` в `.data.brook`.
-    fn offset_for(&self, n: u32) -> u64 {
-        n as u64 * self.piece_size
-    }
-
-    /// Размер piece'а `n` в байтах. Последний piece может быть короче.
-    fn size_for(&self, n: u32) -> u64 {
-        let off = self.offset_for(n);
-        // Гарантировано off < total_size по проверкам в write_piece_bytes;
-        // saturating на всякий случай — лучше нулевой piece, чем underflow.
-        self.total_size.saturating_sub(off).min(self.piece_size)
-    }
 }
 
-/// Стриминговое хранилище: один append-файл, без преаллокации, без
-/// piece-строк. Используется, когда сервер не сообщил `Content-Length`
-/// (§2 плана: streaming / unknown-size). Resume для такого хранилища
-/// не поддерживается — при повторном открытии `.data.brook` truncate'ится.
-pub struct LocalStreamStorage {
-    inner: Arc<Mutex<StreamInner>>,
-    data_path: PathBuf,
-    target_path: PathBuf,
-}
-
-struct StreamInner {
-    data: Option<File>,
-    finalized: bool,
-    aborted: bool,
-}
-
-impl LocalStreamStorage {
-    /// Открыть append-хранилище. Любые старые байты в `.data.brook`
-    /// отбрасываются (streaming не умеет resume — при перезапуске
-    /// начинаем с нуля; это не regression, обычный HTTP-поток без Range
-    /// всё равно не переиспользуем).
-    pub async fn open_streaming(target_dir: &Path, filename: &str) -> Result<Self> {
-        let target_path = resolve_target(target_dir, filename)
-            .map_err(|e| Error::Other(format!("invalid filename: {e}")))?;
-        let data_path = with_suffix(&target_path, ".data.brook");
-        let data_path_for_blocking = data_path.clone();
-        let data = tokio::task::spawn_blocking(move || -> Result<File> {
-            // truncate=true — streaming-mode не делает resume.
-            let f = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(true)
-                .open(&data_path_for_blocking)?;
-            Ok(f)
-        })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))??;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(StreamInner {
-                data: Some(data),
-                finalized: false,
-                aborted: false,
-            })),
-            data_path,
-            target_path,
-        })
+/// `files_repo.get_inspect_fields` единственный возвращает `CoreResult`
+/// (он делит тип с публичным API фабрики). Оборачиваем обратно в
+/// `StorageError::Io` / `StorageError`, не теряя текст.
+fn io_to_err(e: brook_core::Error) -> StorageError {
+    match e {
+        brook_core::Error::Io(io) => StorageError::Io(io),
+        other => StorageError::Io(std::io::Error::other(other.to_string())),
     }
-}
-
-impl TStreamStorage for LocalStreamStorage {
-    async fn append_chunk(&self, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
-        let bytes = bytes.to_vec();
-        let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut guard = inner.lock().expect("mutex poisoned");
-            if guard.finalized {
-                return Err(Error::Other("append after finalize".into()));
-            }
-            if guard.aborted {
-                return Err(Error::Other("append after abort".into()));
-            }
-            let file = guard
-                .data
-                .as_mut()
-                .expect("data handle present while !finalized && !aborted");
-            file.write_all(&bytes)?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))?
-    }
-
-    async fn finalize(&self) -> Result<()> {
-        let inner = Arc::clone(&self.inner);
-        let data_path = self.data_path.clone();
-        let target_path = self.target_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut guard = inner.lock().expect("mutex poisoned");
-            if guard.aborted {
-                return Err(Error::Other("finalize after abort".into()));
-            }
-            if guard.finalized {
-                return Ok(());
-            }
-            let file = guard
-                .data
-                .take()
-                .expect("data handle present while !finalized");
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&data_path, &target_path)?;
-            guard.finalized = true;
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))?
-    }
-
-    async fn abort(&self) -> Result<()> {
-        let inner = Arc::clone(&self.inner);
-        let data_path = self.data_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut guard = inner.lock().expect("mutex poisoned");
-            guard.data = None;
-            let _ = std::fs::remove_file(&data_path);
-            guard.aborted = true;
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))?
-    }
-}
-
-fn piece_count(total_size: u64, piece_size: u64) -> u32 {
-    if total_size == 0 {
-        return 0;
-    }
-    total_size.div_ceil(piece_size) as u32
-}
-
-fn piece_err(e: PiecesError) -> Error {
-    Error::Other(format!("pieces: {e}"))
-}
-
-/// Добавить суффикс к пути без потери расширения.
-fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
-    let mut s: OsString = p.as_os_str().to_os_string();
-    s.push(suffix);
-    PathBuf::from(s)
 }
 
 impl TPieceStorage for LocalPieceStorage {
@@ -367,33 +202,68 @@ impl TPieceStorage for LocalPieceStorage {
         piece_index: u32,
         offset_in_piece: u64,
         bytes: &[u8],
-    ) -> Result<()> {
+    ) -> CoreResult<()> {
+        Ok(self
+            .write_piece_bytes_inner(piece_index, offset_in_piece, bytes)
+            .await?)
+    }
+
+    async fn commit_done(&self, piece_index: u32) -> CoreResult<()> {
+        Ok(self.commit_done_inner(piece_index).await?)
+    }
+
+    async fn pending_pieces(&self) -> CoreResult<Vec<u32>> {
+        self.pieces_repo
+            .pending_numbers(self.file_id)
+            .await
+            .map_err(|e| StorageError::from(e).into())
+    }
+
+    async fn finalize(&self) -> CoreResult<()> {
+        Ok(self.finalize_inner().await?)
+    }
+
+    async fn abort(&self) -> CoreResult<()> {
+        Ok(self.abort_inner().await?)
+    }
+}
+
+impl LocalPieceStorage {
+    async fn write_piece_bytes_inner(
+        &self,
+        piece_index: u32,
+        offset_in_piece: u64,
+        bytes: &[u8],
+    ) -> StorageResult<()> {
         let count = piece_count(self.total_size, self.piece_size);
         if piece_index >= count {
-            return Err(Error::Other(format!(
-                "piece_index {piece_index} out of range (count {count})"
-            )));
+            return Err(StorageError::PieceIndexOutOfRange {
+                index: piece_index,
+                count,
+            });
         }
-        let piece_size = self.size_for(piece_index);
+        let piece_len = size_for(piece_index, self.total_size, self.piece_size);
         let end = offset_in_piece
             .checked_add(bytes.len() as u64)
-            .ok_or_else(|| Error::Other("offset overflow".into()))?;
-        if end > piece_size {
-            return Err(Error::Other(format!(
-                "write past piece end: piece {piece_index}, end {end} vs size {piece_size}"
-            )));
+            .ok_or(StorageError::OffsetOverflow)?;
+        if end > piece_len {
+            return Err(StorageError::WritePastPieceEnd {
+                index: piece_index,
+                end,
+                size: piece_len,
+            });
         }
-        let abs = self.offset_for(piece_index) + offset_in_piece;
+        let abs = offset_for(piece_index, self.piece_size) + offset_in_piece;
         let bytes = bytes.to_vec();
         let inner = Arc::clone(&self.inner);
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        tokio::task::spawn_blocking(move || -> StorageResult<()> {
             let guard = inner.lock().expect("mutex poisoned");
             if guard.finalized {
-                return Err(Error::Other("write after finalize".into()));
+                return Err(StorageError::AfterFinalize { op: "write" });
             }
             if guard.aborted {
-                return Err(Error::Other("write after abort".into()));
+                return Err(StorageError::AfterAbort { op: "write" });
             }
             let file = guard
                 .data
@@ -402,20 +272,22 @@ impl TPieceStorage for LocalPieceStorage {
             pwrite_full(file, &bytes, abs)?;
             Ok(())
         })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))?
+        .await?
     }
 
-    async fn commit_done(&self, piece_index: u32) -> Result<()> {
+    async fn commit_done_inner(&self, piece_index: u32) -> StorageResult<()> {
         // Сначала fsync самих байт — иначе после краша БД будет
         // врать, что piece готов, а данных на диске нет. Инвариант
         // «commit ⇒ persisted» держится именно этим порядком:
         // sync_data() здесь, затем UPDATE в pieces.
         let inner = Arc::clone(&self.inner);
-        let must_check = tokio::task::spawn_blocking(move || -> Result<()> {
+        tokio::task::spawn_blocking(move || -> StorageResult<()> {
             let guard = inner.lock().expect("mutex poisoned");
-            if guard.finalized || guard.aborted {
-                return Err(Error::Other("commit after finalize/abort".into()));
+            if guard.finalized {
+                return Err(StorageError::AfterFinalize { op: "commit" });
+            }
+            if guard.aborted {
+                return Err(StorageError::AfterAbort { op: "commit" });
             }
             guard
                 .data
@@ -424,32 +296,23 @@ impl TPieceStorage for LocalPieceStorage {
                 .sync_data()?;
             Ok(())
         })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))?;
-        must_check?;
+        .await??;
 
         self.pieces_repo
             .commit_done(self.file_id, piece_index)
-            .await
-            .map_err(piece_err)
+            .await?;
+        Ok(())
     }
 
-    async fn pending_pieces(&self) -> Result<Vec<u32>> {
-        self.pieces_repo
-            .pending_numbers(self.file_id)
-            .await
-            .map_err(piece_err)
-    }
-
-    async fn finalize(&self) -> Result<()> {
+    async fn finalize_inner(&self) -> StorageResult<()> {
         let inner = Arc::clone(&self.inner);
         let data_path = self.data_path.clone();
         let target_path = self.target_path.clone();
 
-        let renamed = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let renamed = tokio::task::spawn_blocking(move || -> StorageResult<bool> {
             let mut guard = inner.lock().expect("mutex poisoned");
             if guard.aborted {
-                return Err(Error::Other("finalize after abort".into()));
+                return Err(StorageError::AfterAbort { op: "finalize" });
             }
             if guard.finalized {
                 return Ok(false);
@@ -464,40 +327,33 @@ impl TPieceStorage for LocalPieceStorage {
             guard.finalized = true;
             Ok(true)
         })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))??;
+        .await??;
 
         if renamed {
             // Piece-строки больше не нужны: файл готов и переименован.
             // Состоянием в `files` управляет engine через
             // `TQueueStore::update_state` — здесь мы трогаем только
             // piece-таблицу.
-            self.pieces_repo
-                .delete_all(self.file_id)
-                .await
-                .map_err(piece_err)?;
+            self.pieces_repo.delete_all(self.file_id).await?;
         }
         Ok(())
     }
 
-    async fn abort(&self) -> Result<()> {
+    async fn abort_inner(&self) -> StorageResult<()> {
         let inner = Arc::clone(&self.inner);
         let data_path = self.data_path.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        tokio::task::spawn_blocking(move || -> StorageResult<()> {
             let mut guard = inner.lock().expect("mutex poisoned");
             guard.data = None;
             let _ = std::fs::remove_file(&data_path);
             guard.aborted = true;
             Ok(())
         })
-        .await
-        .map_err(|e| Error::Other(format!("join: {e}")))??;
+        .await??;
 
-        self.pieces_repo
-            .delete_all(self.file_id)
-            .await
-            .map_err(piece_err)
+        self.pieces_repo.delete_all(self.file_id).await?;
+        Ok(())
     }
 }
 
@@ -535,8 +391,6 @@ mod tests {
         }
     }
 
-    /// Минимальная сборка для теста: SharedDb + регистрируем `File`,
-    /// раскладываем inspect-поля (это сделала бы фабрика в stage 6).
     async fn fixture(
         target_dir: &Path,
         filename: &str,
@@ -606,7 +460,6 @@ mod tests {
         let target = dir.path().join("out.bin");
         assert!(target.exists());
         assert!(!dir.path().join("out.bin.data.brook").exists());
-        // Piece-строки удалены после finalize.
         assert!(!pieces.is_initialized(id).await.unwrap());
 
         assert_eq!(read_file(&target), b"AAAABBBBCCCCDDDDEEEE".to_vec());
@@ -616,7 +469,6 @@ mod tests {
     async fn resume_after_crash_continues_where_left() {
         let dir = tempdir().unwrap();
 
-        // Стейдж 1: пишем 2 piece'а, коммитим, дропаем storage без finalize.
         let (db, files, pieces, id) = fixture(dir.path(), "r.bin").await;
         {
             let s = LocalPieceStorage::open(
@@ -635,9 +487,7 @@ mod tests {
             s.commit_done(0).await.unwrap();
             s.commit_done(1).await.unwrap();
         }
-        // Имитируем рестарт демона: сборка repo заново, но БД та же
-        // и `.data.brook` остался.
-        let _ = db; // удерживаем shared_db живым — это и есть «тот же файл»
+        let _ = db;
         let s = LocalPieceStorage::open(
             dir.path(),
             "r.bin",
@@ -683,7 +533,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let (_db, files, pieces, id) = fixture(dir.path(), "m.bin").await;
 
-        // Стейдж 1: пишем piece, коммитим.
         {
             let s = LocalPieceStorage::open(
                 dir.path(),
@@ -700,9 +549,6 @@ mod tests {
             s.commit_done(0).await.unwrap();
         }
 
-        // Меняем inspect-поля (как будто фабрика перезаписала после
-        // нового inspect: другой total_size). Открытие должно увидеть
-        // несоответствие и пересобрать всё.
         files
             .set_inspect_fields(id, Some(32), Some(PIECE), None, None, None)
             .await
@@ -718,7 +564,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // 32 / 8 = 4 piece'а, все pending.
         assert_eq!(s.pending_pieces().await.unwrap(), vec![0, 1, 2, 3]);
     }
 
@@ -727,9 +572,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (_db, _files, _pieces, _id, s) = open_fresh(dir.path(), "b.bin").await;
 
-        // Piece 2 размером 4 байта — запись 5 байт вылезает.
         assert!(s.write_piece_bytes(2, 0, b"EEEEE").await.is_err());
-        // Несуществующий piece (count = 3).
         assert!(s.write_piece_bytes(99, 0, b"Z").await.is_err());
     }
 
@@ -783,7 +626,6 @@ mod tests {
         assert!(s.commit_done(0).await.is_err());
     }
 
-    // Use PathBuf to silence unused-import lints across platforms.
     #[allow(dead_code)]
     fn _unused(_: PathBuf) {}
 }
