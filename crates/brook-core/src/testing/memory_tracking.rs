@@ -15,7 +15,7 @@ use std::sync::{
 use crate::domain::{
     AttemptId,
     AttemptStatus,
-    DownloadId,
+    FileId,
     WorkerId,
     WorkerStatus,
 };
@@ -31,7 +31,7 @@ use crate::ports::{
 #[derive(Debug, Clone)]
 pub struct MemoryWorkerRow {
     pub id: WorkerId,
-    pub file_id: DownloadId,
+    pub file_id: FileId,
     pub slot_index: usize,
     pub status: WorkerStatus,
     pub error: Option<String>,
@@ -41,7 +41,7 @@ pub struct MemoryWorkerRow {
 #[derive(Debug, Clone)]
 pub struct MemoryAttemptRow {
     pub id: AttemptId,
-    pub file_id: DownloadId,
+    pub file_id: FileId,
     pub piece_number: u32,
     pub worker_id: WorkerId,
     pub status: AttemptStatus,
@@ -77,7 +77,7 @@ impl MemoryWorkerRepo {
         v
     }
 
-    pub fn by_file(&self, file_id: DownloadId) -> Vec<MemoryWorkerRow> {
+    pub fn by_file(&self, file_id: FileId) -> Vec<MemoryWorkerRow> {
         self.snapshot()
             .into_iter()
             .filter(|r| r.file_id == file_id)
@@ -88,7 +88,7 @@ impl MemoryWorkerRepo {
 impl TWorkerRepo for MemoryWorkerRepo {
     fn ensure_slots(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
         n: usize,
     ) -> impl std::future::Future<Output = Result<Vec<WorkerRecord>>> + Send {
         let inner = Arc::clone(&self.inner);
@@ -172,7 +172,7 @@ impl TWorkerRepo for MemoryWorkerRepo {
 
     fn pause_all_running_for_file(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {
@@ -232,7 +232,7 @@ impl MemoryAttemptRepo {
         g.rows.values().cloned().collect()
     }
 
-    pub fn by_piece(&self, file_id: DownloadId, piece: u32) -> Vec<MemoryAttemptRow> {
+    pub fn by_piece(&self, file_id: FileId, piece: u32) -> Vec<MemoryAttemptRow> {
         self.snapshot()
             .into_iter()
             .filter(|r| r.file_id == file_id && r.piece_number == piece)
@@ -243,7 +243,7 @@ impl MemoryAttemptRepo {
 impl TPieceAttemptRepo for MemoryAttemptRepo {
     fn start(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
         piece_number: u32,
         worker_id: WorkerId,
     ) -> impl std::future::Future<Output = Result<AttemptRecord>> + Send {
@@ -334,7 +334,7 @@ impl TPieceAttemptRepo for MemoryAttemptRepo {
 
     fn pause_all_running_for_file(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         let inner = Arc::clone(&self.inner);
         async move {

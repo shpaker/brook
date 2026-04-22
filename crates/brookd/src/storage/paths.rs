@@ -44,7 +44,7 @@ pub fn resolve_target(target_dir: &Path, filename: &str) -> Result<PathBuf, Path
 /// Проверить, что `filename` безопасен как один компонент пути.
 ///
 /// Публично, т.к. полезно до того, как `target_dir` известна (например,
-/// в валидации `DownloadSpec`).
+/// в валидации `FileSpec`).
 pub fn validate_filename(filename: &str) -> Result<(), PathError> {
     if filename.is_empty() {
         return Err(PathError::Empty);

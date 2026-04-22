@@ -3,7 +3,9 @@
 //! Отвечает за:
 //! - реестр загрузок (`records`) и активных движков (`engines`);
 //! - ограничение параллельности (`max_concurrent`);
-//! - fan-in событий в единый `broadcast::Sender<DownloadEvent>` для `Watch`;
+//! - fan-in событий в два broadcast-канала —
+//!   `broadcast::Sender<FileLifecycleEvent>` (для `WatchFile`) и
+//!   `broadcast::Sender<ProgressEvent>` (для `WatchProgress`);
 //! - персистенцию состояний через [`TQueueStore`] (insert при `add`,
 //!   `update_state` при смене стейта);
 //! - восстановление очереди из [`TQueueStore`] при старте ([`Self::bootstrap`]).
@@ -22,8 +24,8 @@
 //! ## Fan-in событий
 //!
 //! На каждый спаунингом движок создаётся маленький task, который:
-//! 1. Читает `DownloadEvent` из `broadcast::Receiver` движка.
-//! 2. Форвардит событие в общий `events_tx` (для подписчиков `Watch`).
+//! 1. Читает lifecycle-события из `broadcast::Receiver` движка.
+//! 2. Форвардит их в общий `lifecycle_tx` (для подписчиков `WatchFile`).
 //! 3. Обновляет `records[id]` (state/progress/error/updated_at).
 //! 4. На смене state — пишет в `TQueueStore`.
 //! 5. На терминальном событии — удаляет движок из `engines` и пробует
@@ -53,12 +55,13 @@ use tracing::{
 };
 
 use crate::domain::{
-    Download,
-    DownloadEvent,
-    DownloadId,
-    DownloadSpec,
     FailureReason,
+    File,
+    FileId,
+    FileLifecycleEvent,
+    FileSpec,
     FileStatus,
+    ProgressEvent,
     ReasonCode,
 };
 use crate::error::{
@@ -80,6 +83,7 @@ use crate::service::engine::{
     EngineConfig,
     EngineHandle,
     EngineInputs,
+    EngineSubscriptions,
     StreamingEngineInputs,
 };
 
@@ -157,17 +161,18 @@ where
     workers_repo: Arc<WR>,
     attempts_repo: Arc<AR>,
     inner: Mutex<Inner>,
-    events_tx: broadcast::Sender<DownloadEvent>,
+    lifecycle_tx: broadcast::Sender<FileLifecycleEvent>,
+    progress_tx: broadcast::Sender<ProgressEvent>,
     config: ManagerConfig,
 }
 
 struct Inner {
-    records: HashMap<DownloadId, Download>,
-    engines: HashMap<DownloadId, EngineHandle>,
+    records: HashMap<FileId, File>,
+    engines: HashMap<FileId, EngineHandle>,
     /// Упорядоченная очередь id в ожидании слота. Id может быть и в
     /// `Paused` (пользователь попросил pause до старта) — такие при
     /// продвижении пропускаются.
-    waiting: VecDeque<DownloadId>,
+    waiting: VecDeque<FileId>,
 }
 
 impl<PF, QS, F> DownloadManager<PF, QS, F, NoopWorkerRepo, NoopAttemptRepo>
@@ -213,7 +218,8 @@ where
         attempts_repo: Arc<AR>,
         config: ManagerConfig,
     ) -> Self {
-        let (events_tx, _) = broadcast::channel(config.events_capacity);
+        let (lifecycle_tx, _) = broadcast::channel(config.events_capacity);
+        let (progress_tx, _) = broadcast::channel(config.events_capacity);
         Self {
             shared: Arc::new(Shared {
                 factory,
@@ -226,20 +232,26 @@ where
                     engines: HashMap::new(),
                     waiting: VecDeque::new(),
                 }),
-                events_tx,
+                lifecycle_tx,
+                progress_tx,
                 config,
             }),
         }
     }
 
-    /// Подписаться на поток всех событий всех движков.
-    pub fn subscribe(&self) -> broadcast::Receiver<DownloadEvent> {
-        self.shared.events_tx.subscribe()
+    /// Подписаться на поток lifecycle-событий (`WatchFile`).
+    pub fn subscribe_lifecycle(&self) -> broadcast::Receiver<FileLifecycleEvent> {
+        self.shared.lifecycle_tx.subscribe()
+    }
+
+    /// Подписаться на поток прогресс-тиков (`WatchProgress`).
+    pub fn subscribe_progress(&self) -> broadcast::Receiver<ProgressEvent> {
+        self.shared.progress_tx.subscribe()
     }
 
     /// Срез всех известных менеджеру загрузок — для Snapshot-реконсиляции
     /// в `Watch`.
-    pub fn snapshot(&self) -> Vec<Download> {
+    pub fn snapshot(&self) -> Vec<File> {
         let inner = self.shared.inner.lock().expect("mutex poisoned");
         inner.records.values().cloned().collect()
     }
@@ -251,7 +263,7 @@ where
     /// `Queued` остаются как есть.
     pub async fn bootstrap(&self) -> Result<()> {
         let loaded = self.shared.queue.load_all().await?;
-        let mut to_fix: Vec<(DownloadId, FileStatus)> = Vec::new();
+        let mut to_fix: Vec<(FileId, FileStatus)> = Vec::new();
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
             for mut d in loaded {
@@ -282,21 +294,21 @@ where
         Ok(())
     }
 
-    /// Добавить новую загрузку. Возвращает её `DownloadId`.
-    pub async fn add(&self, spec: DownloadSpec) -> Result<DownloadId> {
-        let id = DownloadId::new();
-        let download = Download::new(id, spec);
-        self.shared.queue.insert(&download).await?;
+    /// Добавить новый файл. Возвращает его `FileId`.
+    pub async fn add(&self, spec: FileSpec) -> Result<FileId> {
+        let id = FileId::new();
+        let file = File::new(id, spec);
+        self.shared.queue.insert(&file).await?;
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-            inner.records.insert(id, download.clone());
+            inner.records.insert(id, file.clone());
             inner.waiting.push_back(id);
         }
-        // Уведомляем подписчиков Watch о новой записи до того, как движок
-        // начнёт слать `StateChanged`/`Progress`: у клиента этого id ещё
+        // Уведомляем подписчиков WatchFile о новой записи до того, как
+        // движок начнёт слать `StatusChanged`: у клиента этого id ещё
         // нет, и событие без предшествующего `Snapshot` было бы выброшено.
-        let _ = self.shared.events_tx.send(DownloadEvent::Snapshot {
-            download: Box::new(download),
+        let _ = self.shared.lifecycle_tx.send(FileLifecycleEvent::Snapshot {
+            file: Box::new(file),
         });
         self.try_spawn_next().await;
         Ok(id)
@@ -309,7 +321,7 @@ where
     /// для клиента, у которого в ViewModel может остаться «призрак»
     /// (например, при рассинхроне после рестарта демона): повторный
     /// `Remove` должен починить состояние, а не ругаться NotFound'ом.
-    pub async fn remove(&self, id: DownloadId) -> Result<()> {
+    pub async fn remove(&self, id: FileId) -> Result<()> {
         let was_known = {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
             if inner.engines.contains_key(&id) {
@@ -334,7 +346,7 @@ where
     /// `StateChanged(Paused)` прилетит из движка.
     /// Если загрузка ещё в `waiting` — сразу помечаем `Paused` и
     /// убираем из `waiting` (движок не появится, пока не будет `Resume`).
-    pub async fn pause(&self, id: DownloadId) -> Result<()> {
+    pub async fn pause(&self, id: FileId) -> Result<()> {
         let mut persist = None;
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
@@ -351,10 +363,13 @@ where
                 record.status = FileStatus::Paused;
                 record.updated_at = SystemTime::now();
                 persist = Some(FileStatus::Paused);
-                let _ = self.shared.events_tx.send(DownloadEvent::StatusChanged {
-                    id,
-                    status: FileStatus::Paused,
-                });
+                let _ = self
+                    .shared
+                    .lifecycle_tx
+                    .send(FileLifecycleEvent::StatusChanged {
+                        id,
+                        status: FileStatus::Paused,
+                    });
             }
         }
         if let Some(status) = persist {
@@ -367,7 +382,7 @@ where
     ///
     /// Если движок активен — прокидываем `Resume`.
     /// Иначе — возвращаем в `waiting` и пытаемся спаунить.
-    pub async fn resume(&self, id: DownloadId) -> Result<()> {
+    pub async fn resume(&self, id: FileId) -> Result<()> {
         let mut persist = None;
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
@@ -383,10 +398,13 @@ where
                 record.status = FileStatus::Pending;
                 record.updated_at = SystemTime::now();
                 persist = Some(FileStatus::Pending);
-                let _ = self.shared.events_tx.send(DownloadEvent::StatusChanged {
-                    id,
-                    status: FileStatus::Pending,
-                });
+                let _ = self
+                    .shared
+                    .lifecycle_tx
+                    .send(FileLifecycleEvent::StatusChanged {
+                        id,
+                        status: FileStatus::Pending,
+                    });
             }
             if !inner.waiting.iter().any(|x| *x == id) {
                 inner.waiting.push_back(id);
@@ -400,7 +418,7 @@ where
     }
 
     /// Отменить загрузку.
-    pub async fn cancel(&self, id: DownloadId) -> Result<()> {
+    pub async fn cancel(&self, id: FileId) -> Result<()> {
         let should_persist = {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
             if let Some(handle) = inner.engines.get(&id) {
@@ -414,10 +432,13 @@ where
             }
             record.status = FileStatus::Cancelled;
             record.updated_at = SystemTime::now();
-            let _ = self.shared.events_tx.send(DownloadEvent::StatusChanged {
-                id,
-                status: FileStatus::Cancelled,
-            });
+            let _ = self
+                .shared
+                .lifecycle_tx
+                .send(FileLifecycleEvent::StatusChanged {
+                    id,
+                    status: FileStatus::Cancelled,
+                });
             true
         };
         if should_persist {
@@ -435,7 +456,7 @@ where
 
     /// Поставить на паузу все активные и всё, что в `waiting`.
     pub async fn pause_all(&self) -> Result<()> {
-        let ids: Vec<DownloadId> = {
+        let ids: Vec<FileId> = {
             let inner = self.shared.inner.lock().expect("mutex poisoned");
             inner.records.keys().copied().collect()
         };
@@ -453,7 +474,7 @@ where
     /// этом случае будут дропнуты владельцем — in-flight piece-пачки без
     /// коммита перекачаются при следующем старте.
     pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
-        let active: Vec<DownloadId> = {
+        let active: Vec<FileId> = {
             let inner = self.shared.inner.lock().expect("mutex poisoned");
             inner.engines.keys().copied().collect()
         };
@@ -494,7 +515,7 @@ where
 
     /// Возобновить все `Paused`.
     pub async fn resume_all(&self) -> Result<()> {
-        let ids: Vec<DownloadId> = {
+        let ids: Vec<FileId> = {
             let inner = self.shared.inner.lock().expect("mutex poisoned");
             inner
                 .records
@@ -519,7 +540,7 @@ where
                 }
                 // Перебираем `waiting` до первого подходящего (Queued);
                 // Paused/Cancelled игнорируем и пропускаем.
-                let mut picked: Option<DownloadId> = None;
+                let mut picked: Option<FileId> = None;
                 while let Some(id) = inner.waiting.pop_front() {
                     match inner.records.get(&id).map(|d| d.status) {
                         Some(FileStatus::Pending) | Some(FileStatus::Retrying) => {
@@ -549,7 +570,7 @@ where
                     .queue
                     .update_status(id, FileStatus::Failed, Some(reason))
                     .await;
-                let _ = self.shared.events_tx.send(DownloadEvent::Failed {
+                let _ = self.shared.lifecycle_tx.send(FileLifecycleEvent::Failed {
                     id,
                     error: e.to_string(),
                 });
@@ -557,15 +578,12 @@ where
         }
     }
 
-    fn spawn_engine(&self, id: DownloadId) -> impl std::future::Future<Output = Result<()>> + Send {
+    fn spawn_engine(&self, id: FileId) -> impl std::future::Future<Output = Result<()>> + Send {
         let shared = Arc::clone(&self.shared);
         async move { Self::spawn_engine_impl(shared, id).await }
     }
 
-    async fn spawn_engine_impl(
-        shared: Arc<Shared<PF, QS, F, WR, AR>>,
-        id: DownloadId,
-    ) -> Result<()> {
+    async fn spawn_engine_impl(shared: Arc<Shared<PF, QS, F, WR, AR>>, id: FileId) -> Result<()> {
         let maybe_spec = {
             let inner = shared.inner.lock().expect("mutex poisoned");
             inner.records.get(&id).map(|d| d.spec.clone())
@@ -573,7 +591,13 @@ where
         let spec = maybe_spec.ok_or(Error::NotFound)?;
         let prepared = shared.factory.prepare(id, &spec).await?;
         let effective_url = prepared.effective_url.clone();
-        let (handle, events_rx) = match prepared.mode {
+        let (
+            handle,
+            EngineSubscriptions {
+                lifecycle: lifecycle_rx,
+                progress: progress_rx,
+            },
+        ) = match prepared.mode {
             PreparedMode::Known {
                 total_size,
                 piece_size,
@@ -628,15 +652,22 @@ where
             let mut inner = shared.inner.lock().expect("mutex poisoned");
             inner.engines.insert(id, handle);
         }
-        tokio::spawn(fan_in_events(Arc::clone(&shared), id, events_rx));
+        // Отдельный таск для прогресса — он не влияет ни на state, ни
+        // на продвижение очереди. Форвардит `ProgressEvent` в общий
+        // broadcast, без обновления `records` (прогресс в домене File
+        // теперь не живёт — это отдельный стрим).
+        tokio::spawn(fan_in_progress(Arc::clone(&shared), id, progress_rx));
+        // Основной таск — lifecycle: обновляет records, персистит
+        // состояние и триггерит advance_queue на терминале.
+        tokio::spawn(fan_in_lifecycle(Arc::clone(&shared), id, lifecycle_rx));
         Ok(())
     }
 }
 
-async fn fan_in_events<PF, QS, F, WR, AR>(
+async fn fan_in_lifecycle<PF, QS, F, WR, AR>(
     shared: Arc<Shared<PF, QS, F, WR, AR>>,
-    id: DownloadId,
-    mut rx: broadcast::Receiver<DownloadEvent>,
+    id: FileId,
+    mut rx: broadcast::Receiver<FileLifecycleEvent>,
 ) where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
@@ -654,7 +685,7 @@ async fn fan_in_events<PF, QS, F, WR, AR>(
         let ev = match rx.recv().await {
             Ok(e) => e,
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!(%id, lagged = n, "engine event stream lagged");
+                warn!(%id, lagged = n, "engine lifecycle stream lagged");
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -665,31 +696,27 @@ async fn fan_in_events<PF, QS, F, WR, AR>(
             let mut inner = shared.inner.lock().expect("mutex poisoned");
             if let Some(record) = inner.records.get_mut(&id) {
                 match &ev {
-                    DownloadEvent::Progress { progress, .. } => {
-                        record.progress = *progress;
-                        record.updated_at = SystemTime::now();
-                    }
-                    DownloadEvent::StatusChanged { status, .. } => {
+                    FileLifecycleEvent::StatusChanged { status, .. } => {
                         if record.status != *status {
                             record.status = *status;
                             record.updated_at = SystemTime::now();
                             status_to_persist = Some(*status);
                         }
                     }
-                    DownloadEvent::Completed { .. } => {
+                    FileLifecycleEvent::Completed { .. } => {
                         if record.status != FileStatus::Done {
                             record.status = FileStatus::Done;
                             record.updated_at = SystemTime::now();
                             status_to_persist = Some(FileStatus::Done);
                         }
                     }
-                    DownloadEvent::Failed { error, .. } => {
+                    FileLifecycleEvent::Failed { error, .. } => {
                         record.status = FileStatus::Failed;
                         record.error = Some(error.clone());
                         record.updated_at = SystemTime::now();
                         status_to_persist = Some(FileStatus::Failed);
                         // У engine нет типизированного Error — только строка.
-                        // Stage 3+ поднимет ReasonCode в DownloadEvent::Failed;
+                        // Stage 3+ поднимет ReasonCode в FileLifecycleEvent::Failed;
                         // пока маппим свободный текст в Unknown и сохраняем его
                         // в сообщении, чтобы причина не терялась.
                         reason_to_persist = Some(FailureReason::with_message(
@@ -697,11 +724,11 @@ async fn fan_in_events<PF, QS, F, WR, AR>(
                             error.clone(),
                         ));
                     }
-                    DownloadEvent::WorkerUpdate { .. } | DownloadEvent::Snapshot { .. } => {}
+                    FileLifecycleEvent::Snapshot { .. } => {}
                 }
             }
         }
-        let _ = shared.events_tx.send(ev);
+        let _ = shared.lifecycle_tx.send(ev);
         if let Some(status) = status_to_persist
             && let Err(e) = shared
                 .queue
@@ -720,6 +747,34 @@ async fn fan_in_events<PF, QS, F, WR, AR>(
     }
     debug!(%id, "engine task terminated, advancing queue");
     advance_queue(Arc::clone(&shared)).await;
+}
+
+/// Фан-ин прогресс-тиков: просто форвардит `ProgressEvent` в общий
+/// broadcast, без касания `records` и без влияния на lifecycle.
+async fn fan_in_progress<PF, QS, F, WR, AR>(
+    shared: Arc<Shared<PF, QS, F, WR, AR>>,
+    id: FileId,
+    mut rx: broadcast::Receiver<ProgressEvent>,
+) where
+    PF: TPieceStorageFactory + Send + Sync + 'static,
+    PF::Storage: Send + Sync + 'static,
+    QS: TQueueStore + Send + Sync + 'static,
+    F: TRangeFetch + Send + Sync + 'static,
+    WR: TWorkerRepo + Send + Sync + 'static,
+    AR: TPieceAttemptRepo + Send + Sync + 'static,
+{
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let _ = shared.progress_tx.send(ev);
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(%id, lagged = n, "engine progress stream lagged");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 /// Попытаться поднять следующий движок после завершения предыдущего.
@@ -744,7 +799,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::domain::DownloadSpec;
+    use crate::domain::FileSpec;
     use crate::service::retry::RetryPolicy;
     use crate::testing::{
         MemoryPieceStorageFactory,
@@ -767,10 +822,8 @@ mod tests {
         }
     }
 
-    fn spec(url: &str) -> DownloadSpec {
-        let mut s = DownloadSpec::new(url, "/tmp");
-        s.workers = 2;
-        s
+    fn spec(url: &str) -> FileSpec {
+        FileSpec::new(url, "/tmp")
     }
 
     fn make_manager(
@@ -798,7 +851,7 @@ mod tests {
 
     async fn wait_for_terminal(
         mgr: &DownloadManager<MemoryPieceStorageFactory, MemoryTQueueStore, MockRangeFetch>,
-        id: DownloadId,
+        id: FileId,
     ) {
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -907,11 +960,11 @@ mod tests {
         let factory = Arc::new(MemoryPieceStorageFactory::new(2, 10));
         let queue = Arc::new(MemoryTQueueStore::new());
         // Предзаполним очередь тремя состояниями.
-        let mut qd = Download::new(DownloadId::new(), spec("https://t/q"));
+        let mut qd = File::new(FileId::new(), spec("https://t/q"));
         qd.status = FileStatus::Pending;
-        let mut rd = Download::new(DownloadId::new(), spec("https://t/r"));
+        let mut rd = File::new(FileId::new(), spec("https://t/r"));
         rd.status = FileStatus::Running;
-        let mut pd = Download::new(DownloadId::new(), spec("https://t/p"));
+        let mut pd = File::new(FileId::new(), spec("https://t/p"));
         pd.status = FileStatus::Paused;
         queue.insert(&qd).await.unwrap();
         queue.insert(&rd).await.unwrap();
@@ -1006,12 +1059,12 @@ mod tests {
     #[tokio::test]
     async fn events_fan_in_delivers_completed() {
         let (mgr, _) = make_manager(2, 10, 2);
-        let mut rx = mgr.subscribe();
+        let mut rx = mgr.subscribe_lifecycle();
         let id = mgr.add(spec("https://t/x")).await.unwrap();
         let mut saw_completed = false;
         for _ in 0..400 {
             match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
-                Ok(Ok(DownloadEvent::Completed { id: eid })) if eid == id => {
+                Ok(Ok(FileLifecycleEvent::Completed { id: eid })) if eid == id => {
                     saw_completed = true;
                     break;
                 }

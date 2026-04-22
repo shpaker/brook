@@ -12,21 +12,21 @@
 use std::future::Future;
 
 use crate::domain::{
-    Download,
-    DownloadId,
     FailureReason,
+    File,
+    FileId,
     FileStatus,
 };
 use crate::error::Result;
 
 pub trait TQueueStore: Send + Sync {
-    /// Все загрузки из хранилища (при старте демона).
-    fn load_all(&self) -> impl Future<Output = Result<Vec<Download>>> + Send;
+    /// Все файлы из хранилища (при старте демона).
+    fn load_all(&self) -> impl Future<Output = Result<Vec<File>>> + Send;
 
     /// Вставить новую запись. Ошибка, если `id` уже существует.
-    fn insert(&self, download: &Download) -> impl Future<Output = Result<()>> + Send;
+    fn insert(&self, file: &File) -> impl Future<Output = Result<()>> + Send;
 
-    /// Обновить статус существующей загрузки. Ошибка, если записи нет.
+    /// Обновить статус существующего файла. Ошибка, если записи нет.
     ///
     /// `reason` обязателен при переходе в [`FileStatus::Failed`]
     /// (инвариант схемы). Для остальных переходов опционален: например,
@@ -37,11 +37,11 @@ pub trait TQueueStore: Send + Sync {
     /// [`ReasonCode::CancelledByUser`]: crate::domain::ReasonCode::CancelledByUser
     fn update_status(
         &self,
-        id: DownloadId,
+        id: FileId,
         status: FileStatus,
         reason: Option<FailureReason>,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Удалить запись. Ошибка, если записи нет.
-    fn remove(&self, id: DownloadId) -> impl Future<Output = Result<()>> + Send;
+    fn remove(&self, id: FileId) -> impl Future<Output = Result<()>> + Send;
 }

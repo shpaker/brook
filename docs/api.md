@@ -10,7 +10,7 @@
 
 Отличия:
 - У нас gRPC + protobuf (а не JSON-RPC).
-- Server-streaming для прогресса (вместо поллинга).
+- Server-streaming для прогресса и лайфсайкла (вместо поллинга).
 - В MVP **Settings через API не ходят** — конфиг живёт в таблице `settings` внутри `brook.db` (см. [architecture.md#конфигурация](architecture.md#конфигурация)).
 
 ## Расположение
@@ -20,60 +20,68 @@
 
 ## Схема
 
-Все типы и методы — в `proto/brook/v1/brook.proto` (единый источник правды). Методы MVP: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `Watch`. Ключевые типы: `DownloadId` (xid, 20-символьная строка), `DownloadSpec` (URL, путь, воркеры, заголовки), `DownloadState` (`QUEUED` / `RUNNING` / `PAUSED` / `DONE` / `FAILED` / `RETRYING`), `Progress` (байты, скорость, ETA), `Download` (полный снимок), `Event` (snapshot / progress_tick / log_line).
+Все типы и методы — в `proto/brook/v1/brook.proto` (единый источник правды). Методы MVP: `List`, `Add`, `Remove`, `Pause`, `Resume`, `Cancel`, `PauseAll`, `ResumeAll`, `WatchFile`, `WatchProgress`. Ключевые типы: `FileId` (UUID), `FileSpec` (URL, путь, имя), `FileStatus` (`PENDING` / `RUNNING` / `PAUSED` / `RETRYING` / `DONE` / `FAILED` / `CANCELLED`), `File` (полный снимок лайфсайкла без прогресса), `FileEvent` (oneof: `snapshot`, `status_changed`, `completed`, `failed`), `ProgressTick` (ratio, байты, скорость, ETA).
 
 ## Семантика команд
 
-- **`Pause`** — `RUNNING` → `PAUSED`. Inflight-куски доводятся до batch-границы, дальше воркеры останавливаются. `.data.brook` и piece-строки загрузки в `brook.db` сохраняются.
+- **`Pause`** — `RUNNING` → `PAUSED`. Inflight-куски доводятся до batch-границы, дальше воркеры останавливаются. `.data.brook` и piece-строки файла в `brook.db` сохраняются.
 - **`Resume`** — `PAUSED` / `FAILED` → `RUNNING`. Для `FAILED` сбрасывается счётчик попыток, читаются piece-строки из `brook.db`, докачиваются `pending`.
-- **`Cancel`** — из любого live-состояния (`QUEUED` / `RUNNING` / `PAUSED` / `RETRYING` / `FAILED`): статус → `CANCELLED`, `.data.brook` и piece-строки загрузки в `brook.db` удаляются, **запись в `files` остаётся**. Это нужно, чтобы пользователь видел, что именно он отменил, и не добавил URL повторно по ошибке. На `DONE` — no-op (финальный файл уже у пользователя).
-- **`Remove`** — сначала то же, что `Cancel` (если загрузка live), затем запись удаляется из глобальной очереди. На `DONE` — только удаление записи; финальный файл остаётся у пользователя.
-- **`PauseAll` / `ResumeAll`** — массовое применение к live-загрузкам (`RUNNING` / `QUEUED` / `RETRYING`).
+- **`Cancel`** — из любого live-состояния (`PENDING` / `RUNNING` / `PAUSED` / `RETRYING` / `FAILED`): статус → `CANCELLED`, `.data.brook` и piece-строки файла в `brook.db` удаляются, **запись в `files` остаётся**. Это нужно, чтобы пользователь видел, что именно он отменил, и не добавил URL повторно по ошибке. На `DONE` — no-op (финальный файл уже у пользователя).
+- **`Remove`** — сначала то же, что `Cancel` (если файл live), затем запись удаляется из глобальной очереди. На `DONE` — только удаление записи; финальный файл остаётся у пользователя.
+- **`PauseAll` / `ResumeAll`** — массовое применение к live-файлам (`RUNNING` / `PENDING` / `RETRYING`).
 
-## `Watch`: события и реконсиляция
+## `WatchFile` и `WatchProgress`: события и реконсиляция
 
-`Watch` — server-streaming RPC. Сервер шлёт поток `Event`-ов, клиент держит view-model и применяет события по мере прихода.
+Скачивание разделено на два server-streaming RPC:
 
-### Типы событий (из proto)
+- **`WatchFile`** — лайфсайкл: добавление, смена статуса, завершение, ошибки. Клиент держит view-model и перезаписывает/мутирует запись по `file_id`.
+- **`WatchProgress`** — поток `ProgressTick` для прогрессбаров, скорости, ETA.
 
-- **`snapshot`** (`Download`) — полное состояние загрузки. Источник истины: клиент **перезаписывает** свою запись для `download_id` целиком.
-- **`progress_tick`** (`Progress`) — лёгкая дельта: байты, скорость, ETA. Применяется поверх существующей записи; если записи нет (snapshot ещё не пришёл) — игнорируется.
-- **`log_line`** (`string`) — строка лога для debug-хвоста в карточке (разворот по `Enter`).
+### `WatchFile`
 
-### Когда сервер шлёт что
+`FileEvent` — oneof из четырёх вариантов:
 
-| Событие         | Триггер                                                                                    |
-|-----------------|--------------------------------------------------------------------------------------------|
-| `snapshot`      | Initial-поток при коннекте — по одному на каждую известную загрузку                        |
-| `snapshot`      | Любая смена состояния (`QUEUED` / `RUNNING` / `PAUSED` / `RETRYING` / `DONE` / `FAILED` / `CANCELLED`) |
-| `snapshot`      | `Add` / `Remove` / `Cancel`                                                                |
-| `snapshot`      | Реконсиляция после desync (см. ниже)                                                       |
-| `progress_tick` | Во время `RUNNING` — **не чаще 5 Hz на загрузку**                                          |
-| `log_line`      | Ретраи, ошибки, важные события жизненного цикла                                            |
+- **`snapshot`** (`File`) — полное состояние файла. Источник истины: клиент **перезаписывает** свою запись для `file_id` целиком.
+- **`status_changed`** (`file_id`, `FileStatus`) — сменился статус, без сопутствующих полей.
+- **`completed`** (`file_id`) — скачивание завершено успехом.
+- **`failed`** (`file_id`, `error`) — скачивание упало фатально.
 
-### Троттлинг прогресса
+Когда сервер шлёт что:
 
-- Сервер агрегирует счётчики в движке и эмитит `progress_tick` не чаще **5 раз/сек на загрузку** (окно 200 ms).
-- `snapshot`-события **не троттлятся** — шлются сразу при смене состояния.
+| Событие           | Триггер                                                                                      |
+|-------------------|----------------------------------------------------------------------------------------------|
+| `snapshot`        | Initial-поток при коннекте — по одному на каждый известный файл                              |
+| `snapshot`        | `Add`                                                                                        |
+| `snapshot`        | Реконсиляция после desync (см. ниже)                                                         |
+| `status_changed`  | Любая смена статуса, кроме терминальных `DONE` / `FAILED` (для них — `completed` / `failed`) |
+| `completed`       | Успешное завершение                                                                          |
+| `failed`          | Фатальная ошибка (после исчерпания ретраев)                                                  |
+
+### `WatchProgress`
+
+- Сервер агрегирует счётчики в движке и эмитит `ProgressTick` не чаще **5 раз/сек на файл** (окно 200 ms).
+- `ProgressTick` несёт `file_id`, `progress` (ratio 0..=1), `bytes_done`, `bytes_total`, `speed_bps`, `eta_secs`.
+- Стрим без initial-sync: актуальный `File` живёт в `WatchFile`, а прогресс начинается с первого тика от активных файлов.
 
 ### Backpressure и desync
 
-Между движком и каждым Watch-клиентом — tokio `broadcast::channel` (ring 1024). Под нагрузкой (медленный клиент, сетевая задержка) ring может переполниться: tonic tx на fanout-задаче ждёт транспорт, broadcast-receiver отстаёт.
+Между движком и каждым watch-клиентом — tokio `broadcast::channel` (ring 1024). Под нагрузкой (медленный клиент, сетевая задержка) ring может переполниться: tonic tx на fanout-задаче ждёт транспорт, broadcast-receiver отстаёт.
 
-- **Потеря `progress_tick`-ов** безопасна: прогресс восстановится со следующим тиком.
-- **Потеря `snapshot`-ов** ловится через `broadcast::RecvError::Lagged(n)`. Сервер на этом событии шлёт **синтетическую реконсиляцию**: по одному свежему `snapshot` на каждую активную загрузку. Клиент перезаписывает записи и продолжает.
+- **Потеря `ProgressTick`-ов** безопасна: прогресс перепишется со следующим тиком.
+- **Потеря `FileEvent`-ов** ловится через `broadcast::RecvError::Lagged(n)`. Сервер на этом событии шлёт **синтетическую реконсиляцию**: по одному свежему `snapshot` на каждый активный файл. Клиент перезаписывает записи и продолжает.
 
 ### Контракт клиента
 
-- `snapshot` — overwrite записи для `download_id`.
-- `progress_tick` — дельта поверх существующей записи; без записи — drop.
-- Разрыв стрима — переподключение; сервер снова начинает с initial-набора `snapshot`-ов.
+- `snapshot` — overwrite записи для `file_id`.
+- `status_changed` / `completed` / `failed` — дельта поверх существующей записи; без записи — drop.
+- `ProgressTick` — дельта поверх существующей записи; без записи — drop.
+- Разрыв стрима — переподключение; `WatchFile` снова начинает с initial-набора `snapshot`-ов.
 
 ## Решённое
 - Транспорт: gRPC (`tonic`), формат — protobuf (`prost`).
 - Локальный UI (`brook`, крейт `brook-tui`) — отдельный процесс, ходит в `brookd` только через gRPC. «Короткого пути» в обход API нет даже локально.
-- Server-streaming `Watch` — один стрим на клиента, сервер шлёт релевантные события.
-- CorrelationId (`session_id`, `download_id`) прокидывается в gRPC-метаданных.
+- Два server-streaming RPC (`WatchFile` + `WatchProgress`) — сервер шлёт релевантные события в каждый поток независимо.
+- CorrelationId (`session_id`, `file_id`) прокидывается в gRPC-метаданных.
 - Settings — не в API в MVP; правятся через SQL в `brook.db` и подхватываются при следующем старте `brookd`.
 - Порт по умолчанию — `7090`.
 - В MVP — все методы из схемы выше (включая `PauseAll`/`ResumeAll`).

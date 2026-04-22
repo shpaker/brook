@@ -9,8 +9,9 @@
 //! Часть параметров — **global-only** (порт gRPC, лимит параллельности,
 //! bind-адрес, логи): на каждую загрузку они одинаковы. Часть —
 //! **per-download defaults**: YAML задаёт дефолт, но клиент через
-//! `DownloadSpec` может прислать override (число воркеров, параметры
-//! нарезки, целевой каталог).
+//! `FileSpec` может прислать override (параметры нарезки, целевой
+//! каталог). Число воркеров настройкой не управляется — ядро считает его
+//! по размеру файла (см. `brook_core::compute_workers`).
 //!
 //! Разделение видно в типах: [`DaemonRuntime`] содержит global-only,
 //! [`DownloadDefaults`] — overridable. Так границу сложнее случайно
@@ -44,15 +45,11 @@ pub const DEFAULT_CONFIG_FILENAME: &str = "brook.yaml";
 const DEFAULT_YAML: &str = "\
 # Конфигурация brookd. Перезапустите демон после правок.
 download:
-  # Воркеров на загрузку по умолчанию (перекрывается DownloadSpec.workers).
-  default_workers: 4
-  # Потолок воркеров на одну загрузку — защита от DoS самого себя.
-  max_workers: 16
   # Сколько загрузок одновременно активны; остальные ждут в очереди.
   max_concurrent: 3
-  # Дефолтный каталог назначения (перекрывается DownloadSpec.target_dir).
+  # Дефолтный каталог назначения (перекрывается FileSpec.target_dir).
   default_dir: ~/Downloads
-  # Целевое число piece'ов на файл (перекрывается в DownloadSpec).
+  # Целевое число piece'ов на файл (перекрывается в FileSpec).
   piece_target_count: 128
   # Нижняя граница размера piece'а, MiB (степень двойки).
   piece_size_min_mib: 16
@@ -60,8 +57,9 @@ download:
   piece_size_max_mib: 128
   # Политика при добавлении URL, уже стоящего в очереди.
   on_duplicate_url: ask  # ask | skip | add
-  # Политика при существующем файле с тем же именем в target_dir.
-  on_file_exists: ask    # ask | rename | overwrite
+  # Политики при существующем файле с тем же именем в target_dir нет:
+  # демон всегда возвращает AlreadyExists, а клиент (TUI) сам подбирает
+  # `<stem> (N).<ext>` и ретраит Add.
 api:
   port: 7090
   bind: 127.0.0.1
@@ -89,10 +87,6 @@ pub struct Settings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DownloadSection {
-    #[serde(default = "d_default_workers")]
-    pub default_workers: u32,
-    #[serde(default = "d_max_workers")]
-    pub max_workers: u32,
     #[serde(default = "d_max_concurrent")]
     pub max_concurrent: u32,
     #[serde(default = "d_default_dir")]
@@ -105,22 +99,17 @@ pub struct DownloadSection {
     pub piece_size_max_mib: u32,
     #[serde(default)]
     pub on_duplicate_url: OnDuplicateUrl,
-    #[serde(default)]
-    pub on_file_exists: OnFileExists,
 }
 
 impl Default for DownloadSection {
     fn default() -> Self {
         Self {
-            default_workers: d_default_workers(),
-            max_workers: d_max_workers(),
             max_concurrent: d_max_concurrent(),
             default_dir: d_default_dir(),
             piece_target_count: d_piece_target_count(),
             piece_size_min_mib: d_piece_size_min_mib(),
             piece_size_max_mib: d_piece_size_max_mib(),
             on_duplicate_url: OnDuplicateUrl::default(),
-            on_file_exists: OnFileExists::default(),
         }
     }
 }
@@ -173,25 +162,10 @@ pub enum OnDuplicateUrl {
     Add,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum OnFileExists {
-    #[default]
-    Ask,
-    Rename,
-    Overwrite,
-}
-
 // ─── Дефолты ────────────────────────────────────────────────────────────
 
 // `serde(default = "...")` требует функций без аргументов, поэтому
 // константы живут внутри функций-геттеров, а не `const`.
-fn d_default_workers() -> u32 {
-    4
-}
-fn d_max_workers() -> u32 {
-    16
-}
 fn d_max_concurrent() -> u32 {
     3
 }
@@ -284,27 +258,6 @@ impl Settings {
     /// Семантические инварианты, которые не ловятся serde-парсером.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let d = &self.download;
-        if d.max_workers == 0 {
-            return Err(ConfigError::Invalid {
-                key: "download.max_workers",
-                reason: "must be ≥ 1".into(),
-            });
-        }
-        if d.default_workers == 0 {
-            return Err(ConfigError::Invalid {
-                key: "download.default_workers",
-                reason: "must be ≥ 1".into(),
-            });
-        }
-        if d.default_workers > d.max_workers {
-            return Err(ConfigError::Invalid {
-                key: "download.default_workers",
-                reason: format!(
-                    "must be ≤ download.max_workers ({} > {})",
-                    d.default_workers, d.max_workers
-                ),
-            });
-        }
         if d.max_concurrent == 0 {
             return Err(ConfigError::Invalid {
                 key: "download.max_concurrent",
@@ -354,16 +307,14 @@ fn is_power_of_two_u32(n: u32) -> bool {
 
 // ─── Проекции в рантайм-конфиг ──────────────────────────────────────────
 
-/// Global-only конфигурация — всё, что не переопределяется в `DownloadSpec`.
+/// Global-only конфигурация — всё, что не переопределяется в `FileSpec`.
 #[derive(Debug, Clone)]
 pub struct DaemonRuntime {
     pub max_concurrent: usize,
     pub api_bind: IpAddr,
     pub api_port: u16,
     pub default_dir: PathBuf,
-    pub max_workers: u32,
     pub on_duplicate_url: OnDuplicateUrl,
-    pub on_file_exists: OnFileExists,
     pub log: LogRuntime,
     pub defaults: DownloadDefaults,
 }
@@ -378,7 +329,6 @@ pub struct LogRuntime {
 /// Per-download-overridable defaults. Все размеры уже в байтах.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadDefaults {
-    pub workers: u32,
     pub piece_target_count: u32,
     pub piece_size_min: u64,
     pub piece_size_max: u64,
@@ -397,16 +347,13 @@ impl DaemonRuntime {
             api_bind,
             api_port: s.api.port,
             default_dir: expand_home(&d.default_dir, "download.default_dir")?,
-            max_workers: d.max_workers,
             on_duplicate_url: d.on_duplicate_url,
-            on_file_exists: d.on_file_exists,
             log: LogRuntime {
                 dir: expand_home(&s.log.dir, "log.dir")?,
                 rotate_count: s.log.rotate_count,
                 rotate_size_mb: s.log.rotate_size_mb,
             },
             defaults: DownloadDefaults {
-                workers: d.default_workers,
                 piece_target_count: d.piece_target_count,
                 piece_size_min: (d.piece_size_min_mib as u64) * 1024 * 1024,
                 piece_size_max: (d.piece_size_max_mib as u64) * 1024 * 1024,
@@ -507,16 +454,6 @@ mod tests {
     }
 
     #[test]
-    fn default_workers_above_cap_is_caught() {
-        let mut s = Settings::default();
-        s.download.default_workers = 100;
-        let err = s.validate().unwrap_err();
-        assert!(
-            matches!(err, ConfigError::Invalid { key, .. } if key == "download.default_workers")
-        );
-    }
-
-    #[test]
     fn port_zero_is_allowed_for_ephemeral_bind() {
         let mut s = Settings::default();
         s.api.port = 0;
@@ -570,7 +507,6 @@ mod tests {
         );
         assert_eq!(rt.defaults.piece_size_min, 16 * 1024 * 1024);
         assert_eq!(rt.defaults.piece_size_max, 128 * 1024 * 1024);
-        assert_eq!(rt.defaults.workers, 4);
     }
 
     #[test]

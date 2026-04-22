@@ -28,14 +28,41 @@ pub struct WorkerSegment {
     pub fraction: f32,
 }
 
+/// Снимок прогресса для одной загрузки. Обновляется `WatchProgress`-тиком;
+/// не живёт в `proto::File` (лайфсайкл и прогресс — разные стримы).
+#[derive(Debug, Clone, Default)]
+pub struct ProgressSnapshot {
+    /// Отношение 0..=1; UI рисует шкалу по `bytes_done / bytes_total`,
+    /// но сервер уже считает clamped ratio — держим для диагностики и
+    /// будущего использования в detail-панели.
+    #[allow(dead_code)]
+    pub progress: f64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub speed_bps: f64,
+    pub eta_secs: Option<u64>,
+}
+
+impl ProgressSnapshot {
+    pub fn from_tick(t: &proto::ProgressTick) -> Self {
+        Self {
+            progress: t.progress,
+            bytes_done: t.bytes_done,
+            bytes_total: t.bytes_total,
+            speed_bps: t.speed_bps,
+            eta_secs: t.eta_secs,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadRow {
     pub id: String,
     pub url: String,
     pub target_dir: String,
     pub filename: String,
-    pub status: proto::DownloadStatus,
-    pub progress: proto::Progress,
+    pub status: proto::FileStatus,
+    pub progress: ProgressSnapshot,
     pub attempt: u32,
     pub max_attempts: u32,
     pub error: Option<String>,
@@ -48,7 +75,7 @@ pub struct DownloadRow {
 }
 
 impl DownloadRow {
-    pub fn from_snapshot(d: &proto::Download) -> Self {
+    pub fn from_snapshot(d: &proto::File) -> Self {
         let spec = d.spec.clone().unwrap_or_default();
         let filename = spec.filename.clone().unwrap_or_default();
         Self {
@@ -56,9 +83,8 @@ impl DownloadRow {
             url: spec.url,
             target_dir: spec.target_dir,
             filename,
-            status: proto::DownloadStatus::try_from(d.status)
-                .unwrap_or(proto::DownloadStatus::Unspecified),
-            progress: d.progress.unwrap_or_default(),
+            status: proto::FileStatus::try_from(d.status).unwrap_or(proto::FileStatus::Unspecified),
+            progress: ProgressSnapshot::default(),
             attempt: d.attempt,
             max_attempts: 0, // brook-proto не передаёт max; подтянем при бэкенд-расширении
             error: d.error.clone(),
@@ -104,9 +130,6 @@ pub enum Mode {
     Duplicate {
         form: AddForm,
         existing_id: String,
-    },
-    FileExists {
-        form: AddForm,
     },
     ConfirmDelete {
         ids: Vec<String>,
@@ -194,13 +217,10 @@ pub struct ViewModel {
     pub port: u16,
     pub settings: proto::GetSettingsResponse,
     pub mode: Mode,
-    /// Поднимали ли мы `brookd` в этом процессе. Если да — при выходе
-    /// спрашиваем, гасить ли его.
-    pub spawned_daemon: bool,
 }
 
 impl ViewModel {
-    pub fn new(port: u16, settings: proto::GetSettingsResponse, spawned_daemon: bool) -> Self {
+    pub fn new(port: u16, settings: proto::GetSettingsResponse) -> Self {
         Self {
             downloads: IndexMap::new(),
             cursor: 0,
@@ -211,7 +231,6 @@ impl ViewModel {
             port,
             settings,
             mode: Mode::Normal,
-            spawned_daemon,
         }
     }
 
@@ -227,41 +246,28 @@ impl ViewModel {
                 let row = DownloadRow::from_snapshot(&d);
                 self.downloads.insert(row.id.clone(), row);
             }
-            E::Progress(id, p) => {
-                if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.progress = p;
+            E::Progress(tick) => {
+                if let Some(id) = tick.file_id.as_ref()
+                    && let Some(row) = self.downloads.get_mut(&id.value)
+                {
+                    row.progress = ProgressSnapshot::from_tick(&tick);
                 }
             }
             E::StatusChanged(id, st) => {
                 if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status = proto::DownloadStatus::try_from(st)
-                        .unwrap_or(proto::DownloadStatus::Unspecified);
-                }
-            }
-            E::WorkerUpdate(id, piece, frac) => {
-                if let Some(row) = self.downloads.get_mut(&id.value) {
-                    if frac >= 1.0 {
-                        row.workers.remove(&piece);
-                    } else {
-                        row.workers.insert(
-                            piece,
-                            WorkerSegment {
-                                piece_index: piece,
-                                fraction: frac,
-                            },
-                        );
-                    }
+                    row.status =
+                        proto::FileStatus::try_from(st).unwrap_or(proto::FileStatus::Unspecified);
                 }
             }
             E::Completed(id) => {
                 if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status = proto::DownloadStatus::Done;
+                    row.status = proto::FileStatus::Done;
                     row.workers.clear();
                 }
             }
             E::Failed(id, err) => {
                 if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status = proto::DownloadStatus::Failed;
+                    row.status = proto::FileStatus::Failed;
                     row.error = Some(err);
                     row.workers.clear();
                 }
@@ -285,7 +291,7 @@ impl ViewModel {
         let mut ids: Vec<&DownloadRow> = self
             .downloads
             .values()
-            .filter(|r| r.status != proto::DownloadStatus::Cancelled)
+            .filter(|r| r.status != proto::FileStatus::Cancelled)
             .collect();
         ids.sort_by(|a, b| {
             state_rank(a.status)
@@ -339,7 +345,7 @@ impl ViewModel {
     pub fn find_by_url(&self, url: &str) -> Option<String> {
         self.downloads
             .values()
-            .find(|r| r.url == url && r.status != proto::DownloadStatus::Cancelled)
+            .find(|r| r.url == url && r.status != proto::FileStatus::Cancelled)
             .map(|r| r.id.clone())
     }
 
@@ -380,8 +386,8 @@ impl ViewModel {
 
 /// Порядок групп по §6.2: RUNNING → RETRYING → QUEUED → PAUSED → DONE → FAILED.
 /// CANCELLED отфильтрован выше и здесь не появляется.
-fn state_rank(s: proto::DownloadStatus) -> u8 {
-    use proto::DownloadStatus as S;
+fn state_rank(s: proto::FileStatus) -> u8 {
+    use proto::FileStatus as S;
     match s {
         S::Running => 0,
         S::Retrying => 1,

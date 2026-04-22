@@ -18,8 +18,8 @@ use std::time::{
 };
 
 use brook_core::{
-    DownloadId,
     Error,
+    FileId,
     Result as CoreResult,
     TWorkerRepo,
     WorkerId,
@@ -49,7 +49,7 @@ impl SqliteWorkerRepository {
 impl TWorkerRepo for SqliteWorkerRepository {
     fn ensure_slots(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
         n: usize,
     ) -> impl std::future::Future<Output = CoreResult<Vec<WorkerRecord>>> + Send {
         let db = self.db.clone();
@@ -107,7 +107,7 @@ impl TWorkerRepo for SqliteWorkerRepository {
 
     fn pause_all_running_for_file(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
     ) -> impl std::future::Future<Output = CoreResult<()>> + Send {
         let db = self.db.clone();
         async move {
@@ -147,7 +147,7 @@ where
 
 fn ensure_slots_impl(
     conn: &mut Connection,
-    file_id: DownloadId,
+    file_id: FileId,
     n: usize,
 ) -> CoreResult<Vec<WorkerRecord>> {
     let now = unix_secs(SystemTime::now());
@@ -211,7 +211,7 @@ fn update_status_impl(
     Ok(())
 }
 
-fn pause_running_impl(conn: &mut Connection, file_id: Option<DownloadId>) -> CoreResult<()> {
+fn pause_running_impl(conn: &mut Connection, file_id: Option<FileId>) -> CoreResult<()> {
     let now = unix_secs(SystemTime::now());
     match file_id {
         Some(id) => {
@@ -249,9 +249,9 @@ mod tests {
     use std::path::PathBuf;
 
     use brook_core::{
-        Download,
-        DownloadId,
-        DownloadSpec,
+        File,
+        FileId,
+        FileSpec,
         TQueueStore,
         TWorkerRepo,
     };
@@ -259,21 +259,16 @@ mod tests {
     use super::*;
     use crate::storage::files::SqliteFileRepository;
 
-    fn sample_download() -> Download {
-        let spec = DownloadSpec {
+    fn sample_download() -> File {
+        let spec = FileSpec {
             url: "https://example.com/file.bin".into(),
             target_dir: PathBuf::from("/tmp/brook"),
             filename: Some("file.bin".into()),
-            workers: 2,
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: Default::default(),
         };
-        Download::new(DownloadId::new(), spec)
+        File::new(FileId::new(), spec)
     }
 
-    async fn fresh() -> (SharedDb, SqliteWorkerRepository, DownloadId) {
+    async fn fresh() -> (SharedDb, SqliteWorkerRepository, FileId) {
         let db = SharedDb::open_in_memory().unwrap();
         let files = SqliteFileRepository::new(db.clone());
         let d = sample_download();

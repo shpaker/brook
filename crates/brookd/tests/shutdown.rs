@@ -2,7 +2,7 @@
 //!
 //! Поднимает реальный `brookd` (в tempdir, с ephemeral-портом и
 //! wiremock-бэкендом), добавляет загрузку, гасит демона через `oneshot` и
-//! проверяет, что после рестарта очередь видит тот же `DownloadId` и
+//! проверяет, что после рестарта очередь видит тот же `FileId` и
 //! нормализованное состояние `Queued`.
 //!
 //! Подменять сигналы на `oneshot` — единственный способ гонять такой тест
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brook_core::{
-    Download,
+    File,
     FileStatus,
     TQueueStore,
 };
@@ -41,12 +41,10 @@ use wiremock::{
 };
 
 /// Пишем минимальный `brook.yaml` с `api.port = 0` и default_dir в
-/// tempdir'е. `on_duplicate_url`/`on_file_exists` остаются дефолтом.
+/// tempdir'е. `on_duplicate_url` остаётся дефолтом.
 fn write_config(dir: &Path, default_dir: &Path) {
     let yaml = format!(
         "download:\n  \
-           default_workers: 1\n  \
-           max_workers: 4\n  \
            max_concurrent: 2\n  \
            default_dir: {}\n  \
            piece_target_count: 1\n  \
@@ -150,12 +148,10 @@ async fn shutdown_persists_and_restart_resumes() {
     let mut client = connect(addr).await;
     let id = client
         .add(proto::AddRequest {
-            spec: Some(proto::DownloadSpec {
+            spec: Some(proto::FileSpec {
                 url: url.clone(),
                 target_dir: downloads.path().to_string_lossy().into(),
                 filename: Some("f.bin".into()),
-                workers: 1,
-                ..Default::default()
             }),
         })
         .await
@@ -176,7 +172,7 @@ async fn shutdown_persists_and_restart_resumes() {
     {
         let db = SharedDb::open(&paths.db).expect("reopen brook.db");
         let queue = Arc::new(SqliteFileRepository::new(db.clone()));
-        let all: Vec<Download> = queue.load_all().await.expect("load_all");
+        let all: Vec<File> = queue.load_all().await.expect("load_all");
         assert_eq!(all.len(), 1, "queue must contain one entry");
         assert_eq!(all[0].id.to_string(), id.value);
         // После второго `bootstrap` Running/Retrying нормализуется, но

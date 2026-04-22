@@ -1,75 +1,73 @@
-//! События от движка к подписчикам (gRPC `Watch` стрим, TUI).
+//! События от движка к подписчикам (gRPC-стримы `WatchFile`/`WatchProgress`, TUI).
 //!
-//! Паттерн: **sum type с полезной нагрузкой у каждого варианта**.
-//! Вызывающий делает `match` и компилятор гарантирует, что ни один
-//! вариант не забыт.
+//! События логически делятся на два потока:
+//! - **lifecycle** (`FileLifecycleEvent`) — смена статусов, завершение,
+//!   падения, полные снапшоты. Это то, что рендерит стрим `WatchFile`.
+//! - **progress** (`ProgressEvent`) — высокочастотные тики прогресса.
+//!   Едут по стриму `WatchProgress`.
 
-use super::download::Download;
-use super::id::DownloadId;
+use super::file::File;
+use super::id::FileId;
 use super::progress::Progress;
 use super::status::FileStatus;
 
+/// События жизненного цикла файла. Вызывающий делает `match` и компилятор
+/// гарантирует, что ни один вариант не забыт.
 #[derive(Debug, Clone)]
-pub enum DownloadEvent {
-    /// Тик прогресса (троттлится со стороны движка).
-    Progress { id: DownloadId, progress: Progress },
-
+pub enum FileLifecycleEvent {
     /// Смена статуса (`Pending → Running`, `Running → Paused`, …).
-    StatusChanged { id: DownloadId, status: FileStatus },
+    StatusChanged { id: FileId, status: FileStatus },
 
-    /// Частичное обновление по одному piece'у — для чанкового прогрессбара.
-    WorkerUpdate {
-        id: DownloadId,
-        piece_index: u32,
-        /// Доля скачанного в этом piece'е, `0.0..=1.0`.
-        fraction: f32,
-    },
+    /// Файл успешно скачан.
+    Completed { id: FileId },
 
-    /// Загрузка успешно завершена.
-    Completed { id: DownloadId },
+    /// Файл упал окончательно.
+    Failed { id: FileId, error: String },
 
-    /// Загрузка упала окончательно.
-    Failed { id: DownloadId, error: String },
-
-    /// Полный снимок — например, при подключении нового клиента к `Watch`.
+    /// Полный снимок — например, при подключении нового клиента к `WatchFile`.
     ///
-    /// `Box<Download>` (а не просто `Download`): `Download` — самая крупная
-    /// по размеру структура из всех вариантов enum'а. Без `Box` enum бы
-    /// «раздулся» до её размера на стеке даже для мелких вариантов вроде
-    /// `Completed`. Индирекция через `Box` держит enum компактным.
-    Snapshot { download: Box<Download> },
+    /// `Box<File>` (а не просто `File`): `File` — самая крупная по размеру
+    /// структура из всех вариантов enum'а. Без `Box` enum бы «раздулся» до
+    /// её размера на стеке даже для мелких вариантов вроде `Completed`.
+    /// Индирекция через `Box` держит enum компактным.
+    Snapshot { file: Box<File> },
+}
+
+/// Тик прогресса. Отдельный enum (а не вариант `FileLifecycleEvent`) —
+/// чтобы lifecycle-стрим не смешивался с высокочастотным прогрессом.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    Tick { id: FileId, progress: Progress },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::spec::DownloadSpec;
+    use super::super::spec::FileSpec;
     use super::*;
 
     #[test]
     fn match_exhaustive_compiles() {
-        let id = DownloadId::new();
-        let ev = DownloadEvent::Completed { id };
+        let id = FileId::new();
+        let ev = FileLifecycleEvent::Completed { id };
         let _text: &'static str = match ev {
-            DownloadEvent::Progress { .. } => "progress",
-            DownloadEvent::StatusChanged { .. } => "status",
-            DownloadEvent::WorkerUpdate { .. } => "worker",
-            DownloadEvent::Completed { .. } => "done",
-            DownloadEvent::Failed { .. } => "failed",
-            DownloadEvent::Snapshot { .. } => "snapshot",
+            FileLifecycleEvent::StatusChanged { .. } => "status",
+            FileLifecycleEvent::Completed { .. } => "done",
+            FileLifecycleEvent::Failed { .. } => "failed",
+            FileLifecycleEvent::Snapshot { .. } => "snapshot",
         };
     }
 
     #[test]
-    fn snapshot_carries_full_download() {
-        let d = Download::new(
-            DownloadId::new(),
-            DownloadSpec::new("https://example.com/f", "/tmp"),
+    fn snapshot_carries_full_file() {
+        let d = File::new(
+            FileId::new(),
+            FileSpec::new("https://example.com/f", "/tmp"),
         );
-        let ev = DownloadEvent::Snapshot {
-            download: Box::new(d.clone()),
+        let ev = FileLifecycleEvent::Snapshot {
+            file: Box::new(d.clone()),
         };
-        if let DownloadEvent::Snapshot { download } = ev {
-            assert_eq!(download.id, d.id);
+        if let FileLifecycleEvent::Snapshot { file } = ev {
+            assert_eq!(file.id, d.id);
         } else {
             panic!("expected Snapshot");
         }

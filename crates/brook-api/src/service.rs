@@ -18,7 +18,6 @@ use brook_core::{
     TWorkerRepo,
 };
 use brook_proto::brook::v1 as proto;
-use brook_proto::brook::v1::Event as ProtoEvent;
 use brook_proto::brook::v1::brook_service_server::BrookService as BrookServiceTrait;
 use futures_core::Stream;
 use tokio::sync::broadcast;
@@ -62,28 +61,22 @@ where
 #[derive(Debug, Clone)]
 pub struct ApiSettings {
     pub default_dir: String,
-    pub default_workers: u32,
-    pub max_workers: u32,
     pub max_concurrent: u32,
     pub piece_target_count: u32,
     pub piece_size_min: u64,
     pub piece_size_max: u64,
     pub on_duplicate_url: proto::OnDuplicateUrlPolicy,
-    pub on_file_exists: proto::OnFileExistsPolicy,
 }
 
 impl Default for ApiSettings {
     fn default() -> Self {
         Self {
             default_dir: String::new(),
-            default_workers: 4,
-            max_workers: 16,
             max_concurrent: 3,
             piece_target_count: 128,
             piece_size_min: 16 * 1024 * 1024,
             piece_size_max: 128 * 1024 * 1024,
             on_duplicate_url: proto::OnDuplicateUrlPolicy::Ask,
-            on_file_exists: proto::OnFileExistsPolicy::Ask,
         }
     }
 }
@@ -131,13 +124,13 @@ where
         &self,
         _req: Request<proto::ListRequest>,
     ) -> Result<Response<proto::ListResponse>, Status> {
-        let downloads = self
+        let files = self
             .manager
             .snapshot()
             .iter()
-            .map(mapper::download_to_proto)
+            .map(mapper::file_to_proto)
             .collect();
-        Ok(Response::new(proto::ListResponse { downloads }))
+        Ok(Response::new(proto::ListResponse { files }))
     }
 
     async fn add(
@@ -236,14 +229,11 @@ where
         let s = &self.settings;
         Ok(Response::new(proto::GetSettingsResponse {
             default_dir: s.default_dir.clone(),
-            default_workers: s.default_workers,
-            max_workers: s.max_workers,
             max_concurrent: s.max_concurrent,
             piece_target_count: s.piece_target_count,
             piece_size_min: s.piece_size_min,
             piece_size_max: s.piece_size_max,
             on_duplicate_url: s.on_duplicate_url as i32,
-            on_file_exists: s.on_file_exists as i32,
         }))
     }
 
@@ -257,17 +247,17 @@ where
         Ok(ok_status())
     }
 
-    type WatchStream = Pin<Box<dyn Stream<Item = Result<ProtoEvent, Status>> + Send>>;
+    type WatchFileStream = Pin<Box<dyn Stream<Item = Result<proto::FileEvent, Status>> + Send>>;
 
-    async fn watch(
+    async fn watch_file(
         &self,
-        _req: Request<proto::WatchRequest>,
-    ) -> Result<Response<Self::WatchStream>, Status> {
+        _req: Request<proto::WatchFileRequest>,
+    ) -> Result<Response<Self::WatchFileStream>, Status> {
         // Важно: сначала подписываемся, потом снимаем initial-snapshot.
         // Обратный порядок мог бы потерять событие, прилетевшее между
         // snapshot'ом и subscribe: сам broadcast не буферизует события
         // до создания ресивера.
-        let rx = self.manager.subscribe();
+        let rx = self.manager.subscribe_lifecycle();
         let initial = self.manager.snapshot();
         let manager = Arc::clone(&self.manager);
 
@@ -283,12 +273,12 @@ where
             while let Some(item) = broadcast.next().await {
                 match item {
                     Ok(ev) => {
-                        yield mapper::event_to_proto(&ev);
+                        yield mapper::lifecycle_event_to_proto(&ev);
                     }
                     Err(BroadcastStreamRecvError::Lagged(n)) => {
-                        warn!(lagged = n, "watch stream lagged; reconciling");
+                        warn!(lagged = n, "watch_file stream lagged; reconciling");
                         // Реконсиляция: шлём свежий snapshot по активным
-                        // загрузкам — терминальные клиент и так не обновляет.
+                        // файлам — терминальные клиент и так не обновляет.
                         for d in manager
                             .snapshot()
                             .iter()
@@ -296,6 +286,38 @@ where
                         {
                             yield mapper::snapshot_event(d);
                         }
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    type WatchProgressStream =
+        Pin<Box<dyn Stream<Item = Result<proto::ProgressTick, Status>> + Send>>;
+
+    async fn watch_progress(
+        &self,
+        _req: Request<proto::WatchProgressRequest>,
+    ) -> Result<Response<Self::WatchProgressStream>, Status> {
+        // Progress — чисто поток тиков, без initial-sync: свежий snapshot
+        // лежит в WatchFile (`SnapshotEvent`), клиент показывает пустой
+        // прогресс до первого тика от активных загрузок.
+        let rx = self.manager.subscribe_progress();
+
+        let stream = async_stream::try_stream! {
+            let mut broadcast = BroadcastStream::new(rx);
+            use tokio_stream::StreamExt;
+            while let Some(item) = broadcast.next().await {
+                match item {
+                    Ok(ev) => {
+                        yield mapper::progress_event_to_proto(&ev);
+                    }
+                    Err(BroadcastStreamRecvError::Lagged(n)) => {
+                        // Прогресс — лоссовый по природе: пропущенные
+                        // тики просто потеряны, следующий перепишет UI.
+                        warn!(lagged = n, "watch_progress stream lagged");
                     }
                 }
             }

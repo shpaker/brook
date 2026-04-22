@@ -1,18 +1,11 @@
-//! Кастомный прогресс-бар с сегментами воркеров (§6.3).
+//! Прогресс-бар как фоновая заливка строки с именем файла (§6.3).
 //!
-//! Зоны слева направо:
-//!
-//! 1. **Done** — `█`, accent-цвет.
-//! 2. **Активные куски** — по одному сегменту на воркера, ширина
-//!    `piece_size / total × bar_width`. Цвет из циклической палитры по
-//!    `worker_id % N`. Под `NO_COLOR` все активные — `▓`, без цвета.
-//! 3. **Pending** — `░`.
-//!
-//! No-Range fallback (`pieces_total = 1`) — бар = done + один активный
-//! сегмент, pending-дырок нет (сама модель в этом случае не хранит
-//! больше одного worker-сегмента).
+//! Бар не рисует собственные символы — только красит `bg` ячеек поверх
+//! уже отрисованного текста. Done-зона получает акцентный фон, pending —
+//! приглушённый. Таким образом имя файла, префикс и правая колонка
+//! остаются читаемыми, а заполнение прогресса виден как «подсветка»
+//! строки слева направо.
 
-use brook_proto::brook::v1::Progress;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{
@@ -21,28 +14,22 @@ use ratatui::style::{
 };
 use ratatui::widgets::Widget;
 
-use crate::model::WorkerSegment;
-
-/// Палитра цветов активных сегментов — 6 штук, выбираем по
-/// `worker_id % 6`. Подобраны так, чтобы на тёмной теме все читались.
-const WORKER_PALETTE: [Color; 6] = [
-    Color::Cyan,
-    Color::Magenta,
-    Color::Yellow,
-    Color::Blue,
-    Color::Green,
-    Color::LightRed,
-];
+use crate::model::{
+    ProgressSnapshot,
+    WorkerSegment,
+};
 
 pub struct ProgressBar<'a> {
-    pub progress: &'a Progress,
+    pub progress: &'a ProgressSnapshot,
     pub workers: &'a [WorkerSegment],
     pub no_color: bool,
 }
 
 impl<'a> Widget for ProgressBar<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
+        if area.width == 0 || area.height == 0 || self.no_color {
+            // В no-color режиме бар-фон невидим; оставляем строку без заливки.
+            let _ = self.workers;
             return;
         }
         let width = area.width as usize;
@@ -68,57 +55,20 @@ impl<'a> Widget for ProgressBar<'a> {
         let done_cells = (done * width as f64).round() as usize;
         let done_cells = done_cells.min(width);
 
-        // Заполняем pending по всей длине, потом затираем done + активные.
+        // Приглушённый фон для pending (чуть темнее фона терминала —
+        // визуально бар «дышит», не перебивая текст).
+        let pending_bg = Color::Rgb(0x22, 0x22, 0x22);
+        // Тёмно-зелёный для done — контрастный, но не режет глаз.
+        let done_bg = Color::Rgb(0x1e, 0x4d, 0x1e);
+
         for x in 0..width {
             let cell = buf
                 .cell_mut((area.x + x as u16, area.y))
                 .expect("cell in area");
-            cell.set_char('░');
-            if !self.no_color {
-                cell.set_style(Style::default().fg(Color::DarkGray));
-            }
+            let bg = if x < done_cells { done_bg } else { pending_bg };
+            cell.set_bg(bg);
         }
 
-        let done_color = if self.no_color {
-            Style::default()
-        } else {
-            Style::default().fg(Color::Green)
-        };
-        for x in 0..done_cells {
-            let cell = buf
-                .cell_mut((area.x + x as u16, area.y))
-                .expect("cell in done zone");
-            cell.set_char('█');
-            cell.set_style(done_color);
-        }
-
-        if self.progress.pieces_total == 0 {
-            return;
-        }
-        let piece_size = total / self.progress.pieces_total as f64;
-        for seg in self.workers {
-            let piece_start = (seg.piece_index as f64 * piece_size) / total;
-            let piece_end = ((seg.piece_index as f64 + 1.0) * piece_size) / total;
-            let start_cell = (piece_start * width as f64).floor() as usize;
-            let end_cell = (piece_end * width as f64).ceil() as usize;
-            let start_cell = start_cell.max(done_cells);
-            let end_cell = end_cell.min(width);
-            if start_cell >= end_cell {
-                continue;
-            }
-            let (glyph, style) = if self.no_color {
-                ('▓', Style::default())
-            } else {
-                let color = WORKER_PALETTE[(seg.piece_index as usize) % WORKER_PALETTE.len()];
-                ('█', Style::default().fg(color))
-            };
-            for x in start_cell..end_cell {
-                let cell = buf
-                    .cell_mut((area.x + x as u16, area.y))
-                    .expect("cell in worker segment");
-                cell.set_char(glyph);
-                cell.set_style(style);
-            }
-        }
+        let _ = self.workers;
     }
 }

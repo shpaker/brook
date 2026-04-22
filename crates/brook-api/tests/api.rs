@@ -11,20 +11,19 @@ use std::time::Duration;
 use brook_proto::brook::v1 as proto;
 use common::HarnessBuilder;
 
-fn spec(url: &str) -> proto::DownloadSpec {
-    proto::DownloadSpec {
+fn spec(url: &str) -> proto::FileSpec {
+    proto::FileSpec {
         url: url.into(),
         target_dir: "/tmp".into(),
-        workers: 2,
         ..Default::default()
     }
 }
 
 async fn wait_until_terminal(
     h: &common::TestHarness,
-    id: &proto::DownloadId,
+    id: &proto::FileId,
     timeout: Duration,
-) -> proto::DownloadStatus {
+) -> proto::FileStatus {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let list = h
@@ -35,16 +34,14 @@ async fn wait_until_terminal(
             .unwrap()
             .into_inner();
         if let Some(d) = list
-            .downloads
+            .files
             .iter()
             .find(|d| d.id.as_ref().map(|x| x.value == id.value).unwrap_or(false))
         {
-            let state = proto::DownloadStatus::try_from(d.status).unwrap();
+            let state = proto::FileStatus::try_from(d.status).unwrap();
             if matches!(
                 state,
-                proto::DownloadStatus::Done
-                    | proto::DownloadStatus::Failed
-                    | proto::DownloadStatus::Cancelled
+                proto::FileStatus::Done | proto::FileStatus::Failed | proto::FileStatus::Cancelled
             ) {
                 return state;
             }
@@ -67,7 +64,7 @@ async fn add_list_cancel_remove_roundtrip() {
         .await
         .unwrap()
         .into_inner();
-    assert!(list.downloads.is_empty());
+    assert!(list.files.is_empty());
 
     // Add.
     let resp = h
@@ -87,11 +84,8 @@ async fn add_list_cancel_remove_roundtrip() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(list.downloads.len(), 1);
-    assert_eq!(
-        list.downloads[0].status,
-        proto::DownloadStatus::Pending as i32
-    );
+    assert_eq!(list.files.len(), 1);
+    assert_eq!(list.files[0].status, proto::FileStatus::Pending as i32);
 
     // Cancel.
     let status = h
@@ -111,10 +105,7 @@ async fn add_list_cancel_remove_roundtrip() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(
-        list.downloads[0].status,
-        proto::DownloadStatus::Cancelled as i32
-    );
+    assert_eq!(list.files[0].status, proto::FileStatus::Cancelled as i32);
 
     // Remove после отмены — ок.
     h.client
@@ -129,7 +120,7 @@ async fn add_list_cancel_remove_roundtrip() {
         .await
         .unwrap()
         .into_inner();
-    assert!(list.downloads.is_empty());
+    assert!(list.files.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -158,10 +149,7 @@ async fn pause_and_resume_unqueued() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(
-        list.downloads[0].status,
-        proto::DownloadStatus::Paused as i32
-    );
+    assert_eq!(list.files[0].status, proto::FileStatus::Paused as i32);
 
     h.client
         .resume(proto::IdRequest {
@@ -175,10 +163,7 @@ async fn pause_and_resume_unqueued() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(
-        list.downloads[0].status,
-        proto::DownloadStatus::Pending as i32
-    );
+    assert_eq!(list.files[0].status, proto::FileStatus::Pending as i32);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -200,8 +185,8 @@ async fn pause_all_and_resume_all() {
         .await
         .unwrap()
         .into_inner();
-    for d in &list.downloads {
-        assert_eq!(d.status, proto::DownloadStatus::Paused as i32);
+    for d in &list.files {
+        assert_eq!(d.status, proto::FileStatus::Paused as i32);
     }
 
     h.client
@@ -214,8 +199,8 @@ async fn pause_all_and_resume_all() {
         .await
         .unwrap()
         .into_inner();
-    for d in &list.downloads {
-        assert_eq!(d.status, proto::DownloadStatus::Pending as i32);
+    for d in &list.files {
+        assert_eq!(d.status, proto::FileStatus::Pending as i32);
     }
 }
 
@@ -234,7 +219,7 @@ async fn download_runs_to_completion() {
         .id
         .unwrap();
     let final_state = wait_until_terminal(&h, &id, Duration::from_secs(5)).await;
-    assert_eq!(final_state, proto::DownloadStatus::Done);
+    assert_eq!(final_state, proto::FileStatus::Done);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -284,7 +269,7 @@ async fn invalid_id_rejected() {
     let err = h
         .client
         .pause(proto::IdRequest {
-            id: Some(proto::DownloadId {
+            id: Some(proto::FileId {
                 value: "not-a-uuid".into(),
             }),
         })
@@ -315,8 +300,6 @@ async fn get_settings_returns_defaults() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.default_workers, 4);
-    assert_eq!(resp.max_workers, 16);
     assert_eq!(resp.max_concurrent, 3);
     assert_eq!(resp.piece_target_count, 128);
     assert_eq!(resp.piece_size_min, 16 * 1024 * 1024);
@@ -325,5 +308,4 @@ async fn get_settings_returns_defaults() {
         resp.on_duplicate_url,
         proto::OnDuplicateUrlPolicy::Ask as i32
     );
-    assert_eq!(resp.on_file_exists, proto::OnFileExistsPolicy::Ask as i32);
 }

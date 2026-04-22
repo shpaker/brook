@@ -18,8 +18,8 @@ use std::time::{
 use brook_core::{
     AttemptId,
     AttemptRecord,
-    DownloadId,
     Error,
+    FileId,
     Result as CoreResult,
     TPieceAttemptRepo,
     WorkerId,
@@ -45,7 +45,7 @@ impl SqlitePieceAttemptRepository {
 impl TPieceAttemptRepo for SqlitePieceAttemptRepository {
     fn start(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
         piece_number: u32,
         worker_id: WorkerId,
     ) -> impl std::future::Future<Output = CoreResult<AttemptRecord>> + Send {
@@ -115,7 +115,7 @@ impl TPieceAttemptRepo for SqlitePieceAttemptRepository {
 
     fn pause_all_running_for_file(
         &self,
-        file_id: DownloadId,
+        file_id: FileId,
     ) -> impl std::future::Future<Output = CoreResult<()>> + Send {
         let db = self.db.clone();
         async move { run(&db, move |c| pause_running_impl(c, Some(file_id))).await }
@@ -143,7 +143,7 @@ where
 
 fn start_impl(
     conn: &mut Connection,
-    file_id: DownloadId,
+    file_id: FileId,
     piece_number: u32,
     worker_id: WorkerId,
 ) -> CoreResult<AttemptRecord> {
@@ -195,7 +195,7 @@ fn update_impl(
     Ok(())
 }
 
-fn pause_running_impl(conn: &mut Connection, file_id: Option<DownloadId>) -> CoreResult<()> {
+fn pause_running_impl(conn: &mut Connection, file_id: Option<FileId>) -> CoreResult<()> {
     let now = unix_secs(SystemTime::now());
     match file_id {
         Some(fid) => {
@@ -235,9 +235,9 @@ mod tests {
     use std::path::PathBuf;
 
     use brook_core::{
-        Download,
-        DownloadId,
-        DownloadSpec,
+        File,
+        FileId,
+        FileSpec,
         TQueueStore,
         TWorkerRepo,
     };
@@ -251,22 +251,17 @@ mod tests {
         SharedDb,
         SqlitePieceAttemptRepository,
         SqliteWorkerRepository,
-        DownloadId,
+        FileId,
     ) {
         let db = SharedDb::open_in_memory().unwrap();
         let files = SqliteFileRepository::new(db.clone());
         let pieces = SqlitePieceRepository::new(db.clone());
-        let d = Download::new(
-            DownloadId::new(),
-            DownloadSpec {
+        let d = File::new(
+            FileId::new(),
+            FileSpec {
                 url: "https://x/f".into(),
                 target_dir: PathBuf::from("/tmp"),
                 filename: Some("f".into()),
-                workers: 2,
-                piece_target_count: None,
-                piece_size_min: None,
-                piece_size_max: None,
-                on_file_exists_override: Default::default(),
             },
         );
         let file_id = d.id;

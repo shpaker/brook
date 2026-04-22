@@ -35,7 +35,7 @@ use std::time::{
     UNIX_EPOCH,
 };
 
-use brook_core::DownloadId;
+use brook_core::FileId;
 use rusqlite::{
     Connection,
     params,
@@ -80,12 +80,12 @@ impl SqlitePieceRepository {
     /// Если для `file_id` уже есть piece-строки — возвращает
     /// `AlreadyInitialized` (перезапись считаем ошибкой программы;
     /// штатный «начать заново» — `delete_all` + `init`).
-    pub async fn init(&self, file_id: DownloadId, count: u32) -> PiecesResult<()> {
+    pub async fn init(&self, file_id: FileId, count: u32) -> PiecesResult<()> {
         run(&self.db, move |c| init_impl(c, file_id, count)).await
     }
 
     /// Уже ли инициализирован файл (есть хоть одна piece-строка).
-    pub async fn is_initialized(&self, file_id: DownloadId) -> PiecesResult<bool> {
+    pub async fn is_initialized(&self, file_id: FileId) -> PiecesResult<bool> {
         run(&self.db, move |c| is_initialized_impl(c, file_id)).await
     }
 
@@ -96,26 +96,26 @@ impl SqlitePieceRepository {
     /// (`total_size`/`piece_size`). Если нет — решаем «fresh» и
     /// пересобираем таблицу, даже когда inspect-поля формально
     /// совпадают (их мог переписать новый inspect-отчёт).
-    pub async fn count(&self, file_id: DownloadId) -> PiecesResult<u32> {
+    pub async fn count(&self, file_id: FileId) -> PiecesResult<u32> {
         run(&self.db, move |c| count_impl(c, file_id)).await
     }
 
     /// Номера piece'ов в статусе `pending`, упорядочены по возрастанию.
-    pub async fn pending_numbers(&self, file_id: DownloadId) -> PiecesResult<Vec<u32>> {
+    pub async fn pending_numbers(&self, file_id: FileId) -> PiecesResult<Vec<u32>> {
         run(&self.db, move |c| pending_numbers_impl(c, file_id)).await
     }
 
     /// Пометить piece как `done`.
     /// Неизвестный `number` молча игнорируется (rowid из отменённой
     /// попытки — нормальный кейс).
-    pub async fn commit_done(&self, file_id: DownloadId, number: u32) -> PiecesResult<()> {
+    pub async fn commit_done(&self, file_id: FileId, number: u32) -> PiecesResult<()> {
         run(&self.db, move |c| commit_done_impl(c, file_id, number)).await
     }
 
     /// Удалить все piece-строки этого файла. Используется при `abort`,
     /// `finalize` (после ренейма таргета — строки больше не нужны) и при
     /// fresh-restart (`open` обнаружил несовместимость inspect-полей).
-    pub async fn delete_all(&self, file_id: DownloadId) -> PiecesResult<()> {
+    pub async fn delete_all(&self, file_id: FileId) -> PiecesResult<()> {
         run(&self.db, move |c| delete_all_impl(c, file_id)).await
     }
 }
@@ -134,7 +134,7 @@ where
 
 // ─── Sync implementations ──────────────────────────────────────────────
 
-fn init_impl(conn: &mut Connection, file_id: DownloadId, count: u32) -> PiecesResult<()> {
+fn init_impl(conn: &mut Connection, file_id: FileId, count: u32) -> PiecesResult<()> {
     if is_initialized_impl(conn, file_id)? {
         return Err(PiecesError::AlreadyInitialized);
     }
@@ -159,11 +159,11 @@ fn init_impl(conn: &mut Connection, file_id: DownloadId, count: u32) -> PiecesRe
     Ok(())
 }
 
-fn is_initialized_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesResult<bool> {
+fn is_initialized_impl(conn: &mut Connection, file_id: FileId) -> PiecesResult<bool> {
     Ok(count_impl(conn, file_id)? > 0)
 }
 
-fn count_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesResult<u32> {
+fn count_impl(conn: &mut Connection, file_id: FileId) -> PiecesResult<u32> {
     let cnt: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pieces WHERE file_id = ?",
         params![file_id.to_string()],
@@ -172,7 +172,7 @@ fn count_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesResult<u32> {
     Ok(cnt as u32)
 }
 
-fn pending_numbers_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesResult<Vec<u32>> {
+fn pending_numbers_impl(conn: &mut Connection, file_id: FileId) -> PiecesResult<Vec<u32>> {
     let mut stmt = conn.prepare(
         "SELECT number FROM pieces
          WHERE file_id = ? AND status_id = 'pending'
@@ -188,7 +188,7 @@ fn pending_numbers_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesRes
     Ok(out)
 }
 
-fn commit_done_impl(conn: &mut Connection, file_id: DownloadId, number: u32) -> PiecesResult<()> {
+fn commit_done_impl(conn: &mut Connection, file_id: FileId, number: u32) -> PiecesResult<()> {
     let now = unix_secs(SystemTime::now());
     conn.execute(
         "UPDATE pieces SET status_id = 'done', finished_at = ?
@@ -198,7 +198,7 @@ fn commit_done_impl(conn: &mut Connection, file_id: DownloadId, number: u32) -> 
     Ok(())
 }
 
-fn delete_all_impl(conn: &mut Connection, file_id: DownloadId) -> PiecesResult<()> {
+fn delete_all_impl(conn: &mut Connection, file_id: FileId) -> PiecesResult<()> {
     conn.execute(
         "DELETE FROM pieces WHERE file_id = ?",
         params![file_id.to_string()],
@@ -219,32 +219,27 @@ mod tests {
     use std::path::PathBuf;
 
     use brook_core::{
-        Download,
-        DownloadId,
-        DownloadSpec,
+        File,
+        FileId,
+        FileSpec,
     };
 
     use super::*;
     use crate::storage::files::SqliteFileRepository;
 
-    fn sample_download() -> Download {
-        let spec = DownloadSpec {
+    fn sample_download() -> File {
+        let spec = FileSpec {
             url: "https://example.com/file.bin".into(),
             target_dir: PathBuf::from("/tmp/brook"),
             filename: Some("file.bin".into()),
-            workers: 4,
-            piece_target_count: Some(256),
-            piece_size_min: Some(8 * 1024 * 1024),
-            piece_size_max: Some(64 * 1024 * 1024),
-            on_file_exists_override: Default::default(),
         };
-        Download::new(DownloadId::new(), spec)
+        File::new(FileId::new(), spec)
     }
 
     /// Создаёт `SharedDb`, репозиторий piece'ов и регистрирует одну
     /// «фейковую» загрузку — нужно, потому что `pieces.file_id` имеет
     /// FK на `files.id`.
-    async fn fresh() -> (SharedDb, SqlitePieceRepository, DownloadId) {
+    async fn fresh() -> (SharedDb, SqlitePieceRepository, FileId) {
         use brook_core::TQueueStore;
         let db = SharedDb::open_in_memory().unwrap();
         let files = SqliteFileRepository::new(db.clone());

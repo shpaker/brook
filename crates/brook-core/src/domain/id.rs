@@ -1,8 +1,8 @@
-//! Идентификатор загрузки.
+//! Идентификатор файла.
 //!
 //! **Newtype pattern** — обёртка с нулевой стоимостью времени выполнения
-//! (`struct DownloadId(Uuid)` в памяти занимает ровно столько же, сколько `Uuid`).
-//! Смысл: `fn remove(id: DownloadId)` нельзя случайно вызвать с `WorkerId`,
+//! (`struct FileId(Uuid)` в памяти занимает ровно столько же, сколько `Uuid`).
+//! Смысл: `fn remove(id: FileId)` нельзя случайно вызвать с `WorkerId`,
 //! даже если оба внутри — `Uuid`. Компилятор заставит распаковать и упаковать явно.
 //!
 //! В `todo.md` стоит пометка `(xid)` — короткий sortable-id. Пока стартуем на
@@ -14,7 +14,7 @@ use std::str::FromStr;
 
 use uuid::Uuid;
 
-/// Глобально-уникальный идентификатор загрузки.
+/// Глобально-уникальный идентификатор файла.
 ///
 /// Derive-макросы:
 /// - `Debug`  — автоматический `{:?}` для логов.
@@ -23,9 +23,9 @@ use uuid::Uuid;
 /// - `Hash` — можно класть в `HashMap`/`HashSet`.
 /// - `PartialOrd, Ord` — сортировка (для стабильного вывода в списках).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DownloadId(Uuid);
+pub struct FileId(Uuid);
 
-impl DownloadId {
+impl FileId {
     /// Новый случайный id (UUIDv4).
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -38,7 +38,7 @@ impl DownloadId {
 }
 
 /// `Default::default()` возвращает свежий id. Полезно для тестов и builder'ов.
-impl Default for DownloadId {
+impl Default for FileId {
     fn default() -> Self {
         Self::new()
     }
@@ -46,15 +46,15 @@ impl Default for DownloadId {
 
 /// `Display` — «человеческое» представление (через `{}` и `.to_string()`).
 /// Делегируем `Display` у `Uuid`.
-impl fmt::Display for DownloadId {
+impl fmt::Display for FileId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
     }
 }
 
-/// Парсинг из строки (`"550e8400-...".parse::<DownloadId>()?`).
+/// Парсинг из строки (`"550e8400-...".parse::<FileId>()?`).
 /// `type Err = uuid::Error` — заявляем, какую ошибку возвращает парсер.
-impl FromStr for DownloadId {
+impl FromStr for FileId {
     type Err = uuid::Error;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -144,19 +144,19 @@ mod tests {
     fn new_ids_are_unique() {
         // На практике — астрономически маленькая вероятность совпадения
         // двух UUIDv4. Если упало — лотерея.
-        assert_ne!(DownloadId::new(), DownloadId::new());
+        assert_ne!(FileId::new(), FileId::new());
     }
 
     #[test]
     fn display_parse_roundtrip() {
-        let id = DownloadId::new();
+        let id = FileId::new();
         let s = id.to_string();
-        let parsed: DownloadId = s.parse().expect("valid uuid string");
+        let parsed: FileId = s.parse().expect("valid uuid string");
         assert_eq!(id, parsed);
     }
 
     #[test]
     fn parse_rejects_garbage() {
-        assert!("not-a-uuid".parse::<DownloadId>().is_err());
+        assert!("not-a-uuid".parse::<FileId>().is_err());
     }
 }

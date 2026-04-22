@@ -1,10 +1,12 @@
 //! Рендер списка загрузок (§6.3).
 //!
-//! Каждая загрузка — 3 строки (шапка + прогрессбар + пустой разделитель).
+//! Каждая загрузка — 2 строки (контент + пустой разделитель). Шапка
+//! (префикс + имя + правая колонка) и прогресс-бар делят одну строку:
+//! сначала рисуется текст, поверх него `ProgressBar` красит `bg` ячеек.
 //! Скроллинг — попиксельный (по строкам буфера), а не «по элементам».
 //! Scrollbar справа появляется только при переполнении.
 
-use brook_proto::brook::v1::DownloadStatus;
+use brook_proto::brook::v1::FileStatus;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{
@@ -30,12 +32,12 @@ use crate::model::{
 };
 use crate::ui::progress::ProgressBar;
 
-/// Каждой загрузке — 2 строки содержимого + 1 строка-разделитель снизу.
-const ROWS_PER_ENTRY: u16 = 3;
+/// Каждой загрузке — 1 строка содержимого + 1 строка-разделитель снизу.
+const ROWS_PER_ENTRY: u16 = 2;
 /// Ширина префикса `[cursor][select][icon]` + запас на пробел.
 const PREFIX_WIDTH: u16 = 4;
 /// Фиксированная ширина правой метрика-колонки.
-const RIGHT_COL_WIDTH: u16 = 34;
+const RIGHT_COL_WIDTH: u16 = 42;
 
 pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
     if area.width < PREFIX_WIDTH + 10 || area.height == 0 {
@@ -124,21 +126,21 @@ fn draw_entry(
     is_selected: bool,
     no_color: bool,
 ) {
-    // Строка 1 — шапка.
+    // Строка 1 — шапка (префикс + имя + правая колонка).
     if area.height >= 1 {
         let header = header_line(row, is_cursor, is_selected, area.width);
-        f.render_widget(
-            Paragraph::new(header),
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: 1,
-            },
-        );
-    }
-    // Строка 2 — прогрессбар (выровнен с именем файла).
-    if area.height >= 2 {
+        let header_rect = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(header), header_rect);
+
+        // Прогресс-бар поверх той же строки: красит только `bg`,
+        // символы имени/правой колонки остаются на месте. Заливка
+        // идёт от конца префикса до правого края — по всей «полезной»
+        // ширине строки.
         let bar_x = area.x + PREFIX_WIDTH;
         let bar_width = area.width.saturating_sub(PREFIX_WIDTH);
         if bar_width > 0 {
@@ -152,7 +154,7 @@ fn draw_entry(
                 widget,
                 Rect {
                     x: bar_x,
-                    y: area.y + 1,
+                    y: area.y,
                     width: bar_width,
                     height: 1,
                 },
@@ -184,7 +186,7 @@ fn draw_entry(
             }
         }
     }
-    // Строка 3 — пустой разделитель (само собой, просто ничего не рисуем).
+    // Строка 2 — пустой разделитель (ничего не рисуем).
 }
 
 fn header_line(row: &DownloadRow, is_cursor: bool, is_selected: bool, width: u16) -> Line<'static> {
@@ -213,15 +215,15 @@ fn header_line(row: &DownloadRow, is_cursor: bool, is_selected: bool, width: u16
     ])
 }
 
-fn status_icon(s: DownloadStatus) -> &'static str {
+fn status_icon(s: FileStatus) -> &'static str {
     match s {
-        DownloadStatus::Running => "▶",
-        DownloadStatus::Paused => "❚❚",
-        DownloadStatus::Retrying => "↻",
-        DownloadStatus::Pending => "⏳",
-        DownloadStatus::Done => "✓",
-        DownloadStatus::Failed | DownloadStatus::Cancelled => "✕",
-        DownloadStatus::Unspecified => "·",
+        FileStatus::Running => "▶",
+        FileStatus::Paused => "❚❚",
+        FileStatus::Retrying => "↻",
+        FileStatus::Pending => "⏳",
+        FileStatus::Done => "✓",
+        FileStatus::Failed | FileStatus::Cancelled => "✕",
+        FileStatus::Unspecified => "·",
     }
 }
 
@@ -232,8 +234,14 @@ fn right_column(row: &DownloadRow) -> String {
     } else {
         "—".to_string()
     };
+    let pct_field: String = if row.progress.bytes_total > 0 {
+        let pct = (row.progress.bytes_done as f64 / row.progress.bytes_total as f64) * 100.0;
+        format!("{pct:.1}%")
+    } else {
+        "—".to_string()
+    };
     let status_field: String = match row.status {
-        DownloadStatus::Running => {
+        FileStatus::Running => {
             let eta = row
                 .progress
                 .eta_secs
@@ -241,23 +249,23 @@ fn right_column(row: &DownloadRow) -> String {
                 .unwrap_or_else(|| "—".to_string());
             format!("{} · {}", format::speed(row.progress.speed_bps), eta)
         }
-        DownloadStatus::Paused => "— · paused".into(),
-        DownloadStatus::Pending => "— · queued".into(),
-        DownloadStatus::Retrying => {
+        FileStatus::Paused => "— · paused".into(),
+        FileStatus::Pending => "— · queued".into(),
+        FileStatus::Retrying => {
             if row.max_attempts > 0 {
                 format!("— · {}/{}", row.attempt, row.max_attempts)
             } else {
                 format!("— · retry {}", row.attempt)
             }
         }
-        DownloadStatus::Done => "— · done".into(),
-        DownloadStatus::Failed => "— · failed".into(),
-        DownloadStatus::Cancelled => "— · cancelled".into(),
-        DownloadStatus::Unspecified => "—".into(),
+        FileStatus::Done => "— · done".into(),
+        FileStatus::Failed => "— · failed".into(),
+        FileStatus::Cancelled => "— · cancelled".into(),
+        FileStatus::Unspecified => "—".into(),
     };
     // Обрезаем до фиксированной ширины, чтобы все правые колонки
     // совпали по границе.
-    let raw = format!("{done} / {total} · {status_field}");
+    let raw = format!("{done} / {total} · {pct_field} · {status_field}");
     let w = RIGHT_COL_WIDTH as usize;
     if raw.chars().count() >= w {
         format::right_ellipsis(&raw, w)

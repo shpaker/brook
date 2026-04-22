@@ -12,17 +12,16 @@ use crossterm::event::{
     MouseEvent,
 };
 
-/// Обёртки над proto-событиями из `Watch`-стрима. Держим сырой proto,
-/// потому что §6.2 целиком живёт на нём, а свой доменный тип породил
-/// бы лишний слой перевода без пользы.
+/// Обёртки над proto-событиями из `WatchFile` / `WatchProgress`-стримов.
+/// Держим сырой proto, потому что §6.2 целиком живёт на нём, а свой
+/// доменный тип породил бы лишний слой перевода без пользы.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    Snapshot(proto::Download),
-    Progress(proto::DownloadId, proto::Progress),
-    StatusChanged(proto::DownloadId, i32),
-    WorkerUpdate(proto::DownloadId, u32, f32),
-    Completed(proto::DownloadId),
-    Failed(proto::DownloadId, String),
+    Snapshot(proto::File),
+    Progress(proto::ProgressTick),
+    StatusChanged(proto::FileId, i32),
+    Completed(proto::FileId),
+    Failed(proto::FileId, String),
 }
 
 #[derive(Debug)]
@@ -39,9 +38,7 @@ pub enum UiEvent {
     StreamDisconnected(String),
     /// 250 ms-тик: протухание toast'ов, пересчёт ETA.
     Tick,
-    /// Результат команды, запущенной с UI. Передаёт ok/err-контекст,
-    /// и для `Add` — `FileExists`-хук, чтобы UI мог показать модалку
-    /// выбора rename/overwrite без лишнего кода.
+    /// Результат команды, запущенной с UI. Передаёт ok/err-контекст.
     CmdResult(CmdOutcome),
     /// Внешний сигнал (SIGTERM/SIGINT из `tokio::signal`): чисто
     /// завершаем цикл.
@@ -55,13 +52,10 @@ pub enum CmdOutcome {
     Ok,
     /// Ошибка — показываем toast'ом.
     Error(String),
-    /// Сервер отказал в `Add` из-за существующего файла. UI должен
-    /// открыть модалку выбора rename/overwrite и повторить `Add` с
-    /// нужным override. Чтобы не терять введённое, возвращаем исходный
-    /// `AddForm`.
-    AddFileExists { form: AddForm },
-    /// Сервер успешно принял `Add` — вернул новый `DownloadId`.
-    AddAccepted,
+    /// Сервер успешно принял `Add`. Если клиент авто-переименовал файл
+    /// после конфликта (`AlreadyExists`), в `renamed_to` — финальное имя
+    /// для toast'а «Saved as …».
+    AddAccepted { renamed_to: Option<String> },
     /// `Remove` прошёл успешно (или же демон ответил `NotFound`, но
     /// `Remove` идемпотентен — см. `manager::remove`). UI должен выкинуть
     /// перечисленные id из ViewModel, потому что демон про них больше
@@ -73,8 +67,7 @@ pub enum CmdOutcome {
     NotFound { ids: Vec<String> },
 }
 
-/// Форма Add-модалки. Используется и при первом `Add`, и при повторе
-/// после `FileExists`.
+/// Форма Add-модалки.
 #[derive(Debug, Clone)]
 pub struct AddForm {
     pub url: String,

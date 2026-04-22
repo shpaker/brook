@@ -1,7 +1,7 @@
 //! Интеграционный тест стриминг-движка (§2).
 //!
 //! Проверяет happy-path: `fetch_full` → `TStreamStorage::append_chunk` →
-//! `finalize`, с `bytes_total = 0` в `Progress`-событиях (TUI рендерит
+//! `finalize`, с `bytes_total = 0` в `ProgressEvent`-тиках (TUI рендерит
 //! indeterminate-gauge).
 
 use std::sync::Arc;
@@ -12,27 +12,31 @@ use brook_core::testing::{
     sequential_bytes,
 };
 use brook_core::{
-    DownloadCommand,
     DownloadEngine,
-    DownloadEvent,
-    DownloadId,
-    DownloadSpec,
     EngineConfig,
+    EngineSubscriptions,
+    FileCommand,
+    FileId,
+    FileLifecycleEvent,
+    FileSpec,
     FileStatus,
     NoopAttemptRepo,
     NoopWorkerRepo,
+    ProgressEvent,
     StreamingEngineInputs,
 };
 use tokio::sync::broadcast;
 
-async fn drain(mut rx: broadcast::Receiver<DownloadEvent>) -> Vec<DownloadEvent> {
+async fn drain_lifecycle(
+    mut rx: broadcast::Receiver<FileLifecycleEvent>,
+) -> Vec<FileLifecycleEvent> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.recv().await {
         let terminal = matches!(
             ev,
-            DownloadEvent::Completed { .. }
-                | DownloadEvent::Failed { .. }
-                | DownloadEvent::StatusChanged {
+            FileLifecycleEvent::Completed { .. }
+                | FileLifecycleEvent::Failed { .. }
+                | FileLifecycleEvent::StatusChanged {
                     status: FileStatus::Cancelled,
                     ..
                 }
@@ -45,6 +49,16 @@ async fn drain(mut rx: broadcast::Receiver<DownloadEvent>) -> Vec<DownloadEvent>
     out
 }
 
+async fn drain_progress(mut rx: broadcast::Receiver<ProgressEvent>) -> Vec<ProgressEvent> {
+    let mut out = Vec::new();
+    // Небольшое окно — в happy-path мы успеем увидеть хотя бы один тик.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        out.push(ev);
+    }
+    out
+}
+
 #[tokio::test]
 async fn streaming_happy_path_completes_and_finalizes() {
     let bytes = sequential_bytes(4096);
@@ -52,11 +66,17 @@ async fn streaming_happy_path_completes_and_finalizes() {
     let stream = Arc::new(MemoryStreamStorage::new());
 
     let inputs = StreamingEngineInputs {
-        spec: DownloadSpec::new("https://host/x", "/tmp"),
+        spec: FileSpec::new("https://host/x", "/tmp"),
         effective_url: None,
     };
-    let (handle, rx) = DownloadEngine::spawn_streaming(
-        DownloadId::new(),
+    let (
+        handle,
+        EngineSubscriptions {
+            lifecycle,
+            progress,
+        },
+    ) = DownloadEngine::spawn_streaming(
+        FileId::new(),
         inputs,
         EngineConfig::default(),
         Arc::clone(&stream),
@@ -64,27 +84,32 @@ async fn streaming_happy_path_completes_and_finalizes() {
         Arc::new(NoopWorkerRepo),
         Arc::new(NoopAttemptRepo),
     );
-    let events = drain(rx).await;
+    let lifecycle_task = tokio::spawn(drain_lifecycle(lifecycle));
+    let progress_task = tokio::spawn(drain_progress(progress));
+    let events = lifecycle_task.await.unwrap();
+    let progress_events = progress_task.await.unwrap();
     handle.join().await;
 
     // Байты сложились целиком и хранилище финализовано.
     assert_eq!(stream.assembled_bytes(), bytes);
     assert!(stream.is_finalized());
 
-    // В событиях — Completed, а Progress приходит с bytes_total = 0.
+    // В lifecycle-стриме — Completed.
     let has_completed = events
         .iter()
-        .any(|e| matches!(e, DownloadEvent::Completed { .. }));
+        .any(|e| matches!(e, FileLifecycleEvent::Completed { .. }));
     assert!(has_completed, "expected Completed, got {events:?}");
-    let any_progress_unknown_size = events.iter().any(|e| {
+    // В прогресс-тиках — bytes_total = 0 (indeterminate).
+    let any_progress_unknown_size = progress_events.iter().any(|e| {
         matches!(
             e,
-            DownloadEvent::Progress { progress, .. } if progress.bytes_total == 0
+            ProgressEvent::Tick { progress, .. } if progress.bytes_total == 0
         )
     });
     assert!(
         any_progress_unknown_size,
-        "expected at least one Progress with bytes_total=0 (indeterminate), got {events:?}"
+        "expected at least one ProgressEvent::Tick with bytes_total=0, \
+         got {progress_events:?}"
     );
 }
 
@@ -97,11 +122,17 @@ async fn streaming_cancel_aborts_storage() {
     let stream = Arc::new(MemoryStreamStorage::new());
 
     let inputs = StreamingEngineInputs {
-        spec: DownloadSpec::new("https://host/x", "/tmp"),
+        spec: FileSpec::new("https://host/x", "/tmp"),
         effective_url: None,
     };
-    let (handle, rx) = DownloadEngine::spawn_streaming(
-        DownloadId::new(),
+    let (
+        handle,
+        EngineSubscriptions {
+            lifecycle,
+            progress: _,
+        },
+    ) = DownloadEngine::spawn_streaming(
+        FileId::new(),
         inputs,
         EngineConfig::default(),
         Arc::clone(&stream),
@@ -111,8 +142,8 @@ async fn streaming_cancel_aborts_storage() {
     );
     // Успеваем послать Cancel до того, как fetch вернёт поток.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    handle.send(DownloadCommand::Cancel);
-    let _ = drain(rx).await;
+    handle.send(FileCommand::Cancel);
+    let _ = drain_lifecycle(lifecycle).await;
     handle.join().await;
 
     assert!(stream.is_aborted(), "cancel must abort the stream storage");

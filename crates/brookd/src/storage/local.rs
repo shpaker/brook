@@ -51,8 +51,8 @@ use std::sync::{
 };
 
 use brook_core::{
-    DownloadId,
     Error,
+    FileId,
     Result,
     TPieceStorage,
     TStreamStorage,
@@ -82,7 +82,7 @@ pub struct LocalPieceStorage {
     inner: Arc<Mutex<Inner>>,
     data_path: PathBuf,
     target_path: PathBuf,
-    file_id: DownloadId,
+    file_id: FileId,
     pieces_repo: Arc<SqlitePieceRepository>,
     /// Пока не используется (engine персистит state-переходы сам), но
     /// нужен фабрике в той же раскладке: держим про запас, чтобы не
@@ -115,7 +115,7 @@ impl LocalPieceStorage {
     pub async fn open(
         target_dir: &Path,
         filename: &str,
-        id: DownloadId,
+        id: FileId,
         total_size: u64,
         piece_size: u64,
         pieces_repo: Arc<SqlitePieceRepository>,
@@ -507,8 +507,8 @@ mod tests {
     use std::path::PathBuf;
 
     use brook_core::{
-        Download,
-        DownloadSpec,
+        File,
+        FileSpec,
         TQueueStore,
     };
     use tempfile::tempdir;
@@ -521,26 +521,21 @@ mod tests {
     const PIECE: u64 = 8;
 
     fn read_file(path: &Path) -> Vec<u8> {
-        let mut f = File::open(path).unwrap();
+        let mut f = std::fs::File::open(path).unwrap();
         let mut out = Vec::new();
         f.read_to_end(&mut out).unwrap();
         out
     }
 
-    fn sample_spec(target_dir: &Path, filename: &str) -> DownloadSpec {
-        DownloadSpec {
+    fn sample_spec(target_dir: &Path, filename: &str) -> FileSpec {
+        FileSpec {
             url: "https://example.com/x".into(),
             target_dir: target_dir.to_path_buf(),
             filename: Some(filename.into()),
-            workers: 1,
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: Default::default(),
         }
     }
 
-    /// Минимальная сборка для теста: SharedDb + регистрируем `Download`,
+    /// Минимальная сборка для теста: SharedDb + регистрируем `File`,
     /// раскладываем inspect-поля (это сделала бы фабрика в stage 6).
     async fn fixture(
         target_dir: &Path,
@@ -549,12 +544,12 @@ mod tests {
         SharedDb,
         Arc<SqliteFileRepository>,
         Arc<SqlitePieceRepository>,
-        DownloadId,
+        FileId,
     ) {
         let db = SharedDb::open_in_memory().unwrap();
         let files = Arc::new(SqliteFileRepository::new(db.clone()));
         let pieces = Arc::new(SqlitePieceRepository::new(db.clone()));
-        let d = Download::new(DownloadId::new(), sample_spec(target_dir, filename));
+        let d = File::new(FileId::new(), sample_spec(target_dir, filename));
         let id = d.id;
         files.insert(&d).await.unwrap();
         files
@@ -571,7 +566,7 @@ mod tests {
         SharedDb,
         Arc<SqliteFileRepository>,
         Arc<SqlitePieceRepository>,
-        DownloadId,
+        FileId,
         LocalPieceStorage,
     ) {
         let (db, files, pieces, id) = fixture(target_dir, filename).await;

@@ -7,33 +7,26 @@
 //!
 //! ```text
 //! inspect(url)
-//!   → resolve_filename + on_file_exists
+//!   → resolve_filename (+ проверка конфликта имени)
 //!   → effective_plan_config + plan_pieces → piece_size
 //!   → files_repo.set_inspect_fields(id, total_size, piece_size, etag, last_modified)
 //!   → LocalPieceStorage::open(id, total_size, piece_size, …)
 //! ```
 //!
-//! ## Политика `on_file_exists`
+//! ## Политика конфликта имени файла
 //!
-//! `ask`/`rename`/`overwrite` здесь не живёт. [`LocalPieceStorage::open`]
-//! уже умеет два легальных сценария (инициализация на пустом месте и
-//! resume поверх валидного `.data.brook`); конфликт именно с существующим
-//! *готовым* файлом (целевым) — задача TUI-модалки §6.6, которая до
-//! `prepare` договаривается с пользователем и правит `spec.filename`.
-//! Фабрика не делает предположений — смотрит только политику
-//! `on_file_exists_override`.
+//! Хардкодится как **ошибка**: если целевой файл уже лежит в
+//! `target_dir`, фабрика возвращает [`Error::FileExists`]. Подбор
+//! свободного имени — ответственность клиента (TUI видит ошибку через
+//! `tonic::Code::AlreadyExists` и сам ретраит `Add` с явным
+//! `filename`). Настройки в `brook.yaml` для этого нет.
 
-use std::path::{
-    Path,
-    PathBuf,
-};
 use std::sync::Arc;
 
 use brook_core::{
-    DownloadId,
-    DownloadSpec,
     Error,
-    OnFileExistsOverride,
+    FileId,
+    FileSpec,
     PreparedDownload,
     PreparedMode,
     RangeGuard,
@@ -92,8 +85,8 @@ where
 
     fn prepare(
         &self,
-        id: DownloadId,
-        spec: &DownloadSpec,
+        id: FileId,
+        spec: &FileSpec,
     ) -> impl std::future::Future<
         Output = Result<PreparedDownload<Self::Storage, Self::StreamStorage>>,
     > + Send {
@@ -112,15 +105,16 @@ where
 
             let filename = resolve_filename(&spec, report.filename.as_deref())?;
             validate_filename(&filename).map_err(|e| Error::Other(format!("filename: {e}")))?;
-            let filename =
-                apply_on_file_exists(&spec.target_dir, filename, spec.on_file_exists_override)?;
+            if spec.target_dir.join(&filename).exists() {
+                return Err(Error::FileExists { filename });
+            }
 
             let guard = RangeGuard::from_report(&report);
             let effective_url = report.effective_url.clone();
 
             match report.total_size {
                 Some(total_size) => {
-                    let cfg = effective_plan_config(&spec, &defaults)
+                    let cfg = effective_plan_config(&defaults)
                         .map_err(|e| Error::Other(format!("plan config: {e}")))?;
                     // `plan_pieces` считает раскладку, но геометрия piece'ов
                     // арифметическая: нужен только `piece_size`.
@@ -192,7 +186,7 @@ where
 
 /// Определить имя файла: `spec.filename` → `InspectReport.filename` →
 /// последний сегмент URL-пути.
-fn resolve_filename(spec: &DownloadSpec, from_report: Option<&str>) -> Result<String> {
+fn resolve_filename(spec: &FileSpec, from_report: Option<&str>) -> Result<String> {
     if let Some(name) = &spec.filename {
         return Ok(name.clone());
     }
@@ -207,57 +201,6 @@ fn resolve_filename(spec: &DownloadSpec, from_report: Option<&str>) -> Result<St
     })
 }
 
-/// Применить политику `on_file_exists_override`: если целевой файл уже
-/// лежит в `target_dir`, либо подобрать свободное имя (Rename), либо
-/// удалить его (Overwrite), либо вернуть `Error::FileExists` (Unspecified).
-fn apply_on_file_exists(
-    target_dir: &Path,
-    filename: String,
-    policy: OnFileExistsOverride,
-) -> Result<String> {
-    let target = target_dir.join(&filename);
-    if !target.exists() {
-        return Ok(filename);
-    }
-    match policy {
-        OnFileExistsOverride::Unspecified => Err(Error::FileExists { path: target }),
-        OnFileExistsOverride::Overwrite => {
-            std::fs::remove_file(&target)
-                .map_err(|e| Error::Other(format!("overwrite {}: {e}", target.display())))?;
-            Ok(filename)
-        }
-        OnFileExistsOverride::Rename => pick_free_name(target_dir, &filename),
-    }
-}
-
-/// Подобрать `<stem> (N).<ext>` (или `<name> (N)` без расширения),
-/// начиная с `N = 1`, пока не найдётся несуществующее имя.
-fn pick_free_name(target_dir: &Path, original: &str) -> Result<String> {
-    let as_path = PathBuf::from(original);
-    let stem = as_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(original)
-        .to_owned();
-    let ext = as_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_owned);
-    for n in 1u32..=10_000 {
-        let candidate = match &ext {
-            Some(e) => format!("{stem} ({n}).{e}"),
-            None => format!("{stem} ({n})"),
-        };
-        if !target_dir.join(&candidate).exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(Error::Other(format!(
-        "cannot pick free filename for {original} in {}",
-        target_dir.display()
-    )))
-}
-
 fn filename_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let path = after_scheme.split_once('/').map(|(_, rest)| rest)?;
@@ -268,12 +211,12 @@ fn filename_from_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use async_trait::async_trait;
     use brook_core::{
-        Download,
-        DownloadSpec,
+        File,
+        FileSpec,
         InspectError,
         InspectReport,
         THttpInspect,
@@ -298,7 +241,6 @@ mod tests {
 
     fn defaults() -> DownloadDefaults {
         DownloadDefaults {
-            workers: 4,
             piece_target_count: 128,
             piece_size_min: 16 * 1024 * 1024,
             piece_size_max: 128 * 1024 * 1024,
@@ -323,18 +265,18 @@ mod tests {
     /// до `set_inspect_fields`).
     async fn build<I: THttpInspect + ?Sized + Send + Sync + 'static>(
         inspect: Arc<I>,
-        spec: &DownloadSpec,
+        spec: &FileSpec,
     ) -> (
         SharedDb,
         Arc<SqliteFileRepository>,
         Arc<SqlitePieceRepository>,
-        DownloadId,
+        FileId,
         LocalPieceStorageFactory<I>,
     ) {
         let db = SharedDb::open_in_memory().unwrap();
         let files = Arc::new(SqliteFileRepository::new(db.clone()));
         let pieces = Arc::new(SqlitePieceRepository::new(db.clone()));
-        let d = Download::new(DownloadId::new(), spec.clone());
+        let d = File::new(FileId::new(), spec.clone());
         let id = d.id;
         files.insert(&d).await.unwrap();
         let factory = LocalPieceStorageFactory::new(
@@ -349,15 +291,10 @@ mod tests {
     #[tokio::test]
     async fn prepare_uses_spec_filename_first() {
         let dir = tempdir().unwrap();
-        let spec = DownloadSpec {
+        let spec = FileSpec {
             url: "https://host/path/server.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: Some("explicit.bin".into()),
-            workers: 2,
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: Default::default(),
         };
         let (_db, _files, _pieces, id, factory) = build(
             inspect_with(Some(1024 * 1024), Some("from-header.bin")),
@@ -384,15 +321,10 @@ mod tests {
     #[tokio::test]
     async fn prepare_falls_back_to_report_filename() {
         let dir = tempdir().unwrap();
-        let spec = DownloadSpec {
+        let spec = FileSpec {
             url: "https://host/path/server.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: None,
-            workers: 2,
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: Default::default(),
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(2048), Some("from-header.bin")), &spec).await;
@@ -403,15 +335,10 @@ mod tests {
     #[tokio::test]
     async fn prepare_falls_back_to_url_tail() {
         let dir = tempdir().unwrap();
-        let spec = DownloadSpec {
+        let spec = FileSpec {
             url: "https://host/path/server.bin?x=1".into(),
             target_dir: dir.path().to_path_buf(),
             filename: None,
-            workers: 2,
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: Default::default(),
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(2048), None), &spec).await;
@@ -422,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_allows_unknown_size() {
         let dir = tempdir().unwrap();
-        let spec = DownloadSpec::new("https://host/f.bin", dir.path());
+        let spec = FileSpec::new("https://host/f.bin", dir.path());
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(None, Some("f.bin")), &spec).await;
         let prepared = factory.prepare(id, &spec).await.unwrap();
@@ -437,61 +364,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_respects_piece_size_override() {
+    async fn prepare_uses_daemon_piece_size() {
         let dir = tempdir().unwrap();
-        let spec = DownloadSpec {
+        let spec = FileSpec {
             url: "https://host/f.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: Some("f.bin".into()),
-            workers: 1,
-            piece_target_count: Some(64),
-            piece_size_min: Some(1024 * 1024),
-            piece_size_max: Some(1024 * 1024),
-            on_file_exists_override: Default::default(),
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(64 * 1024 * 1024), Some("f.bin")), &spec).await;
         let prepared = factory.prepare(id, &spec).await.unwrap();
+        // 64 MiB / 128 = 512 KiB → clamp(min=16 MiB) = 16 MiB.
         match prepared.mode {
-            PreparedMode::Known { piece_size, .. } => assert_eq!(piece_size, 1024 * 1024),
+            PreparedMode::Known { piece_size, .. } => assert_eq!(piece_size, 16 * 1024 * 1024),
             PreparedMode::Streaming => panic!("expected Known"),
         }
     }
 
     #[tokio::test]
-    async fn prepare_rejects_invalid_power_of_two() {
-        let dir = tempdir().unwrap();
-        let spec = DownloadSpec {
-            url: "https://host/f.bin".into(),
-            target_dir: dir.path().to_path_buf(),
-            filename: Some("f.bin".into()),
-            workers: 1,
-            piece_target_count: Some(8),
-            piece_size_min: Some(3 * 1024 * 1024),
-            piece_size_max: Some(16 * 1024 * 1024),
-            on_file_exists_override: Default::default(),
-        };
-        let (_db, _files, _pieces, id, factory) =
-            build(inspect_with(Some(4 * 1024 * 1024), Some("f.bin")), &spec).await;
-        let err = match factory.prepare(id, &spec).await {
-            Err(e) => e,
-            Ok(_) => panic!("expected error"),
-        };
-        assert!(err.to_string().contains("power of two"), "{err}");
-    }
-
-    #[tokio::test]
     async fn prepare_persists_inspect_fields() {
         let dir = tempdir().unwrap();
-        let spec = DownloadSpec {
+        let spec = FileSpec {
             url: "https://host/f.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: Some("f.bin".into()),
-            workers: 1,
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: Default::default(),
         };
         let (_db, files, _pieces, id, factory) =
             build(inspect_with(Some(64 * 1024 * 1024), Some("f.bin")), &spec).await;
@@ -525,95 +421,40 @@ mod tests {
         assert_eq!(filename_from_url("https://a").as_deref(), None);
     }
 
-    // Use PathBuf to silence unused-import lints across platforms.
-    #[allow(dead_code)]
-    fn _unused(_: PathBuf) {}
-
-    fn spec_for(dir: &Path, filename: &str, policy: OnFileExistsOverride) -> DownloadSpec {
-        DownloadSpec {
+    fn spec_for(dir: &Path, filename: &str) -> FileSpec {
+        FileSpec {
             url: "https://host/f.bin".into(),
             target_dir: dir.to_path_buf(),
             filename: Some(filename.into()),
-            workers: 1,
-            piece_target_count: None,
-            piece_size_min: None,
-            piece_size_max: None,
-            on_file_exists_override: policy,
         }
     }
 
     #[tokio::test]
-    async fn on_file_exists_unspecified_errors_when_target_present() {
+    async fn errors_with_file_exists_when_target_present() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("f.bin"), b"old").unwrap();
-        let spec = spec_for(dir.path(), "f.bin", OnFileExistsOverride::Unspecified);
+        let spec = spec_for(dir.path(), "f.bin");
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(1024), Some("f.bin")), &spec).await;
         let err = match factory.prepare(id, &spec).await {
             Err(e) => e,
-            Ok(_) => panic!("expected FileExists"),
+            Ok(_) => panic!("expected FileExists error"),
         };
         assert!(
-            matches!(err, brook_core::Error::FileExists { .. }),
-            "expected FileExists, got {err:?}"
+            matches!(&err, Error::FileExists { filename } if filename == "f.bin"),
+            "got {err:?}"
         );
+        // Существующий файл не трогаем — политика строго «ошибка».
         assert_eq!(std::fs::read(dir.path().join("f.bin")).unwrap(), b"old");
     }
 
     #[tokio::test]
-    async fn on_file_exists_rename_picks_free_candidate() {
+    async fn keeps_filename_when_target_absent() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("f.bin"), b"old").unwrap();
-        std::fs::write(dir.path().join("f (1).bin"), b"other").unwrap();
-        let spec = spec_for(dir.path(), "f.bin", OnFileExistsOverride::Rename);
-        let (_db, _files, _pieces, id, factory) =
-            build(inspect_with(Some(1024), Some("f.bin")), &spec).await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
-        assert_eq!(prepared.resolved_filename, "f (2).bin");
-        assert_eq!(std::fs::read(dir.path().join("f.bin")).unwrap(), b"old");
-        assert_eq!(
-            std::fs::read(dir.path().join("f (1).bin")).unwrap(),
-            b"other"
-        );
-    }
-
-    #[tokio::test]
-    async fn on_file_exists_overwrite_removes_existing_file() {
-        let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("f.bin"), b"old").unwrap();
-        let spec = spec_for(dir.path(), "f.bin", OnFileExistsOverride::Overwrite);
+        let spec = spec_for(dir.path(), "f.bin");
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(1024), Some("f.bin")), &spec).await;
         let prepared = factory.prepare(id, &spec).await.unwrap();
         assert_eq!(prepared.resolved_filename, "f.bin");
-        assert!(!dir.path().join("f.bin").exists());
-        assert!(dir.path().join("f.bin.data.brook").exists());
-    }
-
-    #[tokio::test]
-    async fn on_file_exists_unspecified_passes_when_target_absent() {
-        let dir = tempdir().unwrap();
-        let spec = spec_for(dir.path(), "f.bin", OnFileExistsOverride::Unspecified);
-        let (_db, _files, _pieces, id, factory) =
-            build(inspect_with(Some(1024), Some("f.bin")), &spec).await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
-        assert_eq!(prepared.resolved_filename, "f.bin");
-    }
-
-    #[test]
-    fn pick_free_name_handles_no_extension() {
-        let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("foo"), b"").unwrap();
-        assert_eq!(pick_free_name(dir.path(), "foo").unwrap(), "foo (1)");
-    }
-
-    #[test]
-    fn pick_free_name_uses_last_extension() {
-        let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("a.tar.gz"), b"").unwrap();
-        assert_eq!(
-            pick_free_name(dir.path(), "a.tar.gz").unwrap(),
-            "a.tar (1).gz"
-        );
     }
 }

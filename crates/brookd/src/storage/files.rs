@@ -6,14 +6,13 @@
 //!
 //! ## Раскладка по таблицам
 //!
-//! Одна доменная `Download` ложится в три таблицы новой схемы
+//! Одна доменная `File` ложится в три таблицы новой схемы
 //! (см. [`docs/schema.dbml`]):
 //!
 //! - `files` — «шапка»: `id`, `url`, `target_dir`, `filename`,
 //!   текущее `status_id`, `created_at`.
-//! - `file_settings` (1:1) — override-поля spec'а (`workers`,
-//!   `piece_*`) + inspect-поля (`total_size`, `piece_size`, `etag`,
-//!   `last_modified`; NULL до stage 6, когда их пишет фабрика).
+//! - `file_settings` (1:1) — inspect-поля (`total_size`, `piece_size`,
+//!   `etag`, `last_modified`; NULL до stage 6, когда их пишет фабрика).
 //! - `status_changes` — полный аудит переходов: `reason_code_id` +
 //!   `reason_message` живут только тут; колонки в `files` их не дублируют.
 //!
@@ -41,14 +40,12 @@ use std::time::{
 };
 
 use brook_core::{
-    Download,
-    DownloadId,
-    DownloadSpec,
     Error,
     FailureReason,
+    File,
+    FileId,
+    FileSpec,
     FileStatus,
-    OnFileExistsOverride,
-    Progress,
     Result as CoreResult,
     TQueueStore,
 };
@@ -125,7 +122,7 @@ impl SqliteFileRepository {
     /// (stage 6). 0 строк ⇒ `NotFound`.
     pub async fn set_inspect_fields(
         &self,
-        id: DownloadId,
+        id: FileId,
         total_size: Option<u64>,
         piece_size: Option<u64>,
         etag: Option<String>,
@@ -148,7 +145,7 @@ impl SqliteFileRepository {
 
     /// Прочитать inspect-поля. `Ok(None)` — файл есть, но поля ещё
     /// не заполнены (до первого `prepare`). `Err(NotFound)` — файла нет.
-    pub async fn get_inspect_fields(&self, id: DownloadId) -> CoreResult<Option<InspectFields>> {
+    pub async fn get_inspect_fields(&self, id: FileId) -> CoreResult<Option<InspectFields>> {
         run(&self.db, move |c| get_inspect_fields_impl(c, id)).await
     }
 }
@@ -156,15 +153,12 @@ impl SqliteFileRepository {
 // ─── TQueueStore ────────────────────────────────────────────────────────
 
 impl TQueueStore for SqliteFileRepository {
-    fn load_all(&self) -> impl std::future::Future<Output = CoreResult<Vec<Download>>> + Send {
+    fn load_all(&self) -> impl std::future::Future<Output = CoreResult<Vec<File>>> + Send {
         let db = self.db.clone();
         async move { run(&db, load_all_impl).await }
     }
 
-    fn insert(
-        &self,
-        download: &Download,
-    ) -> impl std::future::Future<Output = CoreResult<()>> + Send {
+    fn insert(&self, download: &File) -> impl std::future::Future<Output = CoreResult<()>> + Send {
         let db = self.db.clone();
         let d = download.clone();
         async move { run(&db, move |c| insert_impl(c, &d)).await }
@@ -172,7 +166,7 @@ impl TQueueStore for SqliteFileRepository {
 
     fn update_status(
         &self,
-        id: DownloadId,
+        id: FileId,
         state: FileStatus,
         reason: Option<FailureReason>,
     ) -> impl std::future::Future<Output = CoreResult<()>> + Send {
@@ -185,7 +179,7 @@ impl TQueueStore for SqliteFileRepository {
         }
     }
 
-    fn remove(&self, id: DownloadId) -> impl std::future::Future<Output = CoreResult<()>> + Send {
+    fn remove(&self, id: FileId) -> impl std::future::Future<Output = CoreResult<()>> + Send {
         let db = self.db.clone();
         async move { run(&db, move |c| remove_impl(c, id)).await }
     }
@@ -208,7 +202,7 @@ where
 
 // ─── Sync implementations (spawn_blocking) ──────────────────────────────
 
-fn insert_impl(conn: &mut Connection, d: &Download) -> FilesResult<()> {
+fn insert_impl(conn: &mut Connection, d: &File) -> FilesResult<()> {
     let target_dir = path_to_str(&d.spec.target_dir)?;
     let created_at = unix_secs(d.created_at);
 
@@ -238,16 +232,9 @@ fn insert_impl(conn: &mut Connection, d: &Download) -> FilesResult<()> {
 
     tx.execute(
         "INSERT INTO file_settings
-           (file_id, workers, piece_target_count, piece_size_min, piece_size_max,
-            total_size, piece_size, etag, last_modified, effective_url)
-         VALUES (?,?,?,?,?, NULL, NULL, NULL, NULL, NULL)",
-        params![
-            d.id.to_string(),
-            d.spec.workers as i64,
-            d.spec.piece_target_count.map(|v| v as i64),
-            d.spec.piece_size_min.map(|v| v as i64),
-            d.spec.piece_size_max.map(|v| v as i64),
-        ],
+           (file_id, total_size, piece_size, etag, last_modified, effective_url)
+         VALUES (?, NULL, NULL, NULL, NULL, NULL)",
+        params![d.id.to_string()],
     )?;
 
     insert_status_change(&tx, d.id, d.status, None, created_at)?;
@@ -258,7 +245,7 @@ fn insert_impl(conn: &mut Connection, d: &Download) -> FilesResult<()> {
 
 fn update_status_impl(
     conn: &mut Connection,
-    id: DownloadId,
+    id: FileId,
     state: FileStatus,
     reason: Option<FailureReason>,
 ) -> FilesResult<()> {
@@ -280,7 +267,7 @@ fn update_status_impl(
 
 fn insert_status_change(
     tx: &Transaction<'_>,
-    id: DownloadId,
+    id: FileId,
     state: FileStatus,
     reason: Option<&FailureReason>,
     at: i64,
@@ -303,7 +290,7 @@ fn insert_status_change(
     Ok(())
 }
 
-fn remove_impl(conn: &mut Connection, id: DownloadId) -> FilesResult<()> {
+fn remove_impl(conn: &mut Connection, id: FileId) -> FilesResult<()> {
     let n = conn.execute("DELETE FROM files WHERE id = ?", params![id.to_string()])?;
     if n == 0 {
         return Err(FilesError::NotFound);
@@ -311,10 +298,9 @@ fn remove_impl(conn: &mut Connection, id: DownloadId) -> FilesResult<()> {
     Ok(())
 }
 
-fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<Download>> {
+fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at,
-                s.workers, s.piece_target_count, s.piece_size_min, s.piece_size_max
+        "SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at
          FROM files f
          JOIN file_settings s ON s.file_id = f.id
          ORDER BY f.created_at",
@@ -328,10 +314,6 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<Download>> {
                 filename: row.get(3)?,
                 status: row.get(4)?,
                 created_at: row.get::<_, i64>(5)?,
-                workers: row.get::<_, i64>(6)? as u32,
-                piece_target_count: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
-                piece_size_min: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-                piece_size_max: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -364,7 +346,7 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<Download>> {
 
 fn set_inspect_fields_impl(
     conn: &mut Connection,
-    id: DownloadId,
+    id: FileId,
     total_size: Option<u64>,
     piece_size: Option<u64>,
     etag: Option<String>,
@@ -392,7 +374,7 @@ fn set_inspect_fields_impl(
 
 fn get_inspect_fields_impl(
     conn: &mut Connection,
-    id: DownloadId,
+    id: FileId,
 ) -> FilesResult<Option<InspectFields>> {
     // Разделяем «файла нет» и «inspect ещё не заполнен»:
     // отсутствие строки в `file_settings` — NotFound; NULL в total_size —
@@ -452,45 +434,34 @@ struct RawRow {
     filename: Option<String>,
     status: String,
     created_at: i64,
-    workers: u32,
-    piece_target_count: Option<u32>,
-    piece_size_min: Option<u64>,
-    piece_size_max: Option<u64>,
 }
 
 fn row_to_download(
     r: RawRow,
     updated_at: i64,
     last_reason_message: Option<String>,
-) -> FilesResult<Download> {
-    let id: DownloadId =
+) -> FilesResult<File> {
+    let id: FileId =
         r.id.parse()
             .map_err(|e| FilesError::Corrupt(format!("id: {e}")))?;
     let status: FileStatus = r
         .status
         .parse()
         .map_err(|e| FilesError::Corrupt(format!("status: {e}")))?;
-    let spec = DownloadSpec {
+    let spec = FileSpec {
         url: r.url,
         target_dir: PathBuf::from(r.target_dir),
         filename: r.filename,
-        workers: r.workers,
-        piece_target_count: r.piece_target_count,
-        piece_size_min: r.piece_size_min,
-        piece_size_max: r.piece_size_max,
-        // Override-хинт — transient, не персистится.
-        on_file_exists_override: OnFileExistsOverride::Unspecified,
     };
     let error = if matches!(status, FileStatus::Failed) {
         last_reason_message
     } else {
         None
     };
-    Ok(Download {
+    Ok(File {
         id,
         spec,
         status,
-        progress: Progress::default(),
         attempt: 0,
         error,
         created_at: from_unix_secs(r.created_at),
@@ -525,10 +496,10 @@ mod tests {
     use std::path::PathBuf;
 
     use brook_core::{
-        Download,
-        DownloadId,
-        DownloadSpec,
         FailureReason,
+        File,
+        FileId,
+        FileSpec,
         FileStatus,
         ReasonCode,
         TQueueStore,
@@ -536,18 +507,13 @@ mod tests {
 
     use super::*;
 
-    fn sample_download() -> Download {
-        let spec = DownloadSpec {
+    fn sample_download() -> File {
+        let spec = FileSpec {
             url: "https://example.com/file.bin".into(),
             target_dir: PathBuf::from("/tmp/brook"),
             filename: Some("file.bin".into()),
-            workers: 4,
-            piece_target_count: Some(256),
-            piece_size_min: Some(8 * 1024 * 1024),
-            piece_size_max: Some(64 * 1024 * 1024),
-            on_file_exists_override: Default::default(),
         };
-        Download::new(DownloadId::new(), spec)
+        File::new(FileId::new(), spec)
     }
 
     fn fresh_repo() -> (SharedDb, SqliteFileRepository) {
@@ -718,7 +684,7 @@ mod tests {
     async fn update_status_missing_is_not_found() {
         let (_db, repo) = fresh_repo();
         let err = repo
-            .update_status(DownloadId::new(), FileStatus::Paused, None)
+            .update_status(FileId::new(), FileStatus::Paused, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound));
@@ -727,7 +693,7 @@ mod tests {
     #[tokio::test]
     async fn remove_missing_is_not_found() {
         let (_db, repo) = fresh_repo();
-        let err = repo.remove(DownloadId::new()).await.unwrap_err();
+        let err = repo.remove(FileId::new()).await.unwrap_err();
         assert!(matches!(err, Error::NotFound));
     }
 
@@ -833,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopen_preserves_override_fields() {
+    async fn reopen_preserves_spec_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("brook.db");
         let d = sample_download();
@@ -849,10 +815,6 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         let got = &loaded[0];
         assert_eq!(got.id, id);
-        assert_eq!(got.spec.workers, 4);
-        assert_eq!(got.spec.piece_target_count, Some(256));
-        assert_eq!(got.spec.piece_size_min, Some(8 * 1024 * 1024));
-        assert_eq!(got.spec.piece_size_max, Some(64 * 1024 * 1024));
         assert_eq!(got.spec.filename.as_deref(), Some("file.bin"));
     }
 }

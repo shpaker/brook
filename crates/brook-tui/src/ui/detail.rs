@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use brook_proto::brook::v1::DownloadStatus;
+use brook_proto::brook::v1::FileStatus;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{
@@ -52,28 +52,10 @@ fn build_lines(row: &DownloadRow, width: usize) -> Vec<Line<'static>> {
         }
         p.display().to_string()
     };
-    let pieces_line = if row.progress.pieces_total <= 1 {
-        "single-stream (no Range)".to_string()
-    } else {
-        let piece_size = if row.progress.pieces_total > 0 && row.progress.bytes_total > 0 {
-            row.progress.bytes_total / row.progress.pieces_total as u64
-        } else {
-            0
-        };
-        format!(
-            "{} / {}  ·  piece_size {}",
-            row.progress.pieces_done,
-            row.progress.pieces_total,
-            format::bytes(piece_size)
-        )
-    };
-
-    let mut lines = vec![
-        labelled("url    ", url),
-        labelled("path   ", path),
-        labelled("pieces ", pieces_line),
-    ];
-    if row.status == DownloadStatus::Failed {
+    // Piece-агрегаты в ProgressTick больше не едут — UI показывает
+    // только байтовый прогресс; строчку `pieces` временно опускаем.
+    let mut lines = vec![labelled("url    ", url), labelled("path   ", path)];
+    if row.status == FileStatus::Failed {
         let err = row.error.clone().unwrap_or_default();
         lines.push(Line::from(vec![
             Span::styled(" error  ", Style::default().fg(Color::Red)),
