@@ -159,6 +159,25 @@ pub fn resume(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
     });
 }
 
+pub fn retry(ch: Channel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
+    run_bulk(ch, tx, ids, "retry", |mut client, req| {
+        Box::pin(async move { client.retry(req).await.map(|_| ()) })
+    });
+}
+
+/// macOS Finder reveal: `open -R <path>`. Ошибки игнорируем —
+/// «открыть» не часть контракта UI, а удобство.
+pub fn reveal_in_finder(target_dir: &str, filename: &str) {
+    if target_dir.is_empty() || filename.is_empty() {
+        return;
+    }
+    let path = std::path::Path::new(target_dir).join(filename);
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
+}
+
 /// Remove идемпотентен на стороне демона (см. `manager::remove`): ghost
 /// id даст `Ok`. Успешно обработанные id отдаём UI, чтобы тот дропнул
 /// их из ViewModel — событий по удалению демон не генерит.

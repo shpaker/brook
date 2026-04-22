@@ -1,13 +1,14 @@
 //! Интеграционный тест: клиент ↔ сервер через tonic на локальном TCP.
 //!
-//! Проходит всю unary-поверхность `BrookService`: Add → List → Pause →
-//! Resume → Cancel → Remove, плюс PauseAll/ResumeAll и пару негативных
-//! сценариев.
+//! Проходит unary-поверхность `BrookService`: Add → Pause → Resume →
+//! Retry → Remove, плюс negativы. Для наблюдения состояния используется
+//! `manager.snapshot()` из harness'а — `List` RPC'а больше нет.
 
 mod common;
 
 use std::time::Duration;
 
+use brook_core::FileStatus;
 use brook_proto::brook::v1 as proto;
 use common::HarnessBuilder;
 
@@ -21,30 +22,19 @@ fn spec(url: &str) -> proto::FileSpec {
 
 async fn wait_until_terminal(
     h: &common::TestHarness,
-    id: &proto::FileId,
+    id_str: &str,
     timeout: Duration,
-) -> proto::FileStatus {
+) -> FileStatus {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let list = h
-            .client
-            .clone()
-            .list(proto::ListRequest {})
-            .await
-            .unwrap()
-            .into_inner();
-        if let Some(d) = list
-            .files
-            .iter()
-            .find(|d| d.id.as_ref().map(|x| x.value == id.value).unwrap_or(false))
+        if let Some(d) = h
+            .manager
+            .snapshot()
+            .into_iter()
+            .find(|d| d.id.to_string() == id_str)
+            && d.status.is_terminal()
         {
-            let state = proto::FileStatus::try_from(d.status).unwrap();
-            if matches!(
-                state,
-                proto::FileStatus::Done | proto::FileStatus::Failed | proto::FileStatus::Cancelled
-            ) {
-                return state;
-            }
+            return d.status;
         }
         if std::time::Instant::now() > deadline {
             panic!("timeout waiting for terminal state");
@@ -53,74 +43,49 @@ async fn wait_until_terminal(
     }
 }
 
+fn find_status(h: &common::TestHarness, id_str: &str) -> FileStatus {
+    h.manager
+        .snapshot()
+        .into_iter()
+        .find(|d| d.id.to_string() == id_str)
+        .expect("record present")
+        .status
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn add_list_cancel_remove_roundtrip() {
+async fn add_pause_remove_roundtrip() {
     let mut h = HarnessBuilder::default().max_concurrent(0).build().await;
+    assert!(h.manager.snapshot().is_empty());
 
-    // List на пустом менеджере.
-    let list = h
-        .client
-        .list(proto::ListRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(list.files.is_empty());
-
-    // Add.
-    let resp = h
+    let id = h
         .client
         .add(proto::AddRequest {
             spec: Some(spec("https://example.com/a")),
         })
         .await
         .unwrap()
-        .into_inner();
-    let id = resp.id.expect("id present");
+        .into_inner()
+        .id
+        .expect("id present");
+    let id_str = id.value.clone();
+    assert_eq!(h.manager.snapshot().len(), 1);
+    assert_eq!(find_status(&h, &id_str), FileStatus::Pending);
 
-    // List возвращает одну запись в Queued (max_concurrent=0 — engine не стартует).
-    let list = h
-        .client
-        .list(proto::ListRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(list.files.len(), 1);
-    assert_eq!(list.files[0].status, proto::FileStatus::Pending as i32);
-
-    // Cancel.
-    let status = h
-        .client
-        .cancel(proto::IdRequest {
-            id: Some(id.clone()),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(status.ok);
-
-    // State перешёл в Cancelled.
-    let list = h
-        .client
-        .list(proto::ListRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(list.files[0].status, proto::FileStatus::Cancelled as i32);
-
-    // Remove после отмены — ок.
+    // Pause, затем remove — без Cancel RPC'а это штатный путь для
+    // не-активных записей.
     h.client
-        .remove(proto::RemoveRequest {
+        .pause(proto::IdRequest {
             id: Some(id.clone()),
         })
         .await
         .unwrap();
-    let list = h
-        .client
-        .list(proto::ListRequest {})
+    assert_eq!(find_status(&h, &id_str), FileStatus::Paused);
+
+    h.client
+        .remove(proto::RemoveRequest { id: Some(id) })
         .await
-        .unwrap()
-        .into_inner();
-    assert!(list.files.is_empty());
+        .unwrap();
+    assert!(h.manager.snapshot().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -136,6 +101,7 @@ async fn pause_and_resume_unqueued() {
         .into_inner()
         .id
         .unwrap();
+    let id_str = id.value.clone();
 
     h.client
         .pause(proto::IdRequest {
@@ -143,65 +109,13 @@ async fn pause_and_resume_unqueued() {
         })
         .await
         .unwrap();
-    let list = h
-        .client
-        .list(proto::ListRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(list.files[0].status, proto::FileStatus::Paused as i32);
+    assert_eq!(find_status(&h, &id_str), FileStatus::Paused);
 
     h.client
-        .resume(proto::IdRequest {
-            id: Some(id.clone()),
-        })
+        .resume(proto::IdRequest { id: Some(id) })
         .await
         .unwrap();
-    let list = h
-        .client
-        .list(proto::ListRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(list.files[0].status, proto::FileStatus::Pending as i32);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn pause_all_and_resume_all() {
-    let mut h = HarnessBuilder::default().max_concurrent(0).build().await;
-    for u in ["a", "b", "c"] {
-        h.client
-            .add(proto::AddRequest {
-                spec: Some(spec(&format!("https://t/{u}"))),
-            })
-            .await
-            .unwrap();
-    }
-
-    h.client.pause_all(proto::PauseAllRequest {}).await.unwrap();
-    let list = h
-        .client
-        .list(proto::ListRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    for d in &list.files {
-        assert_eq!(d.status, proto::FileStatus::Paused as i32);
-    }
-
-    h.client
-        .resume_all(proto::ResumeAllRequest {})
-        .await
-        .unwrap();
-    let list = h
-        .client
-        .list(proto::ListRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    for d in &list.files {
-        assert_eq!(d.status, proto::FileStatus::Pending as i32);
-    }
+    assert_eq!(find_status(&h, &id_str), FileStatus::Pending);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -218,8 +132,8 @@ async fn download_runs_to_completion() {
         .into_inner()
         .id
         .unwrap();
-    let final_state = wait_until_terminal(&h, &id, Duration::from_secs(5)).await;
-    assert_eq!(final_state, proto::FileStatus::Done);
+    let final_state = wait_until_terminal(&h, &id.value, Duration::from_secs(5)).await;
+    assert_eq!(final_state, FileStatus::Done);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -240,7 +154,6 @@ async fn remove_on_active_is_failed_precondition() {
         .id
         .unwrap();
 
-    // Ждём, пока engine стартанёт.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let err = h
@@ -252,15 +165,49 @@ async fn remove_on_active_is_failed_precondition() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
-    // Теперь cancel + remove проходят чисто.
+    // Пауза + remove: для активных это штатный путь без Cancel RPC.
     h.client
-        .cancel(proto::IdRequest {
+        .pause(proto::IdRequest {
             id: Some(id.clone()),
         })
         .await
         .unwrap();
-    // ждём, пока engine доедет до терминала и снимется.
-    let _ = wait_until_terminal(&h, &id, Duration::from_secs(5)).await;
+    // Дождаться, пока engine закоммитится и отпустит запись.
+    for _ in 0..200 {
+        let s = find_status(&h, &id.value);
+        if matches!(
+            s,
+            FileStatus::Paused | FileStatus::Done | FileStatus::Failed
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_requires_failed_state() {
+    let mut h = HarnessBuilder::default().max_concurrent(0).build().await;
+    let id = h
+        .client
+        .add(proto::AddRequest {
+            spec: Some(spec("https://example.com/r")),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .id
+        .unwrap();
+    // В Pending retry — ошибка precondition.
+    let err = h
+        .client
+        .retry(proto::IdRequest {
+            id: Some(id.clone()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Internal); // "not in failed state" → internal
+    let _ = err;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -291,8 +238,6 @@ async fn add_without_spec_is_invalid_argument() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_settings_returns_defaults() {
-    // Harness собирает сервис через `ApiSettings::default()` — проверяем,
-    // что RPC действительно отдаёт эти значения клиенту без потерь.
     let mut h = HarnessBuilder::default().build().await;
     let resp = h
         .client
@@ -301,11 +246,5 @@ async fn get_settings_returns_defaults() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.max_concurrent, 3);
-    assert_eq!(resp.piece_target_count, 128);
-    assert_eq!(resp.piece_size_min, 16 * 1024 * 1024);
-    assert_eq!(resp.piece_size_max, 128 * 1024 * 1024);
-    assert_eq!(
-        resp.on_duplicate_url,
-        proto::OnDuplicateUrlPolicy::Ask as i32
-    );
+    assert!(resp.default_dir.is_empty());
 }

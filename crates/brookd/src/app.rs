@@ -63,7 +63,6 @@ use tracing::{
 use crate::config::{
     DEFAULT_CONFIG_FILENAME,
     DaemonRuntime,
-    OnDuplicateUrl,
     Settings,
 };
 use crate::storage::db::SharedDb;
@@ -267,20 +266,10 @@ pub async fn serve(runtime: Runtime, shutdown: impl Future<Output = ()> + Send) 
 }
 
 /// Перевод `DaemonRuntime` в транспортный снимок для `BrookService::GetSettings`.
-/// Здесь же — маппинг YAML-enum'ов в proto-эквиваленты.
 fn api_settings(rt: &DaemonRuntime) -> ApiSettings {
-    use brook_proto::brook::v1 as proto;
     ApiSettings {
         default_dir: rt.default_dir.to_string_lossy().into_owned(),
         max_concurrent: rt.max_concurrent as u32,
-        piece_target_count: rt.defaults.piece_target_count,
-        piece_size_min: rt.defaults.piece_size_min,
-        piece_size_max: rt.defaults.piece_size_max,
-        on_duplicate_url: match rt.on_duplicate_url {
-            OnDuplicateUrl::Ask => proto::OnDuplicateUrlPolicy::Ask,
-            OnDuplicateUrl::Skip => proto::OnDuplicateUrlPolicy::Skip,
-            OnDuplicateUrl::Add => proto::OnDuplicateUrlPolicy::Add,
-        },
     }
 }
 

@@ -55,17 +55,13 @@ where
     shutdown_tx: broadcast::Sender<()>,
 }
 
-/// Рантайм-снимок `brook.yaml` + `DownloadDefaults`, которым обслуживается
-/// `GetSettings`. `brookd` собирает его из `DaemonRuntime` на старте; в
-/// тестах `default()` даёт разумные значения.
+/// Рантайм-снимок `brook.yaml`, которым обслуживается `GetSettings`.
+/// `brookd` собирает его из `DaemonRuntime` на старте; в тестах
+/// `default()` даёт разумные значения.
 #[derive(Debug, Clone)]
 pub struct ApiSettings {
     pub default_dir: String,
     pub max_concurrent: u32,
-    pub piece_target_count: u32,
-    pub piece_size_min: u64,
-    pub piece_size_max: u64,
-    pub on_duplicate_url: proto::OnDuplicateUrlPolicy,
 }
 
 impl Default for ApiSettings {
@@ -73,10 +69,6 @@ impl Default for ApiSettings {
         Self {
             default_dir: String::new(),
             max_concurrent: 3,
-            piece_target_count: 128,
-            piece_size_min: 16 * 1024 * 1024,
-            piece_size_max: 128 * 1024 * 1024,
-            on_duplicate_url: proto::OnDuplicateUrlPolicy::Ask,
         }
     }
 }
@@ -120,19 +112,6 @@ where
     WR: TWorkerRepo + Send + Sync + 'static,
     AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
-    async fn list(
-        &self,
-        _req: Request<proto::ListRequest>,
-    ) -> Result<Response<proto::ListResponse>, Status> {
-        let files = self
-            .manager
-            .snapshot()
-            .iter()
-            .map(mapper::file_to_proto)
-            .collect();
-        Ok(Response::new(proto::ListResponse { files }))
-    }
-
     async fn add(
         &self,
         req: Request<proto::AddRequest>,
@@ -188,35 +167,13 @@ where
         Ok(ok_status())
     }
 
-    async fn cancel(
+    async fn retry(
         &self,
         req: Request<proto::IdRequest>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
         let id = mapper::id_from_proto_opt(req.into_inner().id.as_ref())?;
         self.manager
-            .cancel(id)
-            .await
-            .map_err(mapper::core_err_to_status)?;
-        Ok(ok_status())
-    }
-
-    async fn pause_all(
-        &self,
-        _req: Request<proto::PauseAllRequest>,
-    ) -> Result<Response<proto::StatusResponse>, Status> {
-        self.manager
-            .pause_all()
-            .await
-            .map_err(mapper::core_err_to_status)?;
-        Ok(ok_status())
-    }
-
-    async fn resume_all(
-        &self,
-        _req: Request<proto::ResumeAllRequest>,
-    ) -> Result<Response<proto::StatusResponse>, Status> {
-        self.manager
-            .resume_all()
+            .retry(id)
             .await
             .map_err(mapper::core_err_to_status)?;
         Ok(ok_status())
@@ -230,10 +187,6 @@ where
         Ok(Response::new(proto::GetSettingsResponse {
             default_dir: s.default_dir.clone(),
             max_concurrent: s.max_concurrent,
-            piece_target_count: s.piece_target_count,
-            piece_size_min: s.piece_size_min,
-            piece_size_max: s.piece_size_max,
-            on_duplicate_url: s.on_duplicate_url as i32,
         }))
     }
 

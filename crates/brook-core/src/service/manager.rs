@@ -513,6 +513,38 @@ where
         }
     }
 
+    /// Перезапустить упавшую загрузку: `Failed` → `Pending`, сбрасываем
+    /// текст ошибки и продвигаем очередь. На не-`Failed` записи — ошибка:
+    /// retry — это явный пользовательский жест после терминального падения.
+    pub async fn retry(&self, id: FileId) -> Result<()> {
+        {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
+            if record.status != FileStatus::Failed {
+                return Err(Error::Other("download is not in failed state".into()));
+            }
+            record.status = FileStatus::Pending;
+            record.error = None;
+            record.updated_at = SystemTime::now();
+            if !inner.waiting.iter().any(|x| *x == id) {
+                inner.waiting.push_back(id);
+            }
+            let _ = self
+                .shared
+                .lifecycle_tx
+                .send(FileLifecycleEvent::StatusChanged {
+                    id,
+                    status: FileStatus::Pending,
+                });
+        }
+        self.shared
+            .queue
+            .update_status(id, FileStatus::Pending, None)
+            .await?;
+        self.try_spawn_next().await;
+        Ok(())
+    }
+
     /// Возобновить все `Paused`.
     pub async fn resume_all(&self) -> Result<()> {
         let ids: Vec<FileId> = {
