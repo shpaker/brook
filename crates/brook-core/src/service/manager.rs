@@ -314,21 +314,35 @@ where
         Ok(id)
     }
 
-    /// Удалить загрузку. Разрешено только для терминальных/не-активных.
-    /// Для активных (running engine) — `Err`: сначала `cancel`.
+    /// Удалить загрузку. Работает в любом состоянии: если engine активен
+    /// (running/paused) — сначала шлём `Cancel` и ждём, пока fan-in task
+    /// снимет запись из `engines`, затем чистим records/waiting/queue.
     ///
     /// Идемпотентно: если id ни в records, ни в queue — тоже Ok. Это важно
     /// для клиента, у которого в ViewModel может остаться «призрак»
     /// (например, при рассинхроне после рестарта демона): повторный
     /// `Remove` должен починить состояние, а не ругаться NotFound'ом.
     pub async fn remove(&self, id: FileId) -> Result<()> {
+        let was_active = {
+            let inner = self.shared.inner.lock().expect("mutex poisoned");
+            if let Some(handle) = inner.engines.get(&id) {
+                handle.cancel();
+                true
+            } else {
+                false
+            }
+        };
+        if was_active {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let inner = self.shared.inner.lock().expect("mutex poisoned");
+                if !inner.engines.contains_key(&id) {
+                    break;
+                }
+            }
+        }
         let was_known = {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-            if inner.engines.contains_key(&id) {
-                return Err(Error::Other(
-                    "download is active, cancel before remove".into(),
-                ));
-            }
             let had_record = inner.records.remove(&id).is_some();
             inner.waiting.retain(|x| *x != id);
             had_record
@@ -965,7 +979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_blocked_for_active_download() {
+    async fn remove_cancels_active_download() {
         let factory = Arc::new(MemoryPieceStorageFactory::new(3, 20));
         let queue = Arc::new(MemoryTQueueStore::new());
         let fetch = Arc::new(
@@ -976,15 +990,13 @@ mod tests {
             events_capacity: 64,
             engine: fast_engine_config(),
         };
-        let mgr = DownloadManager::new(factory, queue, fetch, cfg);
+        let mgr = DownloadManager::new(factory, queue.clone(), fetch, cfg);
         let id = mgr.add(spec("https://t/slow")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        // Пока engine активен — remove должен отказать.
-        let err = mgr.remove(id).await.unwrap_err();
-        assert!(matches!(err, Error::Other(_)));
-        mgr.cancel(id).await.unwrap();
-        wait_for_terminal(&mgr, id).await;
+        // Remove активного файла сам дергает cancel и ждёт завершения engine.
         mgr.remove(id).await.unwrap();
+        assert!(mgr.snapshot().iter().all(|d| d.id != id));
+        assert!(queue.load_all().await.unwrap().iter().all(|d| d.id != id));
     }
 
     #[tokio::test]
