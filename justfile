@@ -31,6 +31,12 @@ run *ARGS:
 run-server *ARGS:
     cargo run -p brook -- server {{ARGS}}
 
+# Остановить локальный `brook server` в CWD (SIGTERM по .brook.lock)
+stop-server:
+    @PID="$(lsof -t .brook.lock 2>/dev/null || true)"; \
+    if [ -n "$PID" ]; then kill -TERM $PID && echo "sent SIGTERM to $PID"; \
+    else echo "no brook server holds .brook.lock in $(pwd)"; fi
+
 # === test ===
 
 # Прогнать все тесты workspace

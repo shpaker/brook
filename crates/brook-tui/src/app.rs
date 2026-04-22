@@ -33,6 +33,7 @@ use crate::model::{
     AddModal,
     ConnectionState,
     Mode,
+    RenameModal,
     ViewModel,
 };
 use crate::{
@@ -170,16 +171,31 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
             }
         }
         CmdOutcome::AddAccepted { renamed_to } => {
-            if matches!(vm.mode, Mode::Add(_)) {
+            if matches!(vm.mode, Mode::Add(_) | Mode::RenameOnConflict { .. }) {
                 vm.mode = Mode::Normal;
             }
             if let Some(name) = renamed_to {
                 vm.set_toast(format!("saved as {name}"));
             }
         }
+        CmdOutcome::AddConflict { base_name, form } => {
+            // Если rename-модалка уже открыта (повторный конфликт после
+            // редактирования пользователем) — просто бампим счётчик. Иначе
+            // открываем новую поверх Add-модалки.
+            if let Mode::RenameOnConflict { modal } = &mut vm.mode {
+                modal.bump();
+                modal.error = Some(format!("name is taken, bumped to ({})", modal.counter));
+            } else {
+                vm.mode = Mode::RenameOnConflict {
+                    modal: RenameModal::new(base_name, form),
+                };
+            }
+        }
         CmdOutcome::Error(msg) => {
             if let Mode::Add(m) = &mut vm.mode {
                 m.error = Some(msg);
+            } else if let Mode::RenameOnConflict { modal } = &mut vm.mode {
+                modal.error = Some(msg);
             } else {
                 vm.set_toast(msg);
             }
@@ -231,6 +247,10 @@ fn handle_key(
         }
         Mode::Ghost { .. } => {
             handle_key_ghost(vm, k, channel.clone(), tx.clone());
+            false
+        }
+        Mode::RenameOnConflict { .. } => {
+            handle_key_rename(vm, k, channel.clone(), tx.clone());
             false
         }
         Mode::QuitConfirm => handle_key_quit_confirm(vm, k, channel.clone(), tx.clone()),
@@ -356,7 +376,34 @@ fn handle_key_add(
                 return;
             }
             let form = AddForm { url, folder };
-            command::add(channel, tx, form);
+            command::add(channel, tx, form, None);
+        }
+        _ => {}
+    }
+}
+
+fn handle_key_rename(
+    vm: &mut ViewModel,
+    k: KeyEvent,
+    channel: AuthedChannel,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) {
+    let Mode::RenameOnConflict { modal } = &mut vm.mode else {
+        return;
+    };
+    match k.code {
+        KeyCode::Esc => vm.mode = Mode::Normal,
+        KeyCode::Backspace => modal.backspace(),
+        KeyCode::Char(c) => modal.insert_char(c),
+        KeyCode::Enter => {
+            let name = modal.name.trim().to_string();
+            if name.is_empty() {
+                modal.error = Some("name is required".into());
+                return;
+            }
+            let form = modal.form.clone();
+            modal.error = None;
+            command::add(channel, tx, form, Some(name));
         }
         _ => {}
     }
@@ -385,7 +432,7 @@ fn handle_key_duplicate(
         }
         KeyCode::Char('a') => {
             vm.mode = Mode::Normal;
-            command::add(channel, tx, form);
+            command::add(channel, tx, form, None);
         }
         _ => {}
     }
@@ -466,7 +513,7 @@ fn handle_key_ghost(
             vm.drop_rows(&ids);
             vm.mode = Mode::Normal;
             for form in forms {
-                command::add(channel.clone(), tx.clone(), form);
+                command::add(channel.clone(), tx.clone(), form, None);
             }
         }
         _ => {}
@@ -479,7 +526,7 @@ fn handle_key_quit_confirm(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
-    // Три варианта (docs/ux.md → раздел «Quit»):
+    // Три варианта quit-модалки:
     //   s        — выход с остановкой демона (Shutdown RPC → Quit)
     //   k / Enter — выход без остановки демона (демон продолжает работать)
     //   Esc      — отмена, остаёмся в TUI
