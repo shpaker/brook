@@ -192,6 +192,9 @@ pub fn core_err_to_status(e: brook_core::Error) -> Status {
         E::FileExists { filename } => {
             Status::already_exists(format!("file already exists: {filename}"))
         }
+        E::PathEscapesRoot { attempted } => {
+            Status::permission_denied(format!("target_dir is outside sandbox root: {attempted}"))
+        }
         E::Io(ref io) => Status::internal(format!("io error: {io}")),
         E::Other(msg) => {
             // Пользовательские precondition-ошибки (`pause/resume` у

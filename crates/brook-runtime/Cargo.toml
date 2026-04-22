@@ -1,0 +1,14 @@
+[package]
+name    = "brook-runtime"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "brook_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow     = { workspace = true }
+tempfile   = { workspace = true }

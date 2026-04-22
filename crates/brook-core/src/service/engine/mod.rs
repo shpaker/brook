@@ -97,7 +97,7 @@ use crate::service::retry::RetryPolicy;
 /// всё остальное (offset и размер конкретного куска) выводится:
 /// `offset(idx) = idx * piece_size`, `size(idx) = min(piece_size,
 /// total_size - offset(idx))`. Явная раскладка (`Vec<PieceLayout>`)
-/// живёт в адаптере ([`brookd::storage::plan`]) — ему она нужна для
+/// живёт в адаптере ([`brook_daemon::storage::plan`]) — ему она нужна для
 /// преаллокации и SQLite-индекса.
 #[derive(Debug, Clone)]
 pub struct EngineInputs {

@@ -2,7 +2,7 @@
 //!
 //! `ReasonCode` — закрытый набор категорий, совпадающий 1:1 со
 //! справочником `reason_codes` в `brook.db` (см.
-//! `crates/brookd/src/storage/db.rs`). Natural-key: строковое имя
+//! `crates/brook-daemon/src/storage/db.rs`). Natural-key: строковое имя
 //! варианта (`network`, `timeout`, ...) — это и PK в БД, и
 //! сериализация в логах/API.
 //!
@@ -82,7 +82,10 @@ impl ReasonCode {
             // raw_os_error работает на всех unix.
             Error::Io(io) if io.raw_os_error() == Some(28) => Self::DiskFull,
             Error::Io(_) => Self::Network,
-            Error::NotFound | Error::FileExists { .. } | Error::Other(_) => Self::Unknown,
+            Error::NotFound
+            | Error::FileExists { .. }
+            | Error::PathEscapesRoot { .. }
+            | Error::Other(_) => Self::Unknown,
         }
     }
 }

@@ -22,8 +22,8 @@ use crossterm::event::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
-use tonic::transport::Channel;
 
+use crate::connect::AuthedChannel;
 use crate::events::{
     AddForm,
     CmdOutcome,
@@ -45,9 +45,10 @@ const TICK: Duration = Duration::from_millis(250);
 
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    channel: Channel,
+    channel: AuthedChannel,
     settings: GetSettingsResponse,
     port: u16,
+    can_stop_daemon: bool,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
 
@@ -87,7 +88,7 @@ pub async fn run(
         let _ = signal_tx.send(UiEvent::Quit);
     });
 
-    let mut vm = ViewModel::new(port, settings);
+    let mut vm = ViewModel::new(port, settings, can_stop_daemon);
     terminal.draw(|f| ui::draw(f, &vm)).context("draw")?;
 
     while let Some(ev) = rx.recv().await {
@@ -115,7 +116,7 @@ pub async fn run(
 fn handle_event(
     vm: &mut ViewModel,
     ev: UiEvent,
-    channel: &Channel,
+    channel: &AuthedChannel,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
     match ev {
@@ -202,7 +203,7 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
 fn handle_key(
     vm: &mut ViewModel,
     k: KeyEvent,
-    channel: &Channel,
+    channel: &AuthedChannel,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
     // Глобальный Ctrl+C — выход.
@@ -224,12 +225,12 @@ fn handle_key(
             handle_key_confirm(vm, k, channel.clone(), tx.clone());
             false
         }
-        Mode::Ghost { .. } => {
-            handle_key_ghost(vm, k, channel.clone(), tx.clone());
+        Mode::ConfirmRetry { .. } => {
+            handle_key_confirm_retry(vm, k, channel.clone(), tx.clone());
             false
         }
-        Mode::Help { .. } => {
-            handle_key_help(vm, k);
+        Mode::Ghost { .. } => {
+            handle_key_ghost(vm, k, channel.clone(), tx.clone());
             false
         }
         Mode::QuitConfirm => handle_key_quit_confirm(vm, k, channel.clone(), tx.clone()),
@@ -239,35 +240,22 @@ fn handle_key(
 fn handle_key_normal(
     vm: &mut ViewModel,
     k: KeyEvent,
-    channel: &Channel,
+    channel: &AuthedChannel,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
-    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
     let visible_len = vm.visible_ids().len();
     match k.code {
         KeyCode::Char('q') => {
             vm.mode = Mode::QuitConfirm;
             return false;
         }
-        KeyCode::Char('?') => vm.mode = Mode::Help { scroll: 0 },
-        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+        KeyCode::Up | KeyCode::Char('k') => {
             vm.cursor = vm.cursor.saturating_sub(1);
-            if shift {
-                vm.extend_selection(visible_len);
-            }
         }
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+        KeyCode::Down | KeyCode::Char('j') => {
             vm.cursor = vm.cursor.saturating_add(1);
             vm.clamp_cursor(visible_len);
-            if shift {
-                vm.extend_selection(visible_len);
-            }
         }
-        KeyCode::Char('g') => vm.cursor = 0,
-        KeyCode::Char('G') => {
-            vm.cursor = visible_len.saturating_sub(1);
-        }
-        KeyCode::Tab => vm.toggle_select_here(),
         KeyCode::Char(' ') => primary_action(vm, channel, tx),
         KeyCode::Enter => reveal_cursor(vm),
         KeyCode::Char('a') => {
@@ -287,26 +275,31 @@ fn handle_key_normal(
 }
 
 /// Space на курсоре: действие зависит от статуса строки (зеркалит
-/// `<action>`-глиф из карточки). Мультиселекшн игнорируем — глиф
-/// специфичен для одной строки.
-fn primary_action(vm: &ViewModel, channel: &Channel, tx: &mpsc::UnboundedSender<UiEvent>) {
+/// `<action>`-глиф из карточки). Для Failed — открывает модалку
+/// подтверждения вместо молчаливого retry.
+fn primary_action(
+    vm: &mut ViewModel,
+    channel: &AuthedChannel,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) {
     use brook_proto::brook::v1::FileStatus as S;
     let visible = vm.visible_ids();
     let Some(id) = visible.get(vm.cursor.min(visible.len().saturating_sub(1))) else {
         return;
     };
-    let Some(row) = vm.downloads.get(id) else {
+    let id = id.clone();
+    let Some(row) = vm.downloads.get(&id) else {
         return;
     };
     match row.status {
         S::Running | S::Retrying | S::Pending => {
-            command::pause(channel.clone(), tx.clone(), vec![id.clone()]);
+            command::pause(channel.clone(), tx.clone(), vec![id]);
         }
         S::Paused => {
-            command::resume(channel.clone(), tx.clone(), vec![id.clone()]);
+            command::resume(channel.clone(), tx.clone(), vec![id]);
         }
         S::Failed => {
-            command::retry(channel.clone(), tx.clone(), vec![id.clone()]);
+            vm.mode = Mode::ConfirmRetry { ids: vec![id] };
         }
         S::Done => {
             command::reveal_in_finder(&row.target_dir, &row.filename);
@@ -328,7 +321,7 @@ fn reveal_cursor(vm: &ViewModel) {
 fn handle_key_add(
     vm: &mut ViewModel,
     k: KeyEvent,
-    channel: Channel,
+    channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
     let Mode::Add(m) = &mut vm.mode else {
@@ -372,7 +365,7 @@ fn handle_key_add(
 fn handle_key_duplicate(
     vm: &mut ViewModel,
     k: KeyEvent,
-    channel: Channel,
+    channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
     let Mode::Duplicate { form, existing_id } = &vm.mode else {
@@ -401,7 +394,7 @@ fn handle_key_duplicate(
 fn handle_key_confirm(
     vm: &mut ViewModel,
     k: KeyEvent,
-    channel: Channel,
+    channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
     let Mode::ConfirmDelete { ids } = &vm.mode else {
@@ -418,10 +411,30 @@ fn handle_key_confirm(
     }
 }
 
+fn handle_key_confirm_retry(
+    vm: &mut ViewModel,
+    k: KeyEvent,
+    channel: AuthedChannel,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) {
+    let Mode::ConfirmRetry { ids } = &vm.mode else {
+        return;
+    };
+    let ids = ids.clone();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            vm.mode = Mode::Normal;
+            command::retry(channel, tx, ids);
+        }
+        _ => {}
+    }
+}
+
 fn handle_key_ghost(
     vm: &mut ViewModel,
     k: KeyEvent,
-    channel: Channel,
+    channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
     let Mode::Ghost { ids } = &vm.mode else {
@@ -463,19 +476,22 @@ fn handle_key_ghost(
 fn handle_key_quit_confirm(
     vm: &mut ViewModel,
     k: KeyEvent,
-    channel: Channel,
+    channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
     // Три варианта (docs/ux.md → раздел «Quit»):
     //   s        — выход с остановкой демона (Shutdown RPC → Quit)
     //   k / Enter — выход без остановки демона (демон продолжает работать)
     //   Esc      — отмена, остаёмся в TUI
+    // Пункт «s» скрыт, если `can_stop_daemon = false` (remote или
+    // внешне запущенный локальный демон) — мы его не поднимали, нам
+    // его и не гасить.
     match k.code {
         KeyCode::Esc => {
             vm.mode = Mode::Normal;
             false
         }
-        KeyCode::Char('s') | KeyCode::Char('S') => {
+        KeyCode::Char('s') | KeyCode::Char('S') if vm.can_stop_daemon => {
             // Сам RPC уходит в фон; по его завершении в канал падает
             // `UiEvent::Quit` и мы выйдем из цикла. Даже если Shutdown
             // ответил ошибкой — закрываемся, чтобы не зависнуть в
@@ -486,21 +502,6 @@ fn handle_key_quit_confirm(
         }
         KeyCode::Enter | KeyCode::Char('k') | KeyCode::Char('K') => true,
         _ => false,
-    }
-}
-
-fn handle_key_help(vm: &mut ViewModel, k: KeyEvent) {
-    let Mode::Help { scroll } = &mut vm.mode else {
-        return;
-    };
-    // §6.7: Esc/?/q всегда закрывают; стрелки листают при маленьком
-    // экране (контент всё равно влезает — скролл будет безобидным); любая
-    // другая клавиша закрывает без побочного эффекта на список.
-    match k.code {
-        KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => vm.mode = Mode::Normal,
-        KeyCode::Up => *scroll = scroll.saturating_sub(1),
-        KeyCode::Down => *scroll = scroll.saturating_add(1),
-        _ => vm.mode = Mode::Normal,
     }
 }
 

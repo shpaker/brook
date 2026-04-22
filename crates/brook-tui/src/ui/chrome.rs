@@ -1,10 +1,10 @@
 //! Top/bottom titles для внешней rounded-рамки.
 //!
-//! Обе «шапки» живут как `Line`-титулы `Block`'а — через `title` и
-//! `title_bottom`. Формат — pipe-tab'ы `| brook |` / `| ? help |`,
-//! визуально «нашитые» на рамку. Toast подменяет нижний титул на
-//! время своей жизни.
+//! Обе «шапки» — `Line`-титулы `Block`'а (`title` / `title_bottom`).
+//! Верх: `[ brook | 127.0.0.1:<port> ]`, низ: `[ ␣ action | a add | d
+//! delete | ? help ]`. Toast подменяет нижний хинт-бар своей строкой.
 
+use brook_proto::brook::v1::FileStatus;
 use ratatui::layout::Alignment;
 use ratatui::style::{
     Color,
@@ -28,43 +28,75 @@ fn accent(s: impl Into<String>) -> Span<'static> {
     Span::styled(s.into(), Style::default().fg(Color::Cyan))
 }
 
-/// Верхний титул: `| brook |  ...  127.0.0.1:<port>  <●|◐|○>`.
-/// Во время reconnect адрес подменяется на `reconnecting · #N`,
-/// при offline — на `offline · <reason>`.
+/// Верхний титул: `[ brook | 127.0.0.1:<port> ]`. При reconnect/offline
+/// во втором сегменте показывается причина, а не адрес.
 pub fn top_title(vm: &ViewModel) -> Line<'static> {
-    let (glyph, glyph_style, tail): (&str, Style, String) = match &vm.connection {
+    let (tail, tail_style): (String, Style) = match &vm.connection {
         ConnectionState::Connected => (
-            "●",
-            Style::default().fg(Color::Green),
             format!("127.0.0.1:{}", vm.port),
+            Style::default().fg(Color::DarkGray),
         ),
         ConnectionState::Reconnecting { attempt } => (
-            "◐",
-            Style::default().fg(Color::Yellow),
             format!("reconnecting · #{attempt}"),
+            Style::default().fg(Color::Yellow),
         ),
         ConnectionState::Disconnected { reason } => (
-            "○",
-            Style::default().fg(Color::Red),
             format!("offline · {}", short_reason(reason)),
+            Style::default().fg(Color::Red),
         ),
     };
 
     Line::from(vec![
-        dim("| "),
+        dim("[ "),
         accent("brook"),
-        dim(" |  "),
-        dim(tail),
-        Span::raw(" "),
-        Span::styled(glyph.to_string(), glyph_style),
-        dim(" "),
+        dim(" | "),
+        Span::styled(tail, tail_style),
+        dim(" ]"),
     ])
     .alignment(Alignment::Left)
 }
 
-/// `| ? help |` tab — всегда справа в нижней рамке.
-pub fn help_tab() -> Line<'static> {
-    Line::from(vec![dim(" | "), accent("?"), dim(" help"), dim(" | ")]).alignment(Alignment::Right)
+/// Нижний хинт-бар: `[ ␣ <verb> | a add | d delete | ? help ]`.
+/// `<verb>` зависит от статуса строки под курсором — pause/resume/
+/// retry/reveal; если действия нет (Cancelled или пустой список) —
+/// рисуем `—`, чтобы ширина бара оставалась предсказуемой.
+pub fn hints_bar(action_word: &str) -> Line<'static> {
+    Line::from(vec![
+        dim("[ "),
+        accent("␣"),
+        dim(format!(" {action_word} ")),
+        dim("| "),
+        accent("a"),
+        dim(" add "),
+        dim("| "),
+        accent("d"),
+        dim(" delete "),
+        dim("| "),
+        accent("?"),
+        dim(" help "),
+        dim("]"),
+    ])
+    .alignment(Alignment::Right)
+}
+
+/// Конкретный глагол для `␣ <verb>` в хинт-баре. Берётся по статусу
+/// строки под курсором, чтобы пользователь видел что именно сейчас
+/// сделает Space.
+pub fn action_word(vm: &ViewModel) -> &'static str {
+    let visible = vm.visible_ids();
+    let Some(id) = visible.get(vm.cursor.min(visible.len().saturating_sub(1))) else {
+        return "—";
+    };
+    let Some(row) = vm.downloads.get(id) else {
+        return "—";
+    };
+    match row.status {
+        FileStatus::Running | FileStatus::Retrying | FileStatus::Pending => "pause",
+        FileStatus::Paused => "resume",
+        FileStatus::Failed => "retry",
+        FileStatus::Done => "reveal",
+        FileStatus::Cancelled | FileStatus::Unspecified => "—",
+    }
 }
 
 /// Toast-подпись слева в нижней рамке. Показывается, пока `vm.toast`

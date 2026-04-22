@@ -32,6 +32,7 @@ use brook_core::{
     RangeGuard,
     Result,
     THttpInspect,
+    TPathPolicy,
     TPieceStorageFactory,
 };
 
@@ -53,32 +54,41 @@ use crate::config::DownloadDefaults;
 /// Параметризуется реализацией [`THttpInspect`] — в тестах это мок, в
 /// бинаре — `brook_http::HttpInspectClient`. Держит [`Arc`]-ссылки на
 /// общие SQLite-репозитории; клонирование фабрики дешёвое.
-pub struct LocalPieceStorageFactory<I: THttpInspect + ?Sized> {
+///
+/// Политика путей ([`TPathPolicy`]) обязательна: любой `spec.target_dir`
+/// проходит через неё до первого I/O. В тестах подставляется no-op-
+/// реализация (`AllowAnyPath`), в проде — `ClampedPathPolicy` с
+/// корнем из `--directory`.
+pub struct LocalPieceStorageFactory<I: THttpInspect + ?Sized, P: TPathPolicy + ?Sized> {
     inspect: Arc<I>,
     defaults: DownloadDefaults,
     pieces_repo: Arc<SqlitePieceRepository>,
     files_repo: Arc<SqliteFileRepository>,
+    policy: Arc<P>,
 }
 
-impl<I: THttpInspect + ?Sized> LocalPieceStorageFactory<I> {
+impl<I: THttpInspect + ?Sized, P: TPathPolicy + ?Sized> LocalPieceStorageFactory<I, P> {
     pub fn new(
         inspect: Arc<I>,
         defaults: DownloadDefaults,
         pieces_repo: Arc<SqlitePieceRepository>,
         files_repo: Arc<SqliteFileRepository>,
+        policy: Arc<P>,
     ) -> Self {
         Self {
             inspect,
             defaults,
             pieces_repo,
             files_repo,
+            policy,
         }
     }
 }
 
-impl<I> TPieceStorageFactory for LocalPieceStorageFactory<I>
+impl<I, P> TPieceStorageFactory for LocalPieceStorageFactory<I, P>
 where
     I: THttpInspect + ?Sized + Send + Sync + 'static,
+    P: TPathPolicy + ?Sized + 'static,
 {
     type Storage = LocalPieceStorage;
     type StreamStorage = LocalStreamStorage;
@@ -96,8 +106,13 @@ where
         let defaults = self.defaults;
         let pieces_repo = Arc::clone(&self.pieces_repo);
         let files_repo = Arc::clone(&self.files_repo);
+        let policy = Arc::clone(&self.policy);
         let spec = spec.clone();
         async move {
+            // Клэмп target_dir первым — до любого сетевого/дискового I/O.
+            // Escape — ошибка, которая маппится в PermissionDenied.
+            let target_dir = policy.check_target_dir(&spec.target_dir)?;
+
             let report = inspect
                 .inspect(&spec.url)
                 .await
@@ -105,7 +120,7 @@ where
 
             let filename = resolve_filename(&spec, report.filename.as_deref())?;
             validate_filename(&filename).map_err(|e| Error::Other(format!("filename: {e}")))?;
-            if spec.target_dir.join(&filename).exists() {
+            if target_dir.join(&filename).exists() {
                 return Err(Error::FileExists { filename });
             }
 
@@ -133,7 +148,7 @@ where
                         .await?;
 
                     let storage = LocalPieceStorage::open(
-                        &spec.target_dir,
+                        &target_dir,
                         &filename,
                         id,
                         total_size,
@@ -169,8 +184,7 @@ where
                             effective_url.clone(),
                         )
                         .await?;
-                    let stream =
-                        LocalStreamStorage::open_streaming(&spec.target_dir, &filename).await?;
+                    let stream = LocalStreamStorage::open_streaming(&target_dir, &filename).await?;
                     Ok(PreparedDownload {
                         mode: PreparedMode::Streaming,
                         piece_storage: None,
@@ -211,7 +225,10 @@ fn filename_from_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{
+        Path,
+        PathBuf,
+    };
 
     use async_trait::async_trait;
     use brook_core::{
@@ -236,6 +253,16 @@ mod tests {
     impl THttpInspect for MockInspect {
         async fn inspect(&self, _url: &str) -> std::result::Result<InspectReport, InspectError> {
             Ok(self.report.clone())
+        }
+    }
+
+    /// No-op политика для юнит-тестов: отдаёт путь как есть, без sandbox-
+    /// проверок. Прод использует `ClampedPathPolicy`, но для проверки
+    /// именно фабричной логики sandbox только мешает.
+    struct AllowAnyPath;
+    impl brook_core::TPathPolicy for AllowAnyPath {
+        fn check_target_dir(&self, target_dir: &Path) -> brook_core::Result<PathBuf> {
+            Ok(target_dir.to_path_buf())
         }
     }
 
@@ -271,7 +298,7 @@ mod tests {
         Arc<SqliteFileRepository>,
         Arc<SqlitePieceRepository>,
         FileId,
-        LocalPieceStorageFactory<I>,
+        LocalPieceStorageFactory<I, AllowAnyPath>,
     ) {
         let db = SharedDb::open_in_memory().unwrap();
         let files = Arc::new(SqliteFileRepository::new(db.clone()));
@@ -284,6 +311,7 @@ mod tests {
             defaults(),
             Arc::clone(&pieces),
             Arc::clone(&files),
+            Arc::new(AllowAnyPath),
         );
         (db, files, pieces, id, factory)
     }

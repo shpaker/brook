@@ -1,21 +1,18 @@
 [package]
-name    = "brookd"
+name    = "brook-daemon"
 version.workspace = true
 edition.workspace = true
 
 [lib]
-name = "brookd"
+name = "brook_daemon"
 path = "src/lib.rs"
-
-[[bin]]
-name = "brookd"
-path = "src/main.rs"
 
 [dependencies]
 brook-core = { path = "../brook-core" }
 brook-http = { path = "../brook-http" }
 brook-api  = { path = "../brook-api" }
 brook-proto = { path = "../brook-proto" }
+brook-runtime = { path = "../brook-runtime" }
 tokio      = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic      = { workspace = true }
@@ -29,6 +26,7 @@ fs4        = { workspace = true }
 serde      = { workspace = true }
 serde_yaml = { workspace = true }
 directories = { workspace = true }
+clap       = { workspace = true }
 
 [dev-dependencies]
 tempfile    = { workspace = true }

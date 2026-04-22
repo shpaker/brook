@@ -3,8 +3,8 @@
 //! Это outbound-порты в смысле Hexagonal Architecture: ядро — клиент
 //! (оно *вызывает* эти трейты), а реализация-адаптер — сервер (SQLite,
 //! файловая система, S3, in-memory для тестов). Адаптеры живут **вне**
-//! `brook-core` — в `brookd` или в отдельных крейтах; ядро не знает про
-//! их существование.
+//! `brook-core` — в `brook-daemon` или в отдельных крейтах; ядро не знает
+//! про их существование.
 //!
 //! Соседи по слою:
 //! - `piece_storage` — запись и индексирование кусков одной загрузки.
@@ -18,6 +18,7 @@
 
 pub mod http;
 pub mod noop_repos;
+pub mod path_policy;
 pub mod piece_attempt_repo;
 pub mod piece_storage;
 pub mod queue_store;
@@ -36,6 +37,7 @@ pub use noop_repos::{
     NoopAttemptRepo,
     NoopWorkerRepo,
 };
+pub use path_policy::TPathPolicy;
 pub use piece_attempt_repo::{
     AttemptRecord,
     TPieceAttemptRepo,

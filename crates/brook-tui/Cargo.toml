@@ -3,12 +3,13 @@ name    = "brook-tui"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "brook"
-path = "src/main.rs"
+[lib]
+name = "brook_tui"
+path = "src/lib.rs"
 
 [dependencies]
-brook-proto  = { path = "../brook-proto" }
+brook-proto   = { path = "../brook-proto" }
+brook-runtime = { path = "../brook-runtime" }
 tonic        = { workspace = true }
 tokio        = { workspace = true }
 tokio-stream = { workspace = true }
@@ -19,3 +20,5 @@ clap         = { workspace = true }
 indexmap     = { workspace = true }
 futures-util = { workspace = true }
 arboard      = { workspace = true }
+directories  = { workspace = true }
+rpassword    = { workspace = true }

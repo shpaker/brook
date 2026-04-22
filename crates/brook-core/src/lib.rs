@@ -7,7 +7,7 @@
 //! - *Services* (этап 1.3+) — application-координаторы `DownloadManager`
 //!   и `DownloadEngine`. Появятся в `src/service/`.
 //! - *Adapters* — реализации `ports` — живут **вне** `brook-core`:
-//!   SQLite/HTTP — в `brookd`, gRPC — в `brook-api`.
+//!   SQLite — в `brook-daemon`, HTTP — в `brook-http`, gRPC — в `brook-api`.
 //!
 //! Публичный API намеренно плоский: `brook_core::FileId`,
 //! `brook_core::TPieceStorage` и т.п. Внутренняя раскладка по папкам —
@@ -58,6 +58,7 @@ pub use ports::{
     RangeError,
     RangeGuard,
     THttpInspect,
+    TPathPolicy,
     TPieceAttemptRepo,
     TPieceStorage,
     TPieceStorageFactory,

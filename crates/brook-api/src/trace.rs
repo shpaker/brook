@@ -8,8 +8,8 @@
 //! - открываем `tracing::info_span!("grpc.request", ...)` — дочерние
 //!   core-операции автоматически наследуют корреляционные поля.
 //!
-//! В MVP это всё — никакого сбора метрик или логов тела. `brookd` в §4.2
-//! подключает интерцептор одной строкой:
+//! В MVP это всё — никакого сбора метрик или логов тела. Серверный стек
+//! в §4.2 подключает интерцептор одной строкой:
 //! `Server::builder().add_service(BrookServiceServer::with_interceptor(svc, trace_interceptor))`.
 
 use tonic::Status;
@@ -53,7 +53,7 @@ pub fn trace_interceptor(mut req: tonic::Request<()>) -> Result<tonic::Request<(
 
 /// Удобная обёртка: тип-маркер, реализующий `Interceptor`. Позволяет
 /// использовать `BrookServiceServer::with_interceptor(svc, TraceInterceptor)`
-/// на стороне `brookd`.
+/// на стороне `brook-daemon`.
 #[derive(Clone, Copy, Default)]
 pub struct TraceInterceptor;
 

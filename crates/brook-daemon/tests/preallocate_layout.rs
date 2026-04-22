@@ -3,11 +3,11 @@
 
 use std::fs::OpenOptions;
 
-use brookd::storage::fs::{
+use brook_daemon::storage::fs::{
     available_space,
     preallocate,
 };
-use brookd::storage::plan::{
+use brook_daemon::storage::plan::{
     PiecePlanConfig,
     plan_pieces,
 };

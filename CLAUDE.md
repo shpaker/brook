@@ -2,7 +2,7 @@
 
 ## 0. Workspace
 
-**brook** is a macOS download manager: Rust async core (`brook-core`), HTTP adapter (`brook-http`), gRPC API (`brook-api`), daemon (`brookd`), and ratatui TUI client (`brook`). Architecture: [docs/architecture.md](docs/architecture.md). Stack: [docs/stack.md](docs/stack.md).
+**brook** is a macOS download manager: Rust async core (`brook-core`), HTTP adapter (`brook-http`), gRPC API (`brook-api`), server stack (`brook-daemon`), and ratatui TUI client (`brook-tui`), all driven by a single `brook` binary with clap subcommands. Architecture: [docs/architecture.md](docs/architecture.md). Stack: [docs/stack.md](docs/stack.md).
 
 ### Crate layout
 
@@ -14,11 +14,19 @@ brook/
 │   ├── brook-proto/              # build.rs → prost + tonic stubs
 │   ├── brook-core/               # hexagonal core: domain + ports (+ services); no network, no disk
 │   ├── brook-http/               # HTTP adapter: reqwest + middleware, impls core's HTTP ports
-│   ├── brook-api/                # gRPC server (tonic), thin wrapper over core
-│   ├── brookd/                   # daemon binary: boots core + api + adapters, holds .brook.lock
-│   └── brook-tui/                # TUI binary (name: brook): ratatui gRPC client
+│   ├── brook-api/                # gRPC server (tonic) + bearer-auth interceptor
+│   ├── brook-runtime/            # shared daemon/TUI primitives: endpoint sidecar, constants
+│   ├── brook-daemon/             # lib: server stack (config, storage, bootstrap, sandbox)
+│   ├── brook-tui/                # lib: ratatui gRPC client
+│   └── brook/                    # the only [[bin]]: `brook` dispatch (TUI by default; `brook server …` = daemon)
 └── docs/
 ```
+
+### Invocation modes
+
+- `brook server --directory <DIR> [--host H] [--port P] [--client-pass …]` — daemon with mandatory sandbox root. Refuses non-loopback without `--client-pass` (also via `BROOK_CLIENT_PASS`).
+- `brook` — TUI to local daemon. Auto-spawns `brook server` if `.brook.endpoint` is missing or unreachable; offers to stop that daemon on quit.
+- `brook --remote HOST:PORT [--pass …]` — TUI to a remote daemon. Prompts for password on TTY when needed; never stops the remote daemon.
 
 ### Key commands
 
@@ -31,8 +39,10 @@ justfile знает про nightly-rustfmt, правильные флаги clip
 ```sh
 just                         # список доступных рецептов
 just build                   # сборка всего workspace
-just run-d                   # запустить brookd (CWD = рабочая директория)
-just run-tui                 # запустить TUI-клиент
+just run                     # brook (TUI-режим) с произвольными аргументами диспетчера
+just run-server -- --directory ~/Downloads   # brook server ... c аргументами
+just run-d                   # алиас на `brook server`
+just run-tui                 # алиас на TUI-режим `brook`
 just test                    # все тесты
 just test-p brook-core       # тесты одного крейта
 just fmt                     # nightly cargo fmt --all
@@ -51,8 +61,10 @@ just fix                     # clippy --fix + fmt
 
 | File | Purpose |
 |---|---|
-| `brook.db` | Config (`settings` table) + global download queue (SQLite) |
-| `.brook.lock` | Single-instance flock (held by `brookd`) |
+| `brook.yaml` | YAML config (global + per-download defaults) |
+| `brook.db` | Global download queue (SQLite, WAL) |
+| `.brook.lock` | Single-instance flock (held by `brook server`) |
+| `.brook.endpoint` | Sidecar with actual `{host, port}` — lets TUI discover ephemeral ports; removed on graceful shutdown |
 
 Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to the target file. The piece index, per-download settings and state history are rows in the shared `./brook.db` (tables `files`, `file_settings`, `state_changes`, `pieces` — see [docs/schema.dbml](docs/schema.dbml)).
 
@@ -80,7 +92,7 @@ Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to th
 ## Coding conventions
 
 - **Trait names** — prefix with `T`: `TPieceStorage`, `TQueueStore`, `TPieceStorageFactory`. Applies to all traits in every crate of this workspace.
-- **`brook-core` layout — Hexagonal (Ports & Adapters).** New domain types go into `crates/brook-core/src/domain/` (pure, no I/O, no external-world dependencies). New outbound traits — into `crates/brook-core/src/ports/`. Application services (coordinators like `DownloadManager`, `DownloadEngine`) — into `crates/brook-core/src/service/` (to be created at stage 1.3). Concrete adapters (SQLite, HTTP clients, gRPC) **never** live in `brook-core` — they belong in `brookd`, `brook-http`, `brook-api`, or other dedicated adapter crates. `brook-core` must not depend on `reqwest`, `rusqlite`, or any other I/O library; enforced by `cargo tree -p brook-core`. The public API of `brook-core` stays flat (`brook_core::DownloadId`, `brook_core::TPieceStorage`) — internal folders exist to keep layers from mixing, not to nest the API.
+- **`brook-core` layout — Hexagonal (Ports & Adapters).** New domain types go into `crates/brook-core/src/domain/` (pure, no I/O, no external-world dependencies). New outbound traits — into `crates/brook-core/src/ports/`. Application services (coordinators like `DownloadManager`, `DownloadEngine`) — into `crates/brook-core/src/service/` (to be created at stage 1.3). Concrete adapters (SQLite, HTTP clients, gRPC) **never** live in `brook-core` — they belong in `brook-daemon`, `brook-http`, `brook-api`, or other dedicated adapter crates. `brook-core` must not depend on `reqwest`, `rusqlite`, or any other I/O library; enforced by `cargo tree -p brook-core`. The public API of `brook-core` stays flat (`brook_core::DownloadId`, `brook_core::TPieceStorage`) — internal folders exist to keep layers from mixing, not to nest the API.
 - **DB access — only through repository structs.** Any SQLite manipulation in `brook.db` lives inside a dedicated repository struct. SQL strings and `rusqlite::Connection` usage never leak past the repository boundary — callers get domain methods, not queries.
 
 ## Formatting (Rust)

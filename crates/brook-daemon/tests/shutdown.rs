@@ -1,6 +1,6 @@
 //! Интеграционный тест §4.4 — graceful shutdown + persist-resume.
 //!
-//! Поднимает реальный `brookd` (в tempdir, с ephemeral-портом и
+//! Поднимает реальный `brook-daemon` (в tempdir, с ephemeral-портом и
 //! wiremock-бэкендом), добавляет загрузку, гасит демона через `oneshot` и
 //! проверяет, что после рестарта очередь видит тот же `FileId` и
 //! нормализованное состояние `Queued`.
@@ -17,15 +17,16 @@ use brook_core::{
     FileStatus,
     TQueueStore,
 };
-use brook_proto::brook::v1 as proto;
-use brook_proto::brook::v1::brook_service_client::BrookServiceClient;
-use brookd::app::{
+use brook_daemon::ServerArgs;
+use brook_daemon::app::{
     Paths,
     build_runtime,
     serve,
 };
-use brookd::storage::db::SharedDb;
-use brookd::storage::files::SqliteFileRepository;
+use brook_daemon::storage::db::SharedDb;
+use brook_daemon::storage::files::SqliteFileRepository;
+use brook_proto::brook::v1 as proto;
+use brook_proto::brook::v1::brook_service_client::BrookServiceClient;
 use rusqlite::params;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -133,9 +134,15 @@ async fn shutdown_persists_and_restart_resumes() {
     let server = mock_server(1024 * 1024).await;
     let url = format!("{}/f.bin", server.uri());
     let paths = Paths::in_dir(workdir.path());
+    let args = ServerArgs {
+        directory: downloads.path().to_path_buf(),
+        host: None,
+        port: None,
+        client_pass: None,
+    };
 
     // ── round 1: старт + Add + shutdown ────────────────────────────────
-    let runtime = build_runtime(&paths).await.expect("build_runtime");
+    let runtime = build_runtime(&paths, &args).await.expect("build_runtime");
     let addr = runtime.addr;
     let (tx, rx) = oneshot::channel::<()>();
     let serve_task = tokio::spawn(async move {
@@ -233,7 +240,9 @@ async fn shutdown_persists_and_restart_resumes() {
     }
 
     // ── round 2: рестарт → bootstrap нормализует в Queued ─────────────
-    let runtime2 = build_runtime(&paths).await.expect("restart build_runtime");
+    let runtime2 = build_runtime(&paths, &args)
+        .await
+        .expect("restart build_runtime");
     let manager2 = Arc::clone(&runtime2.manager);
     let (tx2, rx2) = oneshot::channel::<()>();
     let serve_task2 = tokio::spawn(async move {

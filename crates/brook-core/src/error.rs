@@ -31,6 +31,13 @@ pub enum Error {
     #[error("file already exists: {filename}")]
     FileExists { filename: String },
 
+    /// Клиент прислал `target_dir`, который после канонизации лежит вне
+    /// разрешённого корня (sandbox). Маппится на `PermissionDenied` на
+    /// проводе. `attempted` — то, что увидел сервер (в человекочитаемой
+    /// форме, уже лишённое симлинков).
+    #[error("path escapes sandbox root: {attempted}")]
+    PathEscapesRoot { attempted: String },
+
     /// Запасной вариант: ошибка, которую ещё не выделили в отдельный вариант.
     /// По мере взросления кода такие места заменяются на типизированные варианты.
     #[error("{0}")]

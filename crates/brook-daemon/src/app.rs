@@ -1,4 +1,4 @@
-//! Сборка и жизненный цикл демона `brookd`.
+//! Сборка и жизненный цикл демона (`brook server`).
 //!
 //! Вынесено из `main.rs`, чтобы интеграционные тесты могли запускать
 //! демон напрямую, подсовывая свои `shutdown`-сигналы вместо
@@ -36,9 +36,9 @@ use anyhow::{
 };
 use brook_api::{
     ApiSettings,
+    AuthInterceptor,
     BrookService,
     BrookServiceServer,
-    trace_interceptor,
 };
 use brook_core::{
     DownloadManager,
@@ -51,6 +51,8 @@ use brook_http::{
     HttpInspectClient,
     RangeFetchClient,
 };
+use brook_runtime::Endpoint;
+use brook_runtime::constants::ENDPOINT_FILENAME;
 use fs4::fs_std::FileExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -60,6 +62,7 @@ use tracing::{
     warn,
 };
 
+use crate::ServerArgs;
 use crate::config::{
     DEFAULT_CONFIG_FILENAME,
     DaemonRuntime,
@@ -70,6 +73,7 @@ use crate::storage::factory::LocalPieceStorageFactory;
 use crate::storage::files::SqliteFileRepository;
 use crate::storage::piece_attempts::SqlitePieceAttemptRepository;
 use crate::storage::pieces::SqlitePieceRepository;
+use crate::storage::sandbox::ClampedPathPolicy;
 use crate::storage::workers::SqliteWorkerRepository;
 
 /// Имя lock-файла в CWD (гарантирует single-instance).
@@ -81,7 +85,7 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Конкретные типы адаптеров, с которыми параметризуется менеджер в
 /// проде и интеграционных тестах.
-pub type ProdFactory = LocalPieceStorageFactory<HttpInspectClient>;
+pub type ProdFactory = LocalPieceStorageFactory<HttpInspectClient, ClampedPathPolicy>;
 pub type ProdQueue = SqliteFileRepository;
 pub type ProdFetch = RangeFetchClient;
 pub type ProdWorkerRepo = SqliteWorkerRepository;
@@ -97,6 +101,7 @@ pub struct Paths {
     pub lock: PathBuf,
     pub db: PathBuf,
     pub config: PathBuf,
+    pub endpoint: PathBuf,
 }
 
 impl Paths {
@@ -109,6 +114,7 @@ impl Paths {
             lock: dir.join(LOCK_FILENAME),
             db: dir.join(DB_FILENAME),
             config: dir.join(DEFAULT_CONFIG_FILENAME),
+            endpoint: dir.join(ENDPOINT_FILENAME),
         }
     }
 }
@@ -128,9 +134,26 @@ pub struct Runtime {
     /// Ресивер от `Shutdown` RPC. `serve` селектит его с внешним
     /// `shutdown`-фьючей (в проде — `SIGTERM`/`SIGINT`).
     pub rpc_shutdown_rx: broadcast::Receiver<()>,
+    /// Путь к sidecar-файлу `.brook.endpoint`. Пишем после `bind`,
+    /// удаляем в `serve` на выходе.
+    pub endpoint_path: PathBuf,
+    /// Ожидаемый bearer-пароль. `None` — auth отключена (loopback/dev).
+    pub client_pass: Option<Arc<String>>,
 }
 
-pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
+pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> {
+    // Песочница: канонизируем корень один раз тут, на старте. Если
+    // директории нет — создаём; это типичный сценарий первого запуска
+    // (`brook server --directory ~/Downloads/brook`, а такой папки нет).
+    if !args.directory.exists() {
+        std::fs::create_dir_all(&args.directory)
+            .with_context(|| format!("create sandbox root {}", args.directory.display()))?;
+    }
+    let policy = Arc::new(
+        ClampedPathPolicy::new(&args.directory)
+            .with_context(|| format!("canonicalize sandbox root {}", args.directory.display()))?,
+    );
+
     // 1. Lock (блокирует второй запуск в том же CWD).
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -141,7 +164,7 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         .with_context(|| format!("open lock {}", paths.lock.display()))?;
     FileExt::try_lock_exclusive(&lock).map_err(|_| {
         anyhow!(
-            "another brookd instance is already running ({})",
+            "another brook server instance is already running ({})",
             paths.lock.display()
         )
     })?;
@@ -183,6 +206,7 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         daemon.defaults,
         pieces_repo,
         Arc::clone(&files_repo),
+        Arc::clone(&policy),
     ));
 
     // 6. Manager + bootstrap.
@@ -200,13 +224,49 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
     ));
     manager.bootstrap().await.context("manager bootstrap")?;
 
-    let bind_addr = SocketAddr::new(daemon.api_bind, daemon.api_port);
+    // CLI host/port побеждают YAML. `0` — легальный ephemeral.
+    let host = args.host.unwrap_or(daemon.api_bind);
+    let port = args.port.unwrap_or(daemon.api_port);
+
+    // Non-loopback без пароля — боевая ошибка: тривиальный recipe
+    // «порт случайно открыт в сеть, ACL рулит, auth'а нет». Лучше
+    // отказаться стартовать, чем позволить любому добавлять загрузки.
+    let client_pass = args
+        .client_pass
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| Arc::new(s.to_owned()));
+    if !host.is_loopback() && client_pass.is_none() {
+        return Err(anyhow!(
+            "refusing to bind to {host} without --client-pass (set BROOK_CLIENT_PASS or pass --client-pass)"
+        ));
+    }
+
+    let bind_addr = SocketAddr::new(host, port);
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("bind gRPC listener on {bind_addr}"))?;
     let addr = listener.local_addr().context("local_addr")?;
+
+    // Sidecar-файл: TUI на localhost находит нас по нему, включая случай
+    // ephemeral-порта (`api.port = 0`). Пишем атомарно (tempfile +
+    // rename), чтобы читатель не увидел полу-записанный YAML.
+    let endpoint = Endpoint {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        pid: std::process::id(),
+    };
+    endpoint
+        .write_atomic(&paths.endpoint)
+        .with_context(|| format!("write endpoint {}", paths.endpoint.display()))?;
+
     let (rpc_shutdown_tx, rpc_shutdown_rx) = broadcast::channel(1);
-    let svc = BrookService::new(Arc::clone(&manager), api_settings(&daemon), rpc_shutdown_tx);
+    let svc = BrookService::new(
+        Arc::clone(&manager),
+        api_settings(&daemon),
+        policy,
+        rpc_shutdown_tx,
+    );
 
     Ok(Runtime {
         lock,
@@ -216,6 +276,8 @@ pub async fn build_runtime(paths: &Paths) -> Result<Runtime> {
         svc,
         listener,
         rpc_shutdown_rx,
+        endpoint_path: paths.endpoint.clone(),
+        client_pass,
     })
 }
 
@@ -232,6 +294,8 @@ pub async fn serve(runtime: Runtime, shutdown: impl Future<Output = ()> + Send) 
         svc,
         listener,
         mut rpc_shutdown_rx,
+        endpoint_path,
+        client_pass,
         ..
     } = runtime;
 
@@ -248,12 +312,13 @@ pub async fn serve(runtime: Runtime, shutdown: impl Future<Output = ()> + Send) 
         }
     };
 
+    let interceptor = AuthInterceptor::new(client_pass);
     let incoming = TcpListenerStream::new(listener);
     let server = tonic::transport::Server::builder()
-        .add_service(BrookServiceServer::with_interceptor(svc, trace_interceptor))
+        .add_service(BrookServiceServer::with_interceptor(svc, interceptor))
         .serve_with_incoming_shutdown(incoming, combined_shutdown);
 
-    info!(%addr, "brookd listening");
+    info!(%addr, "brook server listening");
     server.await.context("grpc server")?;
     info!("shutdown signal received — draining engines");
 
@@ -261,6 +326,9 @@ pub async fn serve(runtime: Runtime, shutdown: impl Future<Output = ()> + Send) 
         warn!(error = %e, "manager shutdown did not drain within deadline");
     }
 
+    // Удаляем sidecar до снятия flock — иначе свежестартующий TUI может
+    // увидеть endpoint-файл и промахнуться в probe (порт уже свободен).
+    Endpoint::remove(&endpoint_path);
     drop(lock); // явно: flock снимается здесь, а не в конце main.
     Ok(())
 }
