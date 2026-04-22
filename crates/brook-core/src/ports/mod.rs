@@ -42,8 +42,10 @@ pub use piece_attempt_repo::{
 };
 pub use piece_storage::{
     PreparedDownload,
+    PreparedMode,
     TPieceStorage,
     TPieceStorageFactory,
+    TStreamStorage,
 };
 pub use queue_store::TQueueStore;
 pub use worker_repo::{

@@ -55,6 +55,7 @@ use brook_core::{
     Error,
     Result,
     TPieceStorage,
+    TStreamStorage,
 };
 
 use super::files::SqliteFileRepository;
@@ -140,7 +141,7 @@ impl LocalPieceStorage {
         let expected_count = piece_count(total_size, piece_size);
         let inspect_ok = matches!(
             &inspect,
-            Some(f) if f.total_size == total_size && f.piece_size == piece_size
+            Some(f) if f.total_size == Some(total_size) && f.piece_size == Some(piece_size)
         );
         let data_exists = data_path.exists();
         // `count == expected` — основной сторож нарезки: даже если
@@ -224,6 +225,121 @@ impl LocalPieceStorage {
         // Гарантировано off < total_size по проверкам в write_piece_bytes;
         // saturating на всякий случай — лучше нулевой piece, чем underflow.
         self.total_size.saturating_sub(off).min(self.piece_size)
+    }
+}
+
+/// Стриминговое хранилище: один append-файл, без преаллокации, без
+/// piece-строк. Используется, когда сервер не сообщил `Content-Length`
+/// (§2 плана: streaming / unknown-size). Resume для такого хранилища
+/// не поддерживается — при повторном открытии `.data.brook` truncate'ится.
+pub struct LocalStreamStorage {
+    inner: Arc<Mutex<StreamInner>>,
+    data_path: PathBuf,
+    target_path: PathBuf,
+}
+
+struct StreamInner {
+    data: Option<File>,
+    finalized: bool,
+    aborted: bool,
+}
+
+impl LocalStreamStorage {
+    /// Открыть append-хранилище. Любые старые байты в `.data.brook`
+    /// отбрасываются (streaming не умеет resume — при перезапуске
+    /// начинаем с нуля; это не regression, обычный HTTP-поток без Range
+    /// всё равно не переиспользуем).
+    pub async fn open_streaming(target_dir: &Path, filename: &str) -> Result<Self> {
+        let target_path = resolve_target(target_dir, filename)
+            .map_err(|e| Error::Other(format!("invalid filename: {e}")))?;
+        let data_path = with_suffix(&target_path, ".data.brook");
+        let data_path_for_blocking = data_path.clone();
+        let data = tokio::task::spawn_blocking(move || -> Result<File> {
+            // truncate=true — streaming-mode не делает resume.
+            let f = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&data_path_for_blocking)?;
+            Ok(f)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("join: {e}")))??;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(StreamInner {
+                data: Some(data),
+                finalized: false,
+                aborted: false,
+            })),
+            data_path,
+            target_path,
+        })
+    }
+}
+
+impl TStreamStorage for LocalStreamStorage {
+    async fn append_chunk(&self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let bytes = bytes.to_vec();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut guard = inner.lock().expect("mutex poisoned");
+            if guard.finalized {
+                return Err(Error::Other("append after finalize".into()));
+            }
+            if guard.aborted {
+                return Err(Error::Other("append after abort".into()));
+            }
+            let file = guard
+                .data
+                .as_mut()
+                .expect("data handle present while !finalized && !aborted");
+            file.write_all(&bytes)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("join: {e}")))?
+    }
+
+    async fn finalize(&self) -> Result<()> {
+        let inner = Arc::clone(&self.inner);
+        let data_path = self.data_path.clone();
+        let target_path = self.target_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut guard = inner.lock().expect("mutex poisoned");
+            if guard.aborted {
+                return Err(Error::Other("finalize after abort".into()));
+            }
+            if guard.finalized {
+                return Ok(());
+            }
+            let file = guard
+                .data
+                .take()
+                .expect("data handle present while !finalized");
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&data_path, &target_path)?;
+            guard.finalized = true;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("join: {e}")))?
+    }
+
+    async fn abort(&self) -> Result<()> {
+        let inner = Arc::clone(&self.inner);
+        let data_path = self.data_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut guard = inner.lock().expect("mutex poisoned");
+            guard.data = None;
+            let _ = std::fs::remove_file(&data_path);
+            guard.aborted = true;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Other(format!("join: {e}")))?
     }
 }
 
@@ -442,7 +558,7 @@ mod tests {
         let id = d.id;
         files.insert(&d).await.unwrap();
         files
-            .set_inspect_fields(id, TOTAL, PIECE, None, None)
+            .set_inspect_fields(id, Some(TOTAL), Some(PIECE), None, None, None)
             .await
             .unwrap();
         (db, files, pieces, id)
@@ -593,7 +709,7 @@ mod tests {
         // нового inspect: другой total_size). Открытие должно увидеть
         // несоответствие и пересобрать всё.
         files
-            .set_inspect_fields(id, 32, PIECE, None, None)
+            .set_inspect_fields(id, Some(32), Some(PIECE), None, None, None)
             .await
             .unwrap();
         let s = LocalPieceStorage::open(

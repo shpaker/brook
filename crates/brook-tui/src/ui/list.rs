@@ -159,13 +159,17 @@ fn draw_entry(
             );
             // Справа от бара — процент в пару колонок. Накладывается
             // поверх последних символов бара: §6.3 допускает это.
-            let pct = if row.progress.bytes_total > 0 {
-                ((row.progress.bytes_done as f64 / row.progress.bytes_total as f64) * 100.0).round()
-                    as u32
+            // `bytes_total == 0` — размер неизвестен (streaming). Вместо
+            // процента показываем «∞», чтобы глазу было понятно, что бар
+            // indeterminate, а не «0% прогресса».
+            let pct_text = if row.progress.bytes_total > 0 {
+                let pct = ((row.progress.bytes_done as f64 / row.progress.bytes_total as f64)
+                    * 100.0)
+                    .round() as u32;
+                format!("  {pct:>3}%")
             } else {
-                0
+                "   ∞ ".to_string()
             };
-            let pct_text = format!("  {pct:>3}%");
             let pct_w = pct_text.chars().count() as u16;
             if bar_width > pct_w + 2 {
                 f.render_widget(

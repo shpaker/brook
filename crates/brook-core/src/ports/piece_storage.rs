@@ -65,26 +65,66 @@ pub trait TPieceStorage: Send + Sync {
     fn abort(&self) -> impl Future<Output = Result<()>> + Send;
 }
 
+/// Хранилище потоковой загрузки (unknown-size / no-Range).
+///
+/// Используется, когда сервер не сообщил `Content-Length` и/или не
+/// поддерживает Range. Один append-файл, без преаллокации и piece-строк
+/// в БД. Resume невозможен — при перезапуске хранилище truncate'ится.
+pub trait TStreamStorage: Send + Sync {
+    /// Добавить очередной кусок байт в конец файла.
+    fn append_chunk(&self, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+    /// Финализация: fsync + rename `<name>.data.brook → <name>`.
+    fn finalize(&self) -> impl Future<Output = Result<()>> + Send;
+
+    /// Удалить `<name>.data.brook` — аналог `TPieceStorage::abort`.
+    fn abort(&self) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// Режим подготовленной загрузки: известный размер (piece-based) или
+/// стриминговый (append-only).
+#[derive(Debug)]
+pub enum PreparedMode {
+    /// Known-size: классическая Range-раскладка по piece'ам.
+    Known {
+        /// Общий размер файла (из `Content-Length` / Content-Range).
+        total_size: u64,
+        /// Размер «обычного» piece'а (последний может быть короче).
+        piece_size: u64,
+        /// Поддерживает ли источник Range-запросы.
+        accepts_ranges: bool,
+        /// ETag/Last-Modified для защиты piece'ов от мутации источника.
+        guard: Option<RangeGuard>,
+    },
+    /// Streaming: `Content-Length` неизвестен. Один воркер, append-mode,
+    /// indeterminate-progress, без resume.
+    Streaming,
+}
+
 /// Результат «предстарта» загрузки: всё, что менеджеру нужно узнать об
-/// источнике и нарезке, плюс готовое хранилище piece'ов.
+/// источнике и нарезке, плюс готовое хранилище piece'ов или стрима.
 ///
 /// Фабрика делает inspect источника, считает раскладку и открывает
 /// storage одной операцией — `DownloadManager` видит этот бандл как
 /// единый шаг, без прямой зависимости от `THttpInspect` или `plan_pieces`.
 #[derive(Debug)]
-pub struct PreparedDownload<S: TPieceStorage> {
-    /// Открытое (init или resume) хранилище piece'ов.
-    pub storage: S,
-    /// Общий размер файла (из `Content-Length` / HEAD/GET fallback).
-    pub total_size: u64,
-    /// Размер «обычного» piece'а (последний может быть короче).
-    pub piece_size: u64,
-    /// Поддерживает ли источник Range-запросы.
-    pub accepts_ranges: bool,
-    /// ETag/Last-Modified для защиты piece'ов от мутации источника.
-    pub guard: Option<RangeGuard>,
+pub struct PreparedDownload<S, SS>
+where
+    S: TPieceStorage,
+    SS: TStreamStorage,
+{
+    /// Режим и сопутствующие параметры (Known/Streaming).
+    pub mode: PreparedMode,
+    /// Piece-хранилище для Known-режима. В Streaming — `None`.
+    pub piece_storage: Option<S>,
+    /// Streaming-хранилище для Streaming-режима. В Known — `None`.
+    pub stream_storage: Option<SS>,
     /// Имя файла, которое фабрика резолвила (из spec / Content-Disposition / URL).
     pub resolved_filename: String,
+    /// URL после цепочки редиректов (`None` — редиректов не было).
+    /// Воркеры шлют range-GET'ы именно на этот URL, что экономит RTT
+    /// на повторном резолве подписанных CDN-ссылок.
+    pub effective_url: Option<String>,
 }
 
 /// Фабрика `TPieceStorage` — инкапсулирует всё, что нужно сделать до
@@ -104,6 +144,7 @@ pub struct PreparedDownload<S: TPieceStorage> {
 /// всё нужное для запуска, — самый дешёвый инвариант для менеджера.
 pub trait TPieceStorageFactory: Send + Sync {
     type Storage: TPieceStorage;
+    type StreamStorage: TStreamStorage;
 
     /// Подготовить piece-хранилище.
     ///
@@ -117,5 +158,5 @@ pub trait TPieceStorageFactory: Send + Sync {
         &self,
         id: DownloadId,
         spec: &DownloadSpec,
-    ) -> impl Future<Output = Result<PreparedDownload<Self::Storage>>> + Send;
+    ) -> impl Future<Output = Result<PreparedDownload<Self::Storage, Self::StreamStorage>>> + Send;
 }

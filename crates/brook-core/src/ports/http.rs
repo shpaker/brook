@@ -52,6 +52,11 @@ pub struct InspectReport {
     pub last_modified: Option<String>,
     /// Имя файла: `Content-Disposition filename*=` → `filename=` → хвост URL.
     pub filename: Option<String>,
+    /// Разрешённый URL после цепочки редиректов. `None`, если редиректов
+    /// не было (или финальный URL совпал с исходным). Воркеры используют
+    /// этот URL для range-GET'ов — экономит RTT на повторном резолве
+    /// подписанных CDN-ссылок (CloudFront, S3 presigned, github assets).
+    pub effective_url: Option<String>,
 }
 
 /// Guard-заголовок для Range-запросов: защита от мутации источника между пиками.
@@ -192,6 +197,7 @@ mod tests {
             etag: Some("\"abc\"".into()),
             last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
             filename: None,
+            effective_url: None,
         };
         assert_eq!(
             RangeGuard::from_report(&report),
@@ -207,6 +213,7 @@ mod tests {
             etag: None,
             last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
             filename: None,
+            effective_url: None,
         };
         assert_eq!(
             RangeGuard::from_report(&report),
@@ -224,6 +231,7 @@ mod tests {
             etag: None,
             last_modified: None,
             filename: None,
+            effective_url: None,
         };
         assert_eq!(RangeGuard::from_report(&report), None);
     }

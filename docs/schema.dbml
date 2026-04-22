@@ -24,11 +24,18 @@ Table file_settings {
   piece_target_count integer
   piece_size_min     integer
   piece_size_max     integer
-  // inspect-derived (NULL до prepare)
+  // inspect-derived (NULL до prepare). total_size/piece_size остаются NULL
+  // в streaming-режиме (неизвестный Content-Length) — тогда движок идёт
+  // append-потоком, piece-строк в `pieces` не заводит.
   total_size    integer
   piece_size    integer
   etag          text
   last_modified text
+  // URL после цепочки 3xx-редиректов на первом inspect'е. Воркеры
+  // шлют range-GET'ы именно сюда, чтобы не платить за повторный
+  // резолв подписанных CDN-ссылок. NULL — редиректов не было или
+  // эффективный URL совпадает со spec.url.
+  effective_url text
 }
 
 Table status_changes {

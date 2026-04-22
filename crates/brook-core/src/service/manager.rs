@@ -68,6 +68,7 @@ use crate::error::{
 use crate::ports::{
     NoopAttemptRepo,
     NoopWorkerRepo,
+    PreparedMode,
     TPieceAttemptRepo,
     TPieceStorageFactory,
     TQueueStore,
@@ -79,6 +80,7 @@ use crate::service::engine::{
     EngineConfig,
     EngineHandle,
     EngineInputs,
+    StreamingEngineInputs,
 };
 
 /// Конфигурация менеджера.
@@ -113,6 +115,7 @@ pub struct DownloadManager<PF, QS, F, WR = NoopWorkerRepo, AR = NoopAttemptRepo>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
     WR: TWorkerRepo + Send + Sync + 'static,
@@ -125,6 +128,7 @@ impl<PF, QS, F, WR, AR> Clone for DownloadManager<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
     WR: TWorkerRepo + Send + Sync + 'static,
@@ -141,6 +145,7 @@ struct Shared<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
     WR: TWorkerRepo + Send + Sync + 'static,
@@ -169,6 +174,7 @@ impl<PF, QS, F> DownloadManager<PF, QS, F, NoopWorkerRepo, NoopAttemptRepo>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
 {
@@ -190,6 +196,7 @@ impl<PF, QS, F, WR, AR> DownloadManager<PF, QS, F, WR, AR>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
     WR: TWorkerRepo + Send + Sync + 'static,
@@ -565,23 +572,58 @@ where
         };
         let spec = maybe_spec.ok_or(Error::NotFound)?;
         let prepared = shared.factory.prepare(id, &spec).await?;
-        let inputs = EngineInputs {
-            spec,
-            total_size: prepared.total_size,
-            piece_size: prepared.piece_size,
-            accepts_ranges: prepared.accepts_ranges,
-            guard: prepared.guard,
+        let effective_url = prepared.effective_url.clone();
+        let (handle, events_rx) = match prepared.mode {
+            PreparedMode::Known {
+                total_size,
+                piece_size,
+                accepts_ranges,
+                guard,
+            } => {
+                let inputs = EngineInputs {
+                    spec,
+                    total_size,
+                    piece_size,
+                    accepts_ranges,
+                    guard,
+                    effective_url,
+                };
+                let storage = Arc::new(
+                    prepared
+                        .piece_storage
+                        .expect("Known mode must carry piece storage"),
+                );
+                DownloadEngine::spawn(
+                    id,
+                    inputs,
+                    shared.config.engine.clone(),
+                    storage,
+                    Arc::clone(&shared.fetch),
+                    Arc::clone(&shared.workers_repo),
+                    Arc::clone(&shared.attempts_repo),
+                )
+            }
+            PreparedMode::Streaming => {
+                let inputs = StreamingEngineInputs {
+                    spec,
+                    effective_url,
+                };
+                let stream = Arc::new(
+                    prepared
+                        .stream_storage
+                        .expect("Streaming mode must carry stream storage"),
+                );
+                DownloadEngine::spawn_streaming(
+                    id,
+                    inputs,
+                    shared.config.engine.clone(),
+                    stream,
+                    Arc::clone(&shared.fetch),
+                    Arc::clone(&shared.workers_repo),
+                    Arc::clone(&shared.attempts_repo),
+                )
+            }
         };
-        let storage = Arc::new(prepared.storage);
-        let (handle, events_rx) = DownloadEngine::spawn(
-            id,
-            inputs,
-            shared.config.engine.clone(),
-            storage,
-            Arc::clone(&shared.fetch),
-            Arc::clone(&shared.workers_repo),
-            Arc::clone(&shared.attempts_repo),
-        );
         {
             let mut inner = shared.inner.lock().expect("mutex poisoned");
             inner.engines.insert(id, handle);
@@ -598,6 +640,7 @@ async fn fan_in_events<PF, QS, F, WR, AR>(
 ) where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
     WR: TWorkerRepo + Send + Sync + 'static,
@@ -686,6 +729,7 @@ async fn advance_queue<PF, QS, F, WR, AR>(shared: Arc<Shared<PF, QS, F, WR, AR>>
 where
     PF: TPieceStorageFactory + Send + Sync + 'static,
     PF::Storage: Send + Sync + 'static,
+    PF::StreamStorage: Send + Sync + 'static,
     QS: TQueueStore + Send + Sync + 'static,
     F: TRangeFetch + Send + Sync + 'static,
     WR: TWorkerRepo + Send + Sync + 'static,

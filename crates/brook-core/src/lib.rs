@@ -53,6 +53,7 @@ pub use ports::{
     NoopAttemptRepo,
     NoopWorkerRepo,
     PreparedDownload,
+    PreparedMode,
     RangeError,
     RangeGuard,
     THttpInspect,
@@ -61,6 +62,7 @@ pub use ports::{
     TPieceStorageFactory,
     TQueueStore,
     TRangeFetch,
+    TStreamStorage,
     TWorkerRepo,
     WorkerRecord,
 };
@@ -75,4 +77,5 @@ pub use service::{
     ManagerConfig,
     RetryDecision,
     RetryPolicy,
+    StreamingEngineInputs,
 };

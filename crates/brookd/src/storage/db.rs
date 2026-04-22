@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS file_settings (
     total_size         INTEGER,
     piece_size         INTEGER,
     etag               TEXT,
-    last_modified      TEXT
+    last_modified      TEXT,
+    effective_url      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS status_changes (
