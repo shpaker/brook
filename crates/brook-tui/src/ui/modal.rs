@@ -30,6 +30,7 @@ use crate::model::{
     AddField,
     AddModal,
     Mode,
+    RenameModal,
     ViewModel,
 };
 
@@ -41,6 +42,7 @@ pub fn draw_overlay(f: &mut Frame, vm: &ViewModel, no_color: bool) {
         Mode::ConfirmDelete { ids } => draw_confirm_delete(f, vm, ids, no_color),
         Mode::ConfirmRetry { ids } => draw_confirm_retry(f, vm, ids, no_color),
         Mode::Ghost { ids } => draw_ghost(f, vm, ids, no_color),
+        Mode::RenameOnConflict { modal } => draw_rename(f, modal, no_color),
         Mode::QuitConfirm => draw_quit_confirm(f, vm, no_color),
     }
 }
@@ -119,6 +121,46 @@ fn hint_style(no_color: bool) -> Style {
     } else {
         Style::default().fg(Color::DarkGray)
     }
+}
+
+fn draw_rename(f: &mut Frame, m: &RenameModal, no_color: bool) {
+    let area = centered(f.area(), 60, 8);
+    f.render_widget(Clear, area);
+    let block = block("file exists — pick a name", no_color);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let caret = "▌";
+    let value_style = if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    let mut lines = vec![
+        Line::from(format!(" already in folder: {}", m.base)),
+        Line::from(vec![
+            Span::styled(" name   ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(m.name.clone(), value_style),
+            Span::styled(caret, value_style),
+        ]),
+        Line::from(""),
+    ];
+    if let Some(err) = &m.error {
+        let style = if no_color {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Red)
+        };
+        lines.push(Line::from(Span::styled(err.clone(), style)));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter · save    Esc · cancel ",
+        hint_style(no_color),
+    )));
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_duplicate(

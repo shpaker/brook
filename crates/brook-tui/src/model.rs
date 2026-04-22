@@ -128,6 +128,12 @@ pub enum Mode {
         form: AddForm,
         existing_id: String,
     },
+    /// Демон вернул `AlreadyExists`: в target-каталоге лежит файл с
+    /// таким же именем. Открываем модалку, чтобы пользователь выбрал
+    /// имя (префилл — `<base> (N)` по конвенции Windows/Finder).
+    RenameOnConflict {
+        modal: RenameModal,
+    },
     ConfirmDelete {
         ids: Vec<String>,
     },
@@ -201,6 +207,50 @@ impl AddModal {
                 self.folder.pop();
             }
         }
+    }
+}
+
+/// Состояние rename-модалки, которая открывается при `AlreadyExists`.
+/// `form` сохраняется, чтобы повторить `Add` под выбранным именем;
+/// `base` — имя, о которое споткнулся демон, нужно для инкремента
+/// `counter` при повторных конфликтах.
+#[derive(Debug, Clone)]
+pub struct RenameModal {
+    pub form: AddForm,
+    pub base: String,
+    pub name: String,
+    pub counter: u32,
+    pub error: Option<String>,
+}
+
+impl RenameModal {
+    pub fn new(base: String, form: AddForm) -> Self {
+        let name = crate::command::apply_counter(&base, 1);
+        Self {
+            form,
+            base,
+            name,
+            counter: 1,
+            error: None,
+        }
+    }
+
+    /// Повторный конфликт: подставить следующий счётчик, сбросить
+    /// возможные правки пользователя на автоматический кандидат.
+    pub fn bump(&mut self) {
+        self.counter = self.counter.saturating_add(1);
+        self.name = crate::command::apply_counter(&self.base, self.counter);
+        self.error = None;
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        self.name.push(c);
+        self.error = None;
+    }
+
+    pub fn backspace(&mut self) {
+        self.name.pop();
+        self.error = None;
     }
 }
 

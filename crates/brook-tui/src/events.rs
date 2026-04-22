@@ -52,10 +52,15 @@ pub enum CmdOutcome {
     Ok,
     /// Ошибка — показываем toast'ом.
     Error(String),
-    /// Сервер успешно принял `Add`. Если клиент авто-переименовал файл
+    /// Сервер успешно принял `Add`. Если клиент переименовал файл
     /// после конфликта (`AlreadyExists`), в `renamed_to` — финальное имя
     /// для toast'а «Saved as …».
     AddAccepted { renamed_to: Option<String> },
+    /// Демон вернул `AlreadyExists`: в `target_dir` уже лежит файл
+    /// `base_name`. UI открывает rename-модалку с префиллом
+    /// `<base_name> (1)` (по конвенции Windows/Finder — перед последней
+    /// точкой) и даёт пользователю выбрать итоговое имя.
+    AddConflict { base_name: String, form: AddForm },
     /// `Remove` прошёл успешно (или же демон ответил `NotFound`, но
     /// `Remove` идемпотентен — см. `manager::remove`). UI должен выкинуть
     /// перечисленные id из ViewModel, потому что демон про них больше

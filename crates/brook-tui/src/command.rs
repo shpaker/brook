@@ -28,100 +28,76 @@ fn send(tx: &UnboundedSender<UiEvent>, outcome: CmdOutcome) {
     let _ = tx.send(UiEvent::CmdResult(outcome));
 }
 
-/// Сколько раз клиент переподберёт имя при повторном `AlreadyExists`.
-/// Потолок защищает от зацикливания, если в каталоге уже много `(N)`.
-const MAX_FILENAME_RETRIES: u32 = 100;
-
-/// Послать `Add` и, если демон вернул `AlreadyExists`, автоматически
-/// подобрать `<stem> (N).<ext>` и повторить вызов. UI-модалки для
-/// конфликта имени больше нет — политика жёстко «rename на клиенте».
-pub fn add(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, form: AddForm) {
+/// Послать `Add`. Если демон вернул `AlreadyExists`, возвращаем
+/// `CmdOutcome::AddConflict` — UI откроет rename-модалку и сам решит,
+/// под каким именем отправить повтор.
+///
+/// `filename`:
+/// * `None` — первая попытка; имя выведет демон из Content-Disposition
+///   или хвоста URL.
+/// * `Some(name)` — явно заданное пользователем имя (уже после rename-модалки).
+pub fn add(
+    ch: AuthedChannel,
+    tx: UnboundedSender<UiEvent>,
+    form: AddForm,
+    filename: Option<String>,
+) {
     tokio::spawn(async move {
         let mut client = BrookServiceClient::new(ch);
-        // Базовое имя — хвост URL (после strip query/fragment). Если
-        // вытащить не удалось, пусть решает демон: отправляем первый
-        // запрос без `filename`, а при конфликте сдаёмся с тостом —
-        // переподбирать без base-имени мы не можем.
-        let base_name = filename_from_url(&form.url);
-
-        // Первая попытка — без клиентского `filename` (пусть демон
-        // выведёт из Content-Disposition/URL).
-        let first = FileSpec {
+        let spec = FileSpec {
             url: form.url.clone(),
             target_dir: form.folder.clone(),
-            ..Default::default()
+            filename: filename.clone(),
         };
-        match client.add(AddRequest { spec: Some(first) }).await {
+        match client.add(AddRequest { spec: Some(spec) }).await {
             Ok(_) => {
-                send(&tx, CmdOutcome::AddAccepted { renamed_to: None });
-                return;
+                send(
+                    &tx,
+                    CmdOutcome::AddAccepted {
+                        renamed_to: filename,
+                    },
+                );
             }
             Err(st) if st.code() == Code::AlreadyExists => {
-                // Падаем в retry-loop ниже.
+                // Демон кладёт имя в сообщение строго как
+                // `"file already exists: <name>"` (см. brook-core Error::FileExists).
+                // Если парсинг не удался — fallback на хвост URL; если и это
+                // не даёт имени, отдаём общую ошибку: без базового имени
+                // подсказать в модалке нечего.
+                let base = parse_existing_filename(st.message())
+                    .or_else(|| filename.clone())
+                    .or_else(|| filename_from_url(&form.url));
+                match base {
+                    Some(base_name) => send(
+                        &tx,
+                        CmdOutcome::AddConflict {
+                            base_name,
+                            form: form.clone(),
+                        },
+                    ),
+                    None => send(
+                        &tx,
+                        CmdOutcome::Error(
+                            "file already exists; cannot derive filename from URL to rename".into(),
+                        ),
+                    ),
+                }
             }
             Err(st) => {
                 send(
                     &tx,
                     CmdOutcome::Error(format!("add failed: {}", st.message())),
                 );
-                return;
             }
         }
-
-        let Some(base) = base_name else {
-            send(
-                &tx,
-                CmdOutcome::Error(
-                    "file already exists; cannot derive filename from URL to rename".into(),
-                ),
-            );
-            return;
-        };
-
-        for n in 1..=MAX_FILENAME_RETRIES {
-            let candidate = apply_counter(&base, n);
-            let spec = FileSpec {
-                url: form.url.clone(),
-                target_dir: form.folder.clone(),
-                filename: Some(candidate.clone()),
-            };
-            match client.add(AddRequest { spec: Some(spec) }).await {
-                Ok(_) => {
-                    send(
-                        &tx,
-                        CmdOutcome::AddAccepted {
-                            renamed_to: Some(candidate),
-                        },
-                    );
-                    return;
-                }
-                Err(st) if st.code() == Code::AlreadyExists => {
-                    // Продолжаем перебор.
-                }
-                Err(st) => {
-                    send(
-                        &tx,
-                        CmdOutcome::Error(format!("add failed: {}", st.message())),
-                    );
-                    return;
-                }
-            }
-        }
-        send(
-            &tx,
-            CmdOutcome::Error(format!(
-                "add failed: no free filename for {base} after {MAX_FILENAME_RETRIES} attempts"
-            )),
-        );
     });
 }
 
-/// Сконструировать кандидат `<stem> (N).<ext>` для retry. Повторяет
-/// серверную схему rename'а, которую до рефакторинга делал демон.
-fn apply_counter(original: &str, n: u32) -> String {
-    // Ищем последнюю точку, которая не в начале, — это «расширение».
-    // `a.tar.gz` → stem="a.tar", ext="gz". Имена без точки и дот-файлы
-    // (`.bashrc`) трактуем как «нет расширения».
+/// Вставить счётчик перед последней точкой расширения — Windows
+/// Explorer / macOS Finder convention. `file.bin` → `file (1).bin`;
+/// `README` → `README (1)`; `.bashrc` → `.bashrc (1)` (ведущая точка
+/// трактуется как часть stem, расширения нет); `a.tar.gz` → `a.tar (1).gz`.
+pub(crate) fn apply_counter(original: &str, n: u32) -> String {
     match original.rfind('.') {
         Some(pos) if pos > 0 => {
             let (stem, dot_ext) = original.split_at(pos);
@@ -133,12 +109,23 @@ fn apply_counter(original: &str, n: u32) -> String {
 }
 
 /// Вытащить последний сегмент пути URL: `https://h/a/b/c.bin?x=1#y` → `c.bin`.
-fn filename_from_url(url: &str) -> Option<String> {
+pub(crate) fn filename_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let path = after_scheme.split_once('/').map(|(_, rest)| rest)?;
     let path = path.split(['?', '#']).next().unwrap_or("");
     let last = path.rsplit('/').find(|s| !s.is_empty())?;
     Some(last.to_owned())
+}
+
+/// Парсер сообщения ошибки демона. Формат строго
+/// `"file already exists: <name>"` — см. `brook_core::Error::FileExists`
+/// в [crates/brook-core/src/error.rs]. Если prefix не совпал, возвращаем
+/// `None` — вызывающая сторона сама решит, откуда взять base-имя.
+fn parse_existing_filename(msg: &str) -> Option<String> {
+    const PREFIX: &str = "file already exists: ";
+    msg.strip_prefix(PREFIX)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 fn id_request(id: &str) -> IdRequest {
@@ -319,5 +306,22 @@ mod tests {
         );
         assert_eq!(filename_from_url("https://a/").as_deref(), None);
         assert_eq!(filename_from_url("https://a").as_deref(), None);
+    }
+
+    #[test]
+    fn parse_existing_filename_matches_daemon_format() {
+        assert_eq!(
+            parse_existing_filename("file already exists: large").as_deref(),
+            Some("large")
+        );
+        assert_eq!(
+            parse_existing_filename("file already exists: movie (1).mp4").as_deref(),
+            Some("movie (1).mp4")
+        );
+        assert_eq!(
+            parse_existing_filename("file already exists: ").as_deref(),
+            None
+        );
+        assert_eq!(parse_existing_filename("something else").as_deref(), None);
     }
 }

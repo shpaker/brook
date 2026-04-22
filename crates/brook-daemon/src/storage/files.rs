@@ -6,8 +6,8 @@
 //!
 //! ## Раскладка по таблицам
 //!
-//! Одна доменная `File` ложится в три таблицы новой схемы
-//! (см. [`docs/schema.dbml`]):
+//! Одна доменная `File` ложится в три таблицы (миграция — в
+//! [`super::db::SharedDb`]):
 //!
 //! - `files` — «шапка»: `id`, `url`, `target_dir`, `filename`,
 //!   текущее `status_id`, `created_at`.
@@ -25,7 +25,6 @@
 //! [`SharedDb::with_conn`] → `spawn_blocking`: `rusqlite` синхронный,
 //! держать его на async-потоке нельзя.
 //!
-//! [`docs/schema.dbml`]: ../../../../docs/schema.dbml
 //! [`SharedDb`]: super::db::SharedDb
 //! [`SharedDb::with_conn`]: super::db::SharedDb::with_conn
 //! [`SharedDb::finish_open`]: super::db::SharedDb
@@ -73,7 +72,7 @@ pub enum FilesError {
     #[error("corrupt row: {0}")]
     Corrupt(String),
     /// Переход в `failed` обязан нести [`FailureReason`] — инвариант
-    /// схемы (см. `docs/todo.md` §21). Нарушение ловим до SQL.
+    /// схемы. Нарушение ловим до SQL.
     #[error("failed transition requires reason")]
     MissingFailureReason,
 }
