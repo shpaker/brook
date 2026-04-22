@@ -1,74 +1,77 @@
-//! Прогресс-бар как фоновая заливка строки с именем файла (§6.3).
+//! Двухслойный прогресс: dim track `─` + accent fill `━`, варианты по
+//! статусу. Возвращает `Line` фиксированной длины `width`; рендерится
+//! как третья строка карточки.
 //!
-//! Бар не рисует собственные символы — только красит `bg` ячеек поверх
-//! уже отрисованного текста. Done-зона получает акцентный фон, pending —
-//! приглушённый. Таким образом имя файла, префикс и правая колонка
-//! остаются читаемыми, а заполнение прогресса виден как «подсветка»
-//! строки слева направо.
+//! Искры `◆` на позициях активных piece'ов планировались, но
+//! `WorkerSegment`-данные до proto не проброшены — пока сегменты не
+//! появятся в `WatchProgress`, искры остаются визуальным TODO.
 
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use brook_proto::brook::v1::FileStatus;
 use ratatui::style::{
     Color,
     Style,
 };
-use ratatui::widgets::Widget;
-
-use crate::model::{
-    ProgressSnapshot,
-    WorkerSegment,
+use ratatui::text::{
+    Line,
+    Span,
 };
 
-pub struct ProgressBar<'a> {
-    pub progress: &'a ProgressSnapshot,
-    pub workers: &'a [WorkerSegment],
-    pub no_color: bool,
+use crate::model::DownloadRow;
+
+pub fn progress_line(row: &DownloadRow, width: u16) -> Line<'static> {
+    let width = width as usize;
+    if width == 0 {
+        return Line::from("");
+    }
+
+    match row.status {
+        FileStatus::Done => full_bar(width, accent_dim()),
+        FileStatus::Pending | FileStatus::Cancelled | FileStatus::Unspecified => full_track(width),
+        FileStatus::Failed => failed_bar(row, width),
+        FileStatus::Paused => filled_bar(row, width, Color::Yellow),
+        FileStatus::Retrying => filled_bar(row, width, Color::Yellow),
+        FileStatus::Running => filled_bar(row, width, Color::Cyan),
+    }
 }
 
-impl<'a> Widget for ProgressBar<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 || self.no_color {
-            // В no-color режиме бар-фон невидим; оставляем строку без заливки.
-            let _ = self.workers;
-            return;
-        }
-        let width = area.width as usize;
-        // `bytes_total == 0` — размер неизвестен (streaming/unknown-size).
-        // Рисуем indeterminate-бар: сплошная заливка `▒` без «готовой» зоны.
-        if self.progress.bytes_total == 0 {
-            let style = if self.no_color {
-                Style::default()
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            for x in 0..width {
-                let cell = buf
-                    .cell_mut((area.x + x as u16, area.y))
-                    .expect("cell in area");
-                cell.set_char('▒');
-                cell.set_style(style);
-            }
-            return;
-        }
-        let total = self.progress.bytes_total as f64;
-        let done = (self.progress.bytes_done as f64 / total).clamp(0.0, 1.0);
-        let done_cells = (done * width as f64).round() as usize;
-        let done_cells = done_cells.min(width);
+fn accent_dim() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
 
-        // Приглушённый фон для pending (чуть темнее фона терминала —
-        // визуально бар «дышит», не перебивая текст).
-        let pending_bg = Color::Rgb(0x22, 0x22, 0x22);
-        // Тёмно-зелёный для done — контрастный, но не режет глаз.
-        let done_bg = Color::Rgb(0x1e, 0x4d, 0x1e);
+fn track_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
 
-        for x in 0..width {
-            let cell = buf
-                .cell_mut((area.x + x as u16, area.y))
-                .expect("cell in area");
-            let bg = if x < done_cells { done_bg } else { pending_bg };
-            cell.set_bg(bg);
-        }
+fn full_bar(width: usize, style: Style) -> Line<'static> {
+    Line::from(Span::styled("━".repeat(width), style))
+}
 
-        let _ = self.workers;
+fn full_track(width: usize) -> Line<'static> {
+    Line::from(Span::styled("─".repeat(width), track_style()))
+}
+
+fn filled_bar(row: &DownloadRow, width: usize, fill_color: Color) -> Line<'static> {
+    let ratio = ratio(row);
+    let fill_cells = ((ratio * width as f64).round() as usize).min(width);
+    Line::from(vec![
+        Span::styled("━".repeat(fill_cells), Style::default().fg(fill_color)),
+        Span::styled("─".repeat(width - fill_cells), track_style()),
+    ])
+}
+
+fn failed_bar(row: &DownloadRow, width: usize) -> Line<'static> {
+    let ratio = ratio(row);
+    let fill_cells = ((ratio * width as f64).round() as usize).min(width);
+    Line::from(vec![
+        Span::styled("━".repeat(fill_cells), Style::default().fg(Color::Red)),
+        Span::styled("─".repeat(width - fill_cells), track_style()),
+    ])
+}
+
+fn ratio(row: &DownloadRow) -> f64 {
+    if row.progress.bytes_total == 0 {
+        0.0
+    } else {
+        (row.progress.bytes_done as f64 / row.progress.bytes_total as f64).clamp(0.0, 1.0)
     }
 }

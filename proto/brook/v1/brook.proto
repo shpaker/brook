@@ -5,8 +5,6 @@ import "google/protobuf/timestamp.proto";
 
 // Основной сервис управления загрузками.
 service BrookService {
-  // Получить список всех файлов.
-  rpc List(ListRequest) returns (ListResponse);
   // Добавить новый файл в очередь.
   rpc Add(AddRequest) returns (AddResponse);
   // Удалить файл по идентификатору.
@@ -16,13 +14,8 @@ service BrookService {
   rpc Pause(IdRequest) returns (StatusResponse);
   // Возобновить приостановленную загрузку файла.
   rpc Resume(IdRequest) returns (StatusResponse);
-  // Отменить загрузку файла.
-  rpc Cancel(IdRequest) returns (StatusResponse);
-
-  // Поставить все загрузки на паузу.
-  rpc PauseAll(PauseAllRequest) returns (StatusResponse);
-  // Возобновить все приостановленные загрузки.
-  rpc ResumeAll(ResumeAllRequest) returns (StatusResponse);
+  // Перезапустить упавшую загрузку (Failed → Pending).
+  rpc Retry(IdRequest) returns (StatusResponse);
 
   // Server-streaming: события жизненного цикла по всем файлам (status,
   // snapshot, completed, failed).
@@ -126,13 +119,6 @@ message ProgressTick {
   optional uint64 eta_secs = 6;
 }
 
-message ListRequest {
-}
-
-message ListResponse {
-  repeated File files = 1;
-}
-
 message AddRequest {
   FileSpec spec = 1;
 }
@@ -168,44 +154,18 @@ message WatchFileRequest {
 message WatchProgressRequest {
 }
 
-// Пустой запрос для массовых операций (оставлен как именованный для
-// стабильности схемы — при необходимости сюда можно добавить поля без
-// breaking change).
-message PauseAllRequest {
-}
-
-message ResumeAllRequest {
-}
-
 message GetSettingsRequest {
 }
 
 message ShutdownRequest {
 }
 
-// Политики конфликтов, живущие в `brook.yaml`. Клиент может использовать
-// для решения, показывать ли модалку `ask` или сразу применить политику.
-enum OnDuplicateUrlPolicy {
-  ON_DUPLICATE_URL_POLICY_UNSPECIFIED = 0;
-  ON_DUPLICATE_URL_POLICY_ASK = 1;
-  ON_DUPLICATE_URL_POLICY_SKIP = 2;
-  ON_DUPLICATE_URL_POLICY_ADD = 3;
-}
-
 message GetSettingsResponse {
-  // Дефолты для префилла Add-модалки (`target_dir`). Число воркеров
-  // демон считает по размеру файла и наружу не экспонирует.
+  // Дефолт для префилла Add-модалки.
   string default_dir = 1;
-  reserved 2, 3;
-  reserved "default_workers", "max_workers";
+  reserved 2, 3, 5, 6, 7, 8;
+  reserved "default_workers", "max_workers", "piece_target_count",
+           "piece_size_min", "piece_size_max", "on_duplicate_url";
+  // Лимит одновременных активных загрузок (справочно для UI).
   uint32 max_concurrent = 4;
-
-  // Дефолты нарезки (для справочного отображения; TUI в MVP их не меняет).
-  uint32 piece_target_count = 5;
-  uint64 piece_size_min = 6;
-  uint64 piece_size_max = 7;
-
-  // Политика конфликта URL из `brook.yaml`. Политика конфликта имени
-  // файла (rename) хардкодится демоном и в API не экспонируется.
-  OnDuplicateUrlPolicy on_duplicate_url = 8;
 }

@@ -267,26 +267,13 @@ fn handle_key_normal(
         KeyCode::Char('G') => {
             vm.cursor = visible_len.saturating_sub(1);
         }
-        KeyCode::Char(' ') => vm.toggle_select_here(),
+        KeyCode::Tab => vm.toggle_select_here(),
+        KeyCode::Char(' ') => primary_action(vm, channel, tx),
+        KeyCode::Enter => reveal_cursor(vm),
         KeyCode::Char('a') => {
             let default_dir = vm.settings.default_dir.clone();
             let clipboard_url = command::clipboard_url().unwrap_or_default();
             vm.mode = Mode::Add(AddModal::new(clipboard_url, default_dir));
-        }
-        KeyCode::Char('p') => {
-            let ids = vm.action_targets();
-            let (to_resume, to_pause): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
-                vm.downloads
-                    .get(id)
-                    .map(|r| r.status == brook_proto::brook::v1::FileStatus::Paused)
-                    .unwrap_or(false)
-            });
-            if !to_resume.is_empty() {
-                command::resume(channel.clone(), tx.clone(), to_resume);
-            }
-            if !to_pause.is_empty() {
-                command::pause(channel.clone(), tx.clone(), to_pause);
-            }
         }
         KeyCode::Char('d') => {
             let ids = vm.action_targets();
@@ -297,6 +284,45 @@ fn handle_key_normal(
         _ => {}
     }
     false
+}
+
+/// Space на курсоре: действие зависит от статуса строки (зеркалит
+/// `<action>`-глиф из карточки). Мультиселекшн игнорируем — глиф
+/// специфичен для одной строки.
+fn primary_action(vm: &ViewModel, channel: &Channel, tx: &mpsc::UnboundedSender<UiEvent>) {
+    use brook_proto::brook::v1::FileStatus as S;
+    let visible = vm.visible_ids();
+    let Some(id) = visible.get(vm.cursor.min(visible.len().saturating_sub(1))) else {
+        return;
+    };
+    let Some(row) = vm.downloads.get(id) else {
+        return;
+    };
+    match row.status {
+        S::Running | S::Retrying | S::Pending => {
+            command::pause(channel.clone(), tx.clone(), vec![id.clone()]);
+        }
+        S::Paused => {
+            command::resume(channel.clone(), tx.clone(), vec![id.clone()]);
+        }
+        S::Failed => {
+            command::retry(channel.clone(), tx.clone(), vec![id.clone()]);
+        }
+        S::Done => {
+            command::reveal_in_finder(&row.target_dir, &row.filename);
+        }
+        S::Cancelled | S::Unspecified => {}
+    }
+}
+
+fn reveal_cursor(vm: &ViewModel) {
+    let visible = vm.visible_ids();
+    let Some(id) = visible.get(vm.cursor.min(visible.len().saturating_sub(1))) else {
+        return;
+    };
+    if let Some(row) = vm.downloads.get(id) {
+        command::reveal_in_finder(&row.target_dir, &row.filename);
+    }
 }
 
 fn handle_key_add(

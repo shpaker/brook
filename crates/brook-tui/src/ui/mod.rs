@@ -1,31 +1,28 @@
-//! Рендер TUI. Корневой `draw` режет экран на §6.1-слои
-//! `status(2) · list(Min) · detail(5) · hint(1)` и делегирует
-//! отрисовку подмодулям.
+//! Рендер TUI. Одна внешняя rounded-рамка с двумя pipe-tab'ами
+//! (`| brook |` сверху, `| ? help |` снизу), внутри — плоский список
+//! карточек. Модалки и overlay'и идут поверх.
 
 use ratatui::Frame;
-use ratatui::layout::{
-    Constraint,
-    Direction,
-    Layout,
-    Rect,
-};
+use ratatui::layout::Rect;
 use ratatui::style::{
-    Modifier,
+    Color,
     Style,
 };
-use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{
+    Block,
+    BorderType,
+    Paragraph,
+};
 
 use crate::model::ViewModel;
 
-mod detail;
-mod hint;
+mod card;
+mod chrome;
 mod list;
 pub mod modal;
 mod progress;
-mod status;
 
-/// Минимальный размер терминала. Меньше — заглушка без попыток рендера.
+/// Минимальный размер терминала. Ниже — заглушка без попыток рендера.
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 15;
 
@@ -37,38 +34,34 @@ pub fn draw(f: &mut Frame, vm: &ViewModel) {
     }
     let no_color = std::env::var_os("NO_COLOR").is_some();
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![
-            Constraint::Length(2), // status
-            Constraint::Min(0),    // list
-            Constraint::Length(5), // detail
-            Constraint::Length(1), // hint
-        ])
-        .split(area);
+    let border_style = if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
-    status::draw(f, chunks[0], vm, no_color);
-    list::draw(f, chunks[1], vm, no_color);
-    detail::draw(f, chunks[2], vm, no_color);
-    hint::draw(f, chunks[3], no_color);
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(chrome::top_title(vm))
+        .title_bottom(chrome::help_tab());
+    if let Some(toast) = chrome::toast_line(vm) {
+        block = block.title_bottom(toast);
+    }
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Внутри — только список карточек с паддингом 1 по краям.
+    let list_area = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y.saturating_add(1),
+        width: inner.width.saturating_sub(2),
+        height: inner.height.saturating_sub(2),
+    };
+    list::draw(f, list_area, vm, no_color);
 
     modal::draw_overlay(f, vm, no_color);
-
-    // Toast рендерится поверх последней строки списка — простая
-    // однострочная плашка.
-    if let Some(t) = &vm.toast {
-        let toast_area = Rect {
-            x: area.x,
-            y: area.y + area.height.saturating_sub(2),
-            width: area.width,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(t.message.clone()))
-                .style(Style::default().add_modifier(Modifier::REVERSED)),
-            toast_area,
-        );
-    }
 }
 
 fn draw_too_small(f: &mut Frame, area: Rect) {

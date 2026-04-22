@@ -46,20 +46,6 @@ pub fn eta(secs: u64) -> String {
     }
 }
 
-/// Обрезка `…` **по середине** — для длинных URL в detail.
-pub fn middle_ellipsis(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max || max < 4 {
-        return s.chars().take(max).collect();
-    }
-    let keep = max - 1; // минус один символ под `…`
-    let left = keep / 2;
-    let right = keep - left;
-    let head: String = chars.iter().take(left).collect();
-    let tail: String = chars.iter().skip(chars.len() - right).collect();
-    format!("{head}…{tail}")
-}
-
 /// Обрезка `…` **справа** — для имён файлов.
 pub fn right_ellipsis(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -91,14 +77,6 @@ mod tests {
         assert_eq!(eta(45), "45s");
         assert_eq!(eta(930), "15m 30s");
         assert_eq!(eta(8100), "2h 15m");
-    }
-
-    #[test]
-    fn middle_ellipsis_truncates() {
-        let s = "https://example.com/path/to/very-long-file.tar.gz";
-        let out = middle_ellipsis(s, 20);
-        assert_eq!(out.chars().count(), 20);
-        assert!(out.contains('…'));
     }
 
     #[test]
