@@ -137,7 +137,7 @@ async fn download_runs_to_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn remove_on_active_is_failed_precondition() {
+async fn remove_on_active_cancels_and_succeeds() {
     let mut h = HarnessBuilder::default()
         .max_concurrent(1)
         .fetch_delay(Duration::from_millis(500))
@@ -156,33 +156,20 @@ async fn remove_on_active_is_failed_precondition() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let err = h
-        .client
+    // Remove активного файла — сервис сам отменяет engine и удаляет запись.
+    h.client
         .remove(proto::RemoveRequest {
             id: Some(id.clone()),
         })
         .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-
-    // Пауза + remove: для активных это штатный путь без Cancel RPC.
-    h.client
-        .pause(proto::IdRequest {
-            id: Some(id.clone()),
-        })
-        .await
         .unwrap();
-    // Дождаться, пока engine закоммитится и отпустит запись.
-    for _ in 0..200 {
-        let s = find_status(&h, &id.value);
-        if matches!(
-            s,
-            FileStatus::Paused | FileStatus::Done | FileStatus::Failed
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+
+    assert!(
+        h.manager
+            .snapshot()
+            .iter()
+            .all(|d| d.id.to_string() != id.value)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

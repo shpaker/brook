@@ -194,10 +194,10 @@ pub fn core_err_to_status(e: brook_core::Error) -> Status {
         }
         E::Io(ref io) => Status::internal(format!("io error: {io}")),
         E::Other(msg) => {
-            // Частный случай: manager.remove(id) для активного файла
-            // возвращает Error::Other("download is active, cancel before remove").
-            // Это пользовательская ошибка — `failed_precondition`.
-            if msg.contains("active") || msg.contains("terminal") {
+            // Пользовательские precondition-ошибки (`pause/resume` у
+            // терминальной загрузки и подобные) — `failed_precondition`,
+            // остальное — `internal`.
+            if msg.contains("terminal") {
                 Status::failed_precondition(msg)
             } else {
                 Status::internal(msg)
@@ -352,10 +352,8 @@ mod tests {
     }
 
     #[test]
-    fn core_err_active_to_failed_precondition() {
-        let st = core_err_to_status(brook_core::Error::Other(
-            "download is active, cancel before remove".into(),
-        ));
+    fn core_err_terminal_to_failed_precondition() {
+        let st = core_err_to_status(brook_core::Error::Other("download is terminal".into()));
         assert_eq!(st.code(), tonic::Code::FailedPrecondition);
     }
 }
