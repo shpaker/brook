@@ -2,7 +2,7 @@
 
 ## 0. Workspace
 
-**brook** is a macOS download manager: Rust async core (`brook-core`), HTTP adapter (`brook-http`), gRPC API (`brook-api`), server stack (`brook-daemon`), and ratatui TUI client (`brook-tui`), all driven by a single `brook` binary with clap subcommands. Architecture: [docs/architecture.md](docs/architecture.md). Stack: [docs/stack.md](docs/stack.md).
+**brook** is a macOS download manager: Rust async core (`brook-core`), HTTP adapter (`brook-http`), gRPC API (`brook-api`), server stack (`brook-daemon`), and ratatui TUI client (`brook-tui`), all driven by a single `brook` binary with clap subcommands. Product overview and architecture: [README.md](README.md).
 
 ### Crate layout
 
@@ -19,7 +19,7 @@ brook/
 │   ├── brook-daemon/             # lib: server stack (config, storage, bootstrap, sandbox)
 │   ├── brook-tui/                # lib: ratatui gRPC client
 │   └── brook/                    # the only [[bin]]: `brook` dispatch (TUI by default; `brook server …` = daemon)
-└── docs/
+└── README.md
 ```
 
 ### Invocation modes
@@ -66,7 +66,7 @@ just fix                     # clippy --fix + fmt
 | `.brook.lock` | Single-instance flock (held by `brook server`) |
 | `.brook.endpoint` | Sidecar with actual `{host, port}` — lets TUI discover ephemeral ports; removed on graceful shutdown |
 
-Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to the target file. The piece index, per-download settings and state history are rows in the shared `./brook.db` (tables `files`, `file_settings`, `state_changes`, `pieces` — see [docs/schema.dbml](docs/schema.dbml)).
+Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to the target file. The piece index, per-download settings and state history are rows in the shared `./brook.db` (tables `files`, `file_settings`, `state_changes`, `pieces`).
 
 ## Git
 
@@ -86,8 +86,6 @@ Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to th
 - **Merge strategy — squash & merge only.** No merge commits, no rebase-merge. The squash commit subject = PR title.
 
 - Never push to `main` directly. Never force-push shared branches without explicit user ask.
-
-- **Before pushing code changes, update [docs/todo.md](docs/todo.md) to match reality.** Tick off completed bullets, reword bullets that drifted from what actually landed, add new items discovered during the work. The todo is source of truth for MVP progress — it must not lag behind the code. Does not apply to pushes that only change docs.
 
 ## Coding conventions
 
@@ -118,5 +116,5 @@ Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to th
 
 ## Docs
 
-- **Language**: product docs under `docs/` stay in Russian (current convention). Only git artifacts (commits, PR titles/bodies, branch names, CHANGELOG) are English.
-- **Content**: docs describe *what* the system does and *why* — not how it's built. No code examples (Rust, SQL, proto snippets) and no implementation details in `docs/`. The code is the source of truth for implementation; docs reference it in prose.
+- Product overview lives in [README.md](README.md) (Russian — product convention). Git artifacts (commit messages, PR titles/bodies, branch names, CHANGELOG) are English.
+- README describes *what* and *why*, not implementation details. The code is the source of truth for how things are built; README references it in prose.

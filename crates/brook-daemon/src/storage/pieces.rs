@@ -1,9 +1,8 @@
 //! Репозиторий piece'ов всех загрузок в `./brook.db` поверх общего
 //! [`SharedDb`].
 //!
-//! После миграции на единую БД (см. [docs/todo.md] §4) sidecar
-//! `<name>.index.brook` исчезает: все piece-строки лежат в одной таблице
-//! `pieces`, scoping — по `file_id` (UUID загрузки).
+//! Sidecar `<name>.index.brook` не используется — все piece-строки лежат
+//! в одной таблице `pieces`, scoping — по `file_id` (UUID загрузки).
 //!
 //! ## Раскладка пропала из БД
 //!
@@ -18,7 +17,7 @@
 //!
 //! В БД живут только `pending` и `done`. Runtime-состояние `in_progress`
 //! engine'а на диск не персистится: после рестарта любой piece не в `done`
-//! трактуется как `pending` (см. [docs/todo.md] §21).
+//! трактуется как `pending`.
 //!
 //! ## Конкурентность
 //!
@@ -26,7 +25,6 @@
 //! `spawn_blocking`: `rusqlite` синхронный, держать его на async-потоке
 //! нельзя.
 //!
-//! [docs/todo.md]: ../../../../docs/todo.md
 //! [`SharedDb`]: super::db::SharedDb
 //! [`SharedDb::with_conn`]: super::db::SharedDb::with_conn
 
