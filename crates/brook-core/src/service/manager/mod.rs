@@ -304,10 +304,29 @@ where
     }
 
     /// Добавить новый файл. Возвращает его `FileId`.
+    ///
+    /// Синхронно вызывает `factory.resolve()` — один HEAD к источнику,
+    /// резолв имени и exists-чек. Если имя уже занято, клиент получает
+    /// `AlreadyExists` прямо в ответе на RPC `Add` (rename-модалка в TUI
+    /// открывается моментально, а не по Failed-переходу). На ошибке
+    /// резолва откатываем уже вставленную строку: `queue.remove` каскадом
+    /// снимет и `file_settings`.
     pub async fn add(&self, spec: FileSpec) -> Result<FileId> {
         let id = FileId::new();
-        let file = File::new(id, spec);
+        let mut file = File::new(id, spec.clone());
         self.shared.queue.insert(&file).await?;
+
+        let filename = match self.shared.factory.resolve(id, &spec).await {
+            Ok(name) => name,
+            Err(e) => {
+                if let Err(remove_err) = self.shared.queue.remove(id).await {
+                    warn!(%id, error = %remove_err, "failed to roll back queue row after resolve error");
+                }
+                return Err(e);
+            }
+        };
+        file.spec.filename = Some(filename);
+
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
             inner.records.insert(id, file.clone());

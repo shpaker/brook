@@ -30,10 +30,10 @@ use brook_proto::brook::v1::{
     GetSettingsRequest,
     GetSettingsResponse,
 };
-use brook_runtime::Endpoint;
-use brook_runtime::constants::{
-    DEFAULT_PORT,
-    ENDPOINT_FILENAME,
+use brook_runtime::constants::DEFAULT_PORT;
+use brook_runtime::{
+    AppPaths,
+    Endpoint,
 };
 use clap::Args;
 use crossterm::event::{
@@ -95,12 +95,17 @@ pub async fn run(args: TuiArgs) -> Result<()> {
         pass = Some(Arc::new(prompt_password("remote password: ")?));
     }
 
+    // Путь к sidecar — тот же, что у локального демона (платформо-зависимый
+    // cache-каталог или `BROOK_APP_DIR`). Для `--remote` не нужен, но
+    // резолв дешёвый и не ломается без HOME.
+    let endpoint_path = AppPaths::resolve()?.endpoint();
+
     // Выбор адреса: `--remote` побеждает всё. Иначе — endpoint-файл или
     // дефолтный loopback-порт.
     let endpoint_url = if let Some(remote) = &args.remote {
         format!("http://{remote}")
     } else {
-        resolve_endpoint_url(args.port)
+        resolve_endpoint_url(args.port, &endpoint_path)
     };
 
     let spawned_self;
@@ -126,10 +131,10 @@ pub async fn run(args: TuiArgs) -> Result<()> {
         Err(ProbeError::Transport(_)) => {
             // Локальный демон не отвечает — поднимаем сами. Sidecar мог
             // остаться от мёртвого — удаляем.
-            Endpoint::remove(Path::new(ENDPOINT_FILENAME));
+            Endpoint::remove(&endpoint_path);
             spawn_daemon().context("spawn brook server")?;
             spawned_self = true;
-            wait_for_daemon(pass.clone()).await?
+            wait_for_daemon(pass.clone(), &endpoint_path).await?
         }
     };
     let _ = pass;
@@ -157,11 +162,11 @@ fn prompt_password(prompt: &str) -> Result<String> {
 /// Построить URL gRPC-эндпоинта. Явный `--port` побеждает всё (это
 /// осознанный override пользователя), иначе пробуем прочитать sidecar,
 /// иначе — дефолтный loopback-порт.
-fn resolve_endpoint_url(explicit_port: Option<u16>) -> String {
+fn resolve_endpoint_url(explicit_port: Option<u16>, endpoint_path: &Path) -> String {
     if let Some(port) = explicit_port {
         return format!("http://127.0.0.1:{port}");
     }
-    if let Ok(Some(ep)) = Endpoint::read(Path::new(ENDPOINT_FILENAME)) {
+    if let Ok(Some(ep)) = Endpoint::read(endpoint_path) {
         return format!("http://{}:{}", ep.host, ep.port);
     }
     format!("http://127.0.0.1:{DEFAULT_PORT}")
@@ -254,12 +259,13 @@ fn default_sandbox_dir() -> Result<std::path::PathBuf> {
 /// `port = 0`).
 async fn wait_for_daemon(
     pass: Option<Arc<String>>,
+    endpoint_path: &Path,
 ) -> Result<(AuthedChannel, GetSettingsResponse)> {
     const ATTEMPTS: u32 = 30;
     const DELAY: Duration = Duration::from_millis(100);
     let mut last_err: Option<String> = None;
     for _ in 0..ATTEMPTS {
-        if let Ok(Some(ep)) = Endpoint::read(Path::new(ENDPOINT_FILENAME)) {
+        if let Ok(Some(ep)) = Endpoint::read(endpoint_path) {
             let url = format!("http://{}:{}", ep.host, ep.port);
             match probe(&url, pass.clone()).await {
                 Ok(v) => return Ok(v),

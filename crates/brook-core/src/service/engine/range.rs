@@ -9,6 +9,7 @@ use std::sync::atomic::{
     Ordering,
 };
 
+use bytes::BytesMut;
 use futures_util::StreamExt;
 use tokio::sync::{
     Mutex,
@@ -243,7 +244,14 @@ pub(super) async fn drain_stream_into_piece<S>(
 where
     S: TPieceStorage + Send + Sync,
 {
-    let mut buf: Vec<u8> = Vec::with_capacity(buf_cap);
+    // Накапливаем в `BytesMut`, отдаём в storage `freeze()`-ом. Две
+    // выгоды против старого `Vec<u8>`:
+    //   - `BytesMut::freeze` без копии превращает буфер в `Bytes`;
+    //     дальше storage может передать его в `spawn_blocking` по
+    //     владению (раньше там был `.to_vec()` — лишний memcpy).
+    //   - `extend_from_slice` из `Bytes` — единственная оставшаяся
+    //     копия на горячем пути сеть→диск.
+    let mut buf = BytesMut::with_capacity(buf_cap);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(range_err_to_piece)?;
         let mut slice: &[u8] = &chunk;
@@ -257,12 +265,13 @@ where
                 if total > size {
                     return Err(PieceError::Transient("piece overflow".into()));
                 }
+                let chunk_len = buf.len() as u64;
+                let bytes = std::mem::replace(&mut buf, BytesMut::with_capacity(buf_cap)).freeze();
                 storage
-                    .write_piece_bytes(idx, *written, &buf)
+                    .write_piece_bytes(idx, *written, bytes)
                     .await
                     .map_err(|e| PieceError::Permanent(format!("write: {e}")))?;
-                *written += buf.len() as u64;
-                buf.clear();
+                *written += chunk_len;
             }
         }
     }
@@ -271,11 +280,13 @@ where
         if total > size {
             return Err(PieceError::Transient("piece overflow".into()));
         }
+        let chunk_len = buf.len() as u64;
+        let bytes = buf.freeze();
         storage
-            .write_piece_bytes(idx, *written, &buf)
+            .write_piece_bytes(idx, *written, bytes)
             .await
             .map_err(|e| PieceError::Permanent(format!("write: {e}")))?;
-        *written += buf.len() as u64;
+        *written += chunk_len;
     }
     if *written != size {
         // Усечённый поток — транзиентный сбой, будет ретрай.

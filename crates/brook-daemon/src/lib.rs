@@ -50,10 +50,13 @@ pub struct ServerArgs {
     pub client_pass: Option<String>,
 }
 
-/// Запустить демон со стандартной конфигурацией из `./brook.yaml` (CWD),
-/// санпесочницей в `args.directory`.
+/// Запустить демон с платформо-зависимыми путями для `brook.yaml`,
+/// `brook.db`, `.brook.lock` и `.brook.endpoint` (см. `brook_runtime::AppPaths`)
+/// и песочницей в `args.directory`. Переменная `BROOK_APP_DIR`
+/// переопределяет все четыре файла в один каталог.
 pub async fn run(args: ServerArgs) -> anyhow::Result<()> {
-    let paths = Paths::in_cwd();
+    let app = brook_runtime::AppPaths::resolve()?;
+    let paths = Paths::from_app_paths(&app);
     let runtime = build_runtime(&paths, &args).await?;
     serve(runtime, shutdown_signal()).await?;
     Ok(())

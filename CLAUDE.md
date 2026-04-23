@@ -57,16 +57,22 @@ just fix                     # clippy --fix + fmt
 `cargo fmt`/`cargo clippy` ведут к несогласованным флагам и срабатывают
 не с тем rustfmt-тулчейном.
 
-### Runtime artifacts in CWD
+### Runtime artifacts
 
-| File | Purpose |
-|---|---|
-| `brook.yaml` | YAML config (global + per-download defaults) |
-| `brook.db` | Global download queue (SQLite, WAL) |
-| `.brook.lock` | Single-instance flock (held by `brook server`) |
-| `.brook.endpoint` | Sidecar with actual `{host, port}` — lets TUI discover ephemeral ports; removed on graceful shutdown |
+Пути резолвит `brook_runtime::AppPaths` через `directories::ProjectDirs`.
+Для загрузки/выгрузки `BROOK_APP_DIR` перенаправляет все четыре файла в
+один каталог (удобно для dev-запусков и изолированных инсталляций).
 
-Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to the target file. The piece index, per-download settings and state history are rows in the shared `./brook.db` (tables `files`, `file_settings`, `state_changes`, `pieces`).
+| File | macOS | Linux (XDG) | Windows | Purpose |
+|---|---|---|---|---|
+| `brook.yaml`      | `~/Library/Application Support/brook/` | `~/.config/brook/`      | `%APPDATA%\brook\config\`   | YAML config (global + per-download defaults) |
+| `brook.db`        | `~/Library/Application Support/brook/` | `~/.local/share/brook/` | `%APPDATA%\brook\data\`     | Global download queue (SQLite, WAL) |
+| `.brook.lock`     | `~/Library/Caches/brook/`              | `~/.cache/brook/`       | `%LOCALAPPDATA%\brook\cache\` | Single-instance flock (held by `brook server`) |
+| `.brook.endpoint` | `~/Library/Caches/brook/`              | `~/.cache/brook/`       | `%LOCALAPPDATA%\brook\cache\` | Sidecar with actual `{host, port}` — lets TUI discover ephemeral ports; removed on graceful shutdown |
+
+Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to the target file. The piece index, per-download settings and state history are rows in the shared `brook.db` (tables `files`, `file_settings`, `state_changes`, `pieces`).
+
+Integration-тесты обходят `AppPaths` и кладут все четыре файла в один tempdir через `brook_daemon::app::Paths::in_dir`.
 
 ## Git
 
@@ -92,6 +98,7 @@ Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to th
 - **Trait names** — prefix with `T`: `TPieceStorage`, `TQueueStore`, `TPieceStorageFactory`. Applies to all traits in every crate of this workspace.
 - **`brook-core` layout — Hexagonal (Ports & Adapters).** New domain types go into `crates/brook-core/src/domain/` (pure, no I/O, no external-world dependencies). New outbound traits — into `crates/brook-core/src/ports/`. Application services (coordinators like `DownloadManager`, `DownloadEngine`) — into `crates/brook-core/src/service/` (to be created at stage 1.3). Concrete adapters (SQLite, HTTP clients, gRPC) **never** live in `brook-core` — they belong in `brook-daemon`, `brook-http`, `brook-api`, or other dedicated adapter crates. `brook-core` must not depend on `reqwest`, `rusqlite`, or any other I/O library; enforced by `cargo tree -p brook-core`. The public API of `brook-core` stays flat (`brook_core::DownloadId`, `brook_core::TPieceStorage`) — internal folders exist to keep layers from mixing, not to nest the API.
 - **DB access — only through repository structs.** Any SQLite manipulation in `brook.db` lives inside a dedicated repository struct. SQL strings and `rusqlite::Connection` usage never leak past the repository boundary — callers get domain methods, not queries.
+- **TUI hint bars — символ клавиши всегда выделяется цветом.** Любая подсказка вида `<key> · <действие>` или `<key> <действие>` (в статус-баре главного окна, в футере модалки, в тостах) рендерится минимум двумя `Span`'ами: сама клавиша — accent (`Color::Cyan`), описание — dim (`Color::DarkGray`). Одним серым куском хинт класть нельзя — пользователь должен мгновенно видеть, какую клавишу нажать. В режиме `no_color` оба Span'а получают `Modifier::DIM`, но раскладка «клавиша отдельным span'ом» сохраняется. Эталоны — `hints_bar` в [crates/brook-tui/src/ui/chrome.rs](crates/brook-tui/src/ui/chrome.rs) и `hint_line` в [crates/brook-tui/src/ui/modal.rs](crates/brook-tui/src/ui/modal.rs); новые хинты собирать через них, а не через одиночный `Span::styled(string, …)`.
 
 ## Formatting (Rust)
 

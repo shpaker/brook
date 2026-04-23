@@ -102,6 +102,10 @@ pub struct InspectFields {
     pub last_modified: Option<String>,
     /// URL после цепочки редиректов — для воркеров (§3 плана).
     pub effective_url: Option<String>,
+    /// Поддерживает ли источник `Range` (из первого inspect'а). Для
+    /// streaming-режима (`total_size = None`) смысла не имеет; хранится,
+    /// чтобы `prepare()` не передёргивал HEAD ради одного бита.
+    pub accepts_ranges: bool,
 }
 
 /// SQLite-репозиторий загрузок.
@@ -117,8 +121,14 @@ impl SqliteFileRepository {
         Self { db }
     }
 
-    /// Записать результат `inspect` в `file_settings`. Вызывает фабрика
-    /// (stage 6). 0 строк ⇒ `NotFound`.
+    /// Записать результат `inspect` в `file_settings` (+ `files.filename`).
+    /// Вызывает фабрика при `resolve()`. 0 строк ⇒ `NotFound`.
+    ///
+    /// `filename` уходит в `files.filename` — это resolved-имя после
+    /// `Content-Disposition` / `spec.filename` / URL-tail, которое менеджер
+    /// потом использует во всех API-ответах (иначе TUI падает на URL-хвост,
+    /// который для CDN-архивов бывает UUID'ом).
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_inspect_fields(
         &self,
         id: FileId,
@@ -127,6 +137,8 @@ impl SqliteFileRepository {
         etag: Option<String>,
         last_modified: Option<String>,
         effective_url: Option<String>,
+        accepts_ranges: bool,
+        filename: String,
     ) -> CoreResult<()> {
         run(&self.db, move |c| {
             set_inspect_fields_impl(
@@ -137,6 +149,8 @@ impl SqliteFileRepository {
                 etag,
                 last_modified,
                 effective_url,
+                accepts_ranges,
+                filename,
             )
         })
         .await
@@ -343,6 +357,7 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_inspect_fields_impl(
     conn: &mut Connection,
     id: FileId,
@@ -351,10 +366,15 @@ fn set_inspect_fields_impl(
     etag: Option<String>,
     last_modified: Option<String>,
     effective_url: Option<String>,
+    accepts_ranges: bool,
+    filename: String,
 ) -> FilesResult<()> {
-    let n = conn.execute(
+    let id_str = id.to_string();
+    let tx = conn.transaction()?;
+    let n = tx.execute(
         "UPDATE file_settings
-           SET total_size = ?, piece_size = ?, etag = ?, last_modified = ?, effective_url = ?
+           SET total_size = ?, piece_size = ?, etag = ?, last_modified = ?,
+               effective_url = ?, accepts_ranges = ?
          WHERE file_id = ?",
         params![
             total_size.map(|v| v as i64),
@@ -362,12 +382,18 @@ fn set_inspect_fields_impl(
             etag,
             last_modified,
             effective_url,
-            id.to_string(),
+            accepts_ranges as i64,
+            id_str,
         ],
     )?;
     if n == 0 {
         return Err(FilesError::NotFound);
     }
+    tx.execute(
+        "UPDATE files SET filename = ? WHERE id = ?",
+        params![filename, id_str],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -384,10 +410,11 @@ fn get_inspect_fields_impl(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<i64>,
     );
     let row: Option<InspectRow> = conn
         .query_row(
-            "SELECT total_size, piece_size, etag, last_modified, effective_url
+            "SELECT total_size, piece_size, etag, last_modified, effective_url, accepts_ranges
              FROM file_settings WHERE file_id = ?",
             params![id.to_string()],
             |r| {
@@ -397,30 +424,28 @@ fn get_inspect_fields_impl(
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((total, piece, etag, last_modified, effective_url)) = row else {
+    let Some((total, piece, etag, last_modified, effective_url, accepts_ranges)) = row else {
         return Err(FilesError::NotFound);
     };
-    // Строка `file_settings` есть всегда (INSERT при `insert_impl`); если
-    // ни total_size, ни piece_size ещё не выставлены — возвращаем None,
-    // иначе собираем DTO с тем, что есть (streaming — с `None` в обоих).
-    let inspect_filled = total.is_some()
-        || piece.is_some()
-        || etag.is_some()
-        || last_modified.is_some()
-        || effective_url.is_some();
-    if !inspect_filled {
+    // `accepts_ranges IS NOT NULL` — маркер «inspect уже записан»: колонка
+    // заполняется только из `set_inspect_fields`. До неё все остальные
+    // поля могут быть NULL сами по себе (streaming без etag), поэтому
+    // полагаться на их суммарное «filled» ненадёжно.
+    let Some(accepts_ranges) = accepts_ranges else {
         return Ok(None);
-    }
+    };
     Ok(Some(InspectFields {
         total_size: total.map(|v| v as u64),
         piece_size: piece.map(|v| v as u64),
         etag,
         last_modified,
         effective_url,
+        accepts_ranges: accepts_ranges != 0,
     }))
 }
 
@@ -757,6 +782,8 @@ mod tests {
             Some("\"abc\"".into()),
             Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
             Some("https://cdn.example/resolved".into()),
+            true,
+            "resolved.bin".into(),
         )
         .await
         .unwrap();
@@ -773,14 +800,21 @@ mod tests {
             got.effective_url.as_deref(),
             Some("https://cdn.example/resolved")
         );
+        assert!(got.accepts_ranges);
+
+        // `files.filename` тоже обновился.
+        let loaded = repo.load_all().await.unwrap();
+        let row = loaded.iter().find(|d| d.id == id).unwrap();
+        assert_eq!(row.spec.filename.as_deref(), Some("resolved.bin"));
 
         // Повторный set перезаписывает.
-        repo.set_inspect_fields(id, Some(1), Some(1), None, None, None)
+        repo.set_inspect_fields(id, Some(1), Some(1), None, None, None, false, "x".into())
             .await
             .unwrap();
         let got = repo.get_inspect_fields(id).await.unwrap().unwrap();
         assert_eq!(got.total_size, Some(1));
         assert!(got.etag.is_none());
+        assert!(!got.accepts_ranges);
     }
 
     #[tokio::test]

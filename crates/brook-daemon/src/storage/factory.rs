@@ -93,24 +93,18 @@ where
     type Storage = LocalPieceStorage;
     type StreamStorage = LocalStreamStorage;
 
-    fn prepare(
+    fn resolve(
         &self,
         id: FileId,
         spec: &FileSpec,
-    ) -> impl std::future::Future<
-        Output = Result<PreparedDownload<Self::Storage, Self::StreamStorage>>,
-    > + Send {
-        // Клонируем всё, что нужно для async-блока: фабрика может быть
-        // живее отдельного `prepare`-вызова.
+    ) -> impl std::future::Future<Output = Result<String>> + Send {
         let inspect = Arc::clone(&self.inspect);
         let defaults = self.defaults;
-        let pieces_repo = Arc::clone(&self.pieces_repo);
         let files_repo = Arc::clone(&self.files_repo);
         let policy = Arc::clone(&self.policy);
         let spec = spec.clone();
         async move {
             // Клэмп target_dir первым — до любого сетевого/дискового I/O.
-            // Escape — ошибка, которая маппится в PermissionDenied.
             let target_dir = policy.check_target_dir(&spec.target_dir)?;
 
             let report = inspect
@@ -124,29 +118,69 @@ where
                 return Err(Error::FileExists { filename });
             }
 
-            let guard = RangeGuard::from_report(&report);
-            let effective_url = report.effective_url.clone();
-
-            match report.total_size {
+            let piece_size = match report.total_size {
                 Some(total_size) => {
                     let cfg = effective_plan_config(&defaults)
                         .map_err(|e| Error::Other(format!("plan config: {e}")))?;
-                    // `plan_pieces` считает раскладку, но геометрия piece'ов
-                    // арифметическая: нужен только `piece_size`.
-                    let piece_size = plan_pieces(total_size, cfg).piece_size;
-                    let accepts_ranges = report.accepts_ranges;
+                    Some(plan_pieces(total_size, cfg).piece_size)
+                }
+                None => None,
+            };
 
-                    files_repo
-                        .set_inspect_fields(
-                            id,
-                            Some(total_size),
-                            Some(piece_size),
-                            report.etag.clone(),
-                            report.last_modified.clone(),
-                            effective_url.clone(),
-                        )
-                        .await?;
+            files_repo
+                .set_inspect_fields(
+                    id,
+                    report.total_size,
+                    piece_size,
+                    report.etag.clone(),
+                    report.last_modified.clone(),
+                    report.effective_url.clone(),
+                    report.accepts_ranges,
+                    filename.clone(),
+                )
+                .await?;
 
+            Ok(filename)
+        }
+    }
+
+    fn prepare(
+        &self,
+        id: FileId,
+        spec: &FileSpec,
+    ) -> impl std::future::Future<
+        Output = Result<PreparedDownload<Self::Storage, Self::StreamStorage>>,
+    > + Send {
+        let pieces_repo = Arc::clone(&self.pieces_repo);
+        let files_repo = Arc::clone(&self.files_repo);
+        let policy = Arc::clone(&self.policy);
+        let spec = spec.clone();
+        async move {
+            let target_dir = policy.check_target_dir(&spec.target_dir)?;
+
+            // Штатный путь: inspect-поля уже уехали в `file_settings`
+            // из `resolve()` при `Add`. Ключевой инвариант — никакого
+            // HEAD'а здесь больше нет.
+            let fields = files_repo
+                .get_inspect_fields(id)
+                .await?
+                .ok_or_else(|| Error::Other(format!("inspect fields missing for {id}")))?;
+
+            // `spec.filename` заполняет `resolve()`; без этого имя
+            // восстановить нечем — файл в БД неконсистентен.
+            let filename = spec.filename.clone().ok_or_else(|| {
+                Error::Other(format!("spec.filename missing for {id} (resolve skipped?)"))
+            })?;
+            validate_filename(&filename).map_err(|e| Error::Other(format!("filename: {e}")))?;
+
+            let guard = guard_from_fields(&fields);
+            let effective_url = fields.effective_url.clone();
+
+            match fields.total_size {
+                Some(total_size) => {
+                    let piece_size = fields.piece_size.ok_or_else(|| {
+                        Error::Other(format!("piece_size missing for {id} with known total_size"))
+                    })?;
                     let storage = LocalPieceStorage::open(
                         &target_dir,
                         &filename,
@@ -157,12 +191,11 @@ where
                         files_repo,
                     )
                     .await?;
-
                     Ok(PreparedDownload {
                         mode: PreparedMode::Known {
                             total_size,
                             piece_size,
-                            accepts_ranges,
+                            accepts_ranges: fields.accepts_ranges,
                             guard,
                         },
                         piece_storage: Some(storage),
@@ -172,18 +205,6 @@ where
                     })
                 }
                 None => {
-                    // Streaming-режим: ни размера, ни piece-нарезки. Один
-                    // воркер, append-mode. Resume не поддерживается.
-                    files_repo
-                        .set_inspect_fields(
-                            id,
-                            None,
-                            None,
-                            report.etag.clone(),
-                            report.last_modified.clone(),
-                            effective_url.clone(),
-                        )
-                        .await?;
                     let stream = LocalStreamStorage::open_streaming(&target_dir, &filename).await?;
                     Ok(PreparedDownload {
                         mode: PreparedMode::Streaming,
@@ -195,6 +216,17 @@ where
                 }
             }
         }
+    }
+}
+
+/// Реконструкция [`RangeGuard`] из уже персистнутых inspect-полей.
+/// Параллельна [`RangeGuard::from_report`], но без зависимости от
+/// `InspectReport` (у нас на этом этапе его уже нет — только DB-DTO).
+fn guard_from_fields(fields: &crate::storage::files::InspectFields) -> Option<RangeGuard> {
+    if let Some(etag) = &fields.etag {
+        Some(RangeGuard::Etag(etag.clone()))
+    } else {
+        fields.last_modified.clone().map(RangeGuard::LastModified)
     }
 }
 
@@ -316,8 +348,30 @@ mod tests {
         (db, files, pieces, id, factory)
     }
 
+    /// Пройти через `resolve()` + `prepare()`, имитируя вызов из
+    /// `DownloadManager::add` + последующий `spawn_engine`. После
+    /// `resolve()` возвращает обновлённый `FileSpec` с заполненным
+    /// `filename` (так бы сделал менеджер перед `prepare()`).
+    async fn resolve_then_prepare<I>(
+        factory: &LocalPieceStorageFactory<I, AllowAnyPath>,
+        id: FileId,
+        spec: &FileSpec,
+    ) -> (
+        String,
+        PreparedDownload<LocalPieceStorage, LocalStreamStorage>,
+    )
+    where
+        I: THttpInspect + ?Sized + Send + Sync + 'static,
+    {
+        let name = factory.resolve(id, spec).await.unwrap();
+        let mut next = spec.clone();
+        next.filename = Some(name.clone());
+        let prepared = factory.prepare(id, &next).await.unwrap();
+        (name, prepared)
+    }
+
     #[tokio::test]
-    async fn prepare_uses_spec_filename_first() {
+    async fn resolve_uses_spec_filename_first() {
         let dir = tempdir().unwrap();
         let spec = FileSpec {
             url: "https://host/path/server.bin".into(),
@@ -329,7 +383,8 @@ mod tests {
             &spec,
         )
         .await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
+        let (name, prepared) = resolve_then_prepare(&factory, id, &spec).await;
+        assert_eq!(name, "explicit.bin");
         assert_eq!(prepared.resolved_filename, "explicit.bin");
         match prepared.mode {
             PreparedMode::Known {
@@ -347,7 +402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_falls_back_to_report_filename() {
+    async fn resolve_falls_back_to_report_filename() {
         let dir = tempdir().unwrap();
         let spec = FileSpec {
             url: "https://host/path/server.bin".into(),
@@ -356,12 +411,13 @@ mod tests {
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(2048), Some("from-header.bin")), &spec).await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
+        let (name, prepared) = resolve_then_prepare(&factory, id, &spec).await;
+        assert_eq!(name, "from-header.bin");
         assert_eq!(prepared.resolved_filename, "from-header.bin");
     }
 
     #[tokio::test]
-    async fn prepare_falls_back_to_url_tail() {
+    async fn resolve_falls_back_to_url_tail() {
         let dir = tempdir().unwrap();
         let spec = FileSpec {
             url: "https://host/path/server.bin?x=1".into(),
@@ -370,7 +426,8 @@ mod tests {
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(2048), None), &spec).await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
+        let (name, prepared) = resolve_then_prepare(&factory, id, &spec).await;
+        assert_eq!(name, "server.bin");
         assert_eq!(prepared.resolved_filename, "server.bin");
     }
 
@@ -380,7 +437,7 @@ mod tests {
         let spec = FileSpec::new("https://host/f.bin", dir.path());
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(None, Some("f.bin")), &spec).await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
+        let (_, prepared) = resolve_then_prepare(&factory, id, &spec).await;
         assert!(
             matches!(prepared.mode, PreparedMode::Streaming),
             "expected Streaming mode, got {:?}",
@@ -392,7 +449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_uses_daemon_piece_size() {
+    async fn resolve_uses_daemon_piece_size() {
         let dir = tempdir().unwrap();
         let spec = FileSpec {
             url: "https://host/f.bin".into(),
@@ -401,7 +458,7 @@ mod tests {
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(64 * 1024 * 1024), Some("f.bin")), &spec).await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
+        let (_, prepared) = resolve_then_prepare(&factory, id, &spec).await;
         // 64 MiB / 128 = 512 KiB → clamp(min=16 MiB) = 16 MiB.
         match prepared.mode {
             PreparedMode::Known { piece_size, .. } => assert_eq!(piece_size, 16 * 1024 * 1024),
@@ -410,7 +467,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_persists_inspect_fields() {
+    async fn resolve_persists_inspect_fields() {
         let dir = tempdir().unwrap();
         let spec = FileSpec {
             url: "https://host/f.bin".into(),
@@ -419,7 +476,7 @@ mod tests {
         };
         let (_db, files, _pieces, id, factory) =
             build(inspect_with(Some(64 * 1024 * 1024), Some("f.bin")), &spec).await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
+        let (_, prepared) = resolve_then_prepare(&factory, id, &spec).await;
         let prepared_piece_size = match prepared.mode {
             PreparedMode::Known { piece_size, .. } => piece_size,
             PreparedMode::Streaming => panic!("expected Known"),
@@ -433,6 +490,12 @@ mod tests {
             got.last_modified.as_deref(),
             Some("Wed, 21 Oct 2015 07:28:00 GMT")
         );
+        assert!(got.accepts_ranges);
+
+        // `files.filename` обновился именем, которое отдал resolve().
+        let loaded = files.load_all().await.unwrap();
+        let row = loaded.iter().find(|d| d.id == id).unwrap();
+        assert_eq!(row.spec.filename.as_deref(), Some("f.bin"));
     }
 
     #[test]
@@ -458,13 +521,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn errors_with_file_exists_when_target_present() {
+    async fn resolve_errors_with_file_exists_when_target_present() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("f.bin"), b"old").unwrap();
         let spec = spec_for(dir.path(), "f.bin");
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(1024), Some("f.bin")), &spec).await;
-        let err = match factory.prepare(id, &spec).await {
+        let err = match factory.resolve(id, &spec).await {
             Err(e) => e,
             Ok(_) => panic!("expected FileExists error"),
         };
@@ -477,12 +540,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_filename_when_target_absent() {
+    async fn resolve_keeps_filename_when_target_absent() {
         let dir = tempdir().unwrap();
         let spec = spec_for(dir.path(), "f.bin");
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(1024), Some("f.bin")), &spec).await;
-        let prepared = factory.prepare(id, &spec).await.unwrap();
-        assert_eq!(prepared.resolved_filename, "f.bin");
+        let name = factory.resolve(id, &spec).await.unwrap();
+        assert_eq!(name, "f.bin");
+    }
+
+    #[tokio::test]
+    async fn prepare_errors_when_resolve_skipped() {
+        // Если `resolve()` не вызвали (нет inspect-полей в БД),
+        // `prepare()` не должен делать HEAD сам — он падает с понятной
+        // ошибкой, чтобы менеджер увидел рассинхрон между Add и spawn.
+        let dir = tempdir().unwrap();
+        let spec = FileSpec {
+            url: "https://host/f.bin".into(),
+            target_dir: dir.path().to_path_buf(),
+            filename: Some("f.bin".into()),
+        };
+        let (_db, _files, _pieces, id, factory) =
+            build(inspect_with(Some(1024), Some("f.bin")), &spec).await;
+        let err = match factory.prepare(id, &spec).await {
+            Ok(_) => panic!("prepare() succeeded without resolve()"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("inspect fields missing"),
+            "got {err:?}"
+        );
     }
 }

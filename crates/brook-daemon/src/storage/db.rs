@@ -113,7 +113,8 @@ CREATE TABLE IF NOT EXISTS file_settings (
     piece_size         INTEGER,
     etag               TEXT,
     last_modified      TEXT,
-    effective_url      TEXT
+    effective_url      TEXT,
+    accepts_ranges     INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS status_changes (
@@ -205,28 +206,48 @@ const REASON_CODES: &[&str] = &[
 
 fn migrate(conn: &mut Connection) -> DbResult<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if current >= 1 {
-        return Ok(());
-    }
 
-    let tx = conn.transaction()?;
-    tx.execute_batch(SCHEMA_V1)?;
+    if current < 1 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V1)?;
 
-    {
-        let mut stmt = tx.prepare("INSERT OR IGNORE INTO statuses (name) VALUES (?1)")?;
-        for name in STATUSES {
-            stmt.execute([name])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO statuses (name) VALUES (?1)")?;
+            for name in STATUSES {
+                stmt.execute([name])?;
+            }
         }
-    }
-    {
-        let mut stmt = tx.prepare("INSERT OR IGNORE INTO reason_codes (code) VALUES (?1)")?;
-        for code in REASON_CODES {
-            stmt.execute([code])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO reason_codes (code) VALUES (?1)")?;
+            for code in REASON_CODES {
+                stmt.execute([code])?;
+            }
         }
+
+        tx.pragma_update(None, "user_version", 1i64)?;
+        tx.commit()?;
     }
 
-    tx.pragma_update(None, "user_version", 1i64)?;
-    tx.commit()?;
+    // V2: колонка `accepts_ranges` в `file_settings`. До V2 её не было,
+    // потому что `prepare()` каждый раз дергал `inspect()` заново; после
+    // перехода на «один HEAD на Add» эта характеристика тоже персистится.
+    // Для новых БД SCHEMA_V1 создаёт колонку сразу — ALTER ниже тихо упадёт
+    // в «duplicate column», это ожидаемо.
+    if current < 2 {
+        let tx = conn.transaction()?;
+        match tx.execute(
+            "ALTER TABLE file_settings ADD COLUMN accepts_ranges INTEGER",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(e.into()),
+        }
+        tx.pragma_update(None, "user_version", 2i64)?;
+        tx.commit()?;
+    }
+
     Ok(())
 }
 
@@ -260,7 +281,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
 
         let tables = table_names(&conn);
         for t in [
@@ -305,7 +326,7 @@ mod tests {
             let version: i64 = conn
                 .pragma_query_value(None, "user_version", |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 1);
+            assert_eq!(version, 2);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM statuses"), 7);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 9);
         }
