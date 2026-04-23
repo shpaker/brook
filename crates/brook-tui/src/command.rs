@@ -152,17 +152,23 @@ pub fn retry(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) 
     });
 }
 
-/// macOS Finder reveal: `open -R <path>`. Ошибки игнорируем —
-/// «открыть» не часть контракта UI, а удобство.
+/// macOS Finder reveal: `open -R <path>` на файл, либо `open <dir>`,
+/// если имени файла нет (демон не всегда пробрасывает resolved filename
+/// в snapshot — тогда хотя бы открываем родительскую папку, это лучше
+/// молчаливого no-op). Ошибки игнорируем — «открыть» не часть контракта
+/// UI, а удобство.
 pub fn reveal_in_finder(target_dir: &str, filename: &str) {
-    if target_dir.is_empty() || filename.is_empty() {
+    if target_dir.is_empty() {
         return;
     }
-    let path = std::path::Path::new(target_dir).join(filename);
-    let _ = std::process::Command::new("open")
-        .arg("-R")
-        .arg(path)
-        .spawn();
+    let mut cmd = std::process::Command::new("open");
+    if filename.is_empty() {
+        cmd.arg(target_dir);
+    } else {
+        let path = std::path::Path::new(target_dir).join(filename);
+        cmd.arg("-R").arg(path);
+    }
+    let _ = cmd.spawn();
 }
 
 /// Remove идемпотентен на стороне демона (см. `manager::remove`): ghost

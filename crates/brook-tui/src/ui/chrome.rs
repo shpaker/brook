@@ -53,7 +53,7 @@ pub fn top_title(vm: &ViewModel) -> Line<'static> {
         Span::styled(tail, tail_style),
         dim(" ]"),
     ])
-    .alignment(Alignment::Left)
+    .alignment(Alignment::Center)
 }
 
 /// Нижний хинт-бар: `[ ␣ <verb> | a add | d delete | q quit ]`.
@@ -76,7 +76,7 @@ pub fn hints_bar(action_word: &str) -> Line<'static> {
         dim(" quit "),
         dim("]"),
     ])
-    .alignment(Alignment::Right)
+    .alignment(Alignment::Center)
 }
 
 /// Конкретный глагол для `␣ <verb>` в хинт-баре. Берётся по статусу
