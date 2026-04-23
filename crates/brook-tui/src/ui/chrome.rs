@@ -2,7 +2,7 @@
 //!
 //! Обе «шапки» — `Line`-титулы `Block`'а (`title` / `title_bottom`).
 //! Верх: `[ brook | 127.0.0.1:<port> ]`, низ: `[ ␣ action | a add | d
-//! delete | ? help ]`. Toast подменяет нижний хинт-бар своей строкой.
+//! delete | q quit ]`. Toast подменяет нижний хинт-бар своей строкой.
 
 use brook_proto::brook::v1::FileStatus;
 use ratatui::layout::Alignment;
@@ -56,7 +56,7 @@ pub fn top_title(vm: &ViewModel) -> Line<'static> {
     .alignment(Alignment::Left)
 }
 
-/// Нижний хинт-бар: `[ ␣ <verb> | a add | d delete | ? help ]`.
+/// Нижний хинт-бар: `[ ␣ <verb> | a add | d delete | q quit ]`.
 /// `<verb>` зависит от статуса строки под курсором — pause/resume/
 /// retry/reveal; если действия нет (Cancelled или пустой список) —
 /// рисуем `—`, чтобы ширина бара оставалась предсказуемой.
@@ -72,8 +72,8 @@ pub fn hints_bar(action_word: &str) -> Line<'static> {
         accent("d"),
         dim(" delete "),
         dim("| "),
-        accent("?"),
-        dim(" help "),
+        accent("q"),
+        dim(" quit "),
         dim("]"),
     ])
     .alignment(Alignment::Right)

@@ -281,6 +281,7 @@ dependencies = [
  "brook-http",
  "brook-proto",
  "brook-runtime",
+ "bytes",
  "clap",
  "directories",
  "fs4",
@@ -333,6 +334,7 @@ name = "brook-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "directories",
  "serde",
  "serde_yaml",
  "tempfile",

@@ -13,5 +13,10 @@
 
 pub mod constants;
 pub mod endpoint;
+pub mod paths;
 
 pub use endpoint::Endpoint;
+pub use paths::{
+    APP_DIR_ENV,
+    AppPaths,
+};

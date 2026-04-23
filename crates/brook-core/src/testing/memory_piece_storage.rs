@@ -17,6 +17,8 @@ use std::collections::{
 };
 use std::sync::Mutex;
 
+use bytes::Bytes;
+
 use crate::domain::{
     FileId,
     FileSpec,
@@ -120,7 +122,7 @@ impl TPieceStorage for MemoryPieceStorage {
         &self,
         piece_index: u32,
         offset_in_piece: u64,
-        bytes: &[u8],
+        bytes: Bytes,
     ) -> Result<()> {
         let mut inner = self.inner.lock().expect("mutex poisoned");
         if inner.finalized {
@@ -148,7 +150,7 @@ impl TPieceStorage for MemoryPieceStorage {
                 buf.len()
             )));
         }
-        buf[start..end].copy_from_slice(bytes);
+        buf[start..end].copy_from_slice(&bytes);
         Ok(())
     }
 
@@ -333,6 +335,16 @@ impl TPieceStorageFactory for MemoryPieceStorageFactory {
     type Storage = MemoryPieceStorage;
     type StreamStorage = MemoryStreamStorage;
 
+    async fn resolve(&self, _id: FileId, spec: &FileSpec) -> Result<String> {
+        // In-memory фабрика живёт в тестах: никакого inspect'а, никакого
+        // exists-чека. Имя приходит готовым из spec (тесты задают явно),
+        // иначе — синтетический `memory.bin`.
+        Ok(spec
+            .filename
+            .clone()
+            .unwrap_or_else(|| "memory.bin".to_owned()))
+    }
+
     async fn prepare(
         &self,
         _id: FileId,
@@ -383,19 +395,19 @@ mod tests {
 
         // Пишем байты во все три куска в два захода (проверяем offset_in_piece).
         storage
-            .write_piece_bytes(0, 0, &[0xAA, 0xBB])
+            .write_piece_bytes(0, 0, Bytes::from_static(&[0xAA, 0xBB]))
             .await
             .unwrap();
         storage
-            .write_piece_bytes(0, 2, &[0xCC, 0xDD])
+            .write_piece_bytes(0, 2, Bytes::from_static(&[0xCC, 0xDD]))
             .await
             .unwrap();
         storage
-            .write_piece_bytes(1, 0, &[1, 2, 3, 4])
+            .write_piece_bytes(1, 0, Bytes::from_static(&[1, 2, 3, 4]))
             .await
             .unwrap();
         storage
-            .write_piece_bytes(2, 0, &[9, 9, 9, 9])
+            .write_piece_bytes(2, 0, Bytes::from_static(&[9, 9, 9, 9]))
             .await
             .unwrap();
 
@@ -426,16 +438,24 @@ mod tests {
     #[tokio::test]
     async fn write_after_finalize_is_rejected() {
         let s = MemoryPieceStorage::new(1, 2);
-        s.write_piece_bytes(0, 0, &[1, 2]).await.unwrap();
+        s.write_piece_bytes(0, 0, Bytes::from_static(&[1, 2]))
+            .await
+            .unwrap();
         s.commit_done(0).await.unwrap();
         s.finalize().await.unwrap();
-        assert!(s.write_piece_bytes(0, 0, &[3, 4]).await.is_err());
+        assert!(
+            s.write_piece_bytes(0, 0, Bytes::from_static(&[3, 4]))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn abort_wipes_state_and_blocks_commit() {
         let s = MemoryPieceStorage::new(2, 4);
-        s.write_piece_bytes(0, 0, &[1, 2, 3, 4]).await.unwrap();
+        s.write_piece_bytes(0, 0, Bytes::from_static(&[1, 2, 3, 4]))
+            .await
+            .unwrap();
         s.commit_done(0).await.unwrap();
         s.abort().await.unwrap();
 
@@ -450,9 +470,17 @@ mod tests {
     async fn write_out_of_bounds_errors() {
         let s = MemoryPieceStorage::new(1, 4);
         // Несуществующий piece_index.
-        assert!(s.write_piece_bytes(5, 0, &[0]).await.is_err());
+        assert!(
+            s.write_piece_bytes(5, 0, Bytes::from_static(&[0]))
+                .await
+                .is_err()
+        );
         // За пределы piece_size.
-        assert!(s.write_piece_bytes(0, 3, &[0, 0]).await.is_err());
+        assert!(
+            s.write_piece_bytes(0, 3, Bytes::from_static(&[0, 0]))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -478,7 +506,10 @@ mod tests {
 
         let a_storage = a.piece_storage.as_ref().expect("Known carries storage");
         let b_storage = b.piece_storage.as_ref().expect("Known carries storage");
-        a_storage.write_piece_bytes(0, 0, &[1, 2, 3]).await.unwrap();
+        a_storage
+            .write_piece_bytes(0, 0, Bytes::from_static(&[1, 2, 3]))
+            .await
+            .unwrap();
         a_storage.commit_done(0).await.unwrap();
 
         // У `b` ничего не закоммичено — инстансы независимы.

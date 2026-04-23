@@ -90,10 +90,15 @@ fn draw_add(f: &mut Frame, m: &AddModal, no_color: bool) {
     } else {
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled(
-        " Tab · switch   Enter · add   Esc · cancel ",
-        hint_style(no_color),
-    )));
+    lines.push(hint_line(
+        &[
+            ("Tab", Some("switch")),
+            ("Enter", Some("add")),
+            ("Esc", Some("cancel")),
+        ],
+        "   ",
+        no_color,
+    ));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -115,12 +120,39 @@ fn field_line(label: &'static str, value: &str, focused: bool, no_color: bool) -
     ])
 }
 
-fn hint_style(no_color: bool) -> Style {
-    if no_color {
-        Style::default().add_modifier(Modifier::DIM)
+/// Пункт хинта: клавиша и опциональное описание (None — ключ без
+/// глагола, как одинокий `Esc` в confirm-модалках).
+type HintItem = (&'static str, Option<&'static str>);
+
+/// Собирает хинт-бар из пар (клавиша, описание). Клавиша рисуется
+/// accent-цветом, описание — dim; в no_color всё — `Modifier::DIM`,
+/// но остаётся раскладка по Span'ам. См. правило
+/// «TUI hint bars — символ клавиши всегда выделяется цветом» в
+/// CLAUDE.md.
+fn hint_line(items: &[HintItem], separator: &'static str, no_color: bool) -> Line<'static> {
+    let (key_style, desc_style) = if no_color {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        (dim, dim)
     } else {
-        Style::default().fg(Color::DarkGray)
+        (
+            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len() * 3 + 2);
+    spans.push(Span::styled(" ", desc_style));
+    for (i, (key, desc)) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(separator, desc_style));
+        }
+        spans.push(Span::styled(*key, key_style));
+        if let Some(text) = desc {
+            spans.push(Span::styled(format!(" · {text}"), desc_style));
+        }
     }
+    spans.push(Span::styled(" ", desc_style));
+    Line::from(spans)
 }
 
 fn draw_rename(f: &mut Frame, m: &RenameModal, no_color: bool) {
@@ -155,10 +187,11 @@ fn draw_rename(f: &mut Frame, m: &RenameModal, no_color: bool) {
     } else {
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled(
-        " Enter · save    Esc · cancel ",
-        hint_style(no_color),
-    )));
+    lines.push(hint_line(
+        &[("Enter", Some("save")), ("Esc", Some("cancel"))],
+        "    ",
+        no_color,
+    ));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -187,10 +220,15 @@ fn draw_duplicate(
         Line::from(" this url is already in the queue."),
         Line::from(format!(" existing: {existing_label}")),
         Line::from(""),
-        Line::from(Span::styled(
-            " o · open existing    a · add anyway    Esc · cancel ",
-            hint_style(no_color),
-        )),
+        hint_line(
+            &[
+                ("o", Some("open existing")),
+                ("a", Some("add anyway")),
+                ("Esc", Some("cancel")),
+            ],
+            "    ",
+            no_color,
+        ),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -216,11 +254,12 @@ fn draw_confirm_delete(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: 
         Line::from(format!(" {summary}")),
         Line::from(" partial files will be removed."),
         Line::from(""),
-        Line::from(Span::styled(
-            "                    y · yes    n · no    Esc ",
-            hint_style(no_color),
-        ))
-        .alignment(Alignment::Left),
+        hint_line(
+            &[("y", Some("yes")), ("n", Some("no")), ("Esc", None)],
+            "    ",
+            no_color,
+        )
+        .alignment(Alignment::Right),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -246,11 +285,12 @@ fn draw_confirm_retry(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: b
         Line::from(format!(" {summary}")),
         Line::from(" download will resume from where it stopped."),
         Line::from(""),
-        Line::from(Span::styled(
-            "                    y · yes    n · no    Esc ",
-            hint_style(no_color),
-        ))
-        .alignment(Alignment::Left),
+        hint_line(
+            &[("y", Some("yes")), ("n", Some("no")), ("Esc", None)],
+            "    ",
+            no_color,
+        )
+        .alignment(Alignment::Right),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -276,10 +316,15 @@ fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
         Line::from(format!(" {summary}")),
         Line::from(" the daemon has no record of it anymore."),
         Line::from(""),
-        Line::from(Span::styled(
-            " r · redownload    d · delete    Esc · cancel ",
-            hint_style(no_color),
-        )),
+        hint_line(
+            &[
+                ("r", Some("redownload")),
+                ("d", Some("delete")),
+                ("Esc", Some("cancel")),
+            ],
+            "    ",
+            no_color,
+        ),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -308,11 +353,23 @@ fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     lines.push(Line::from(" [ cancel ␛ ]"));
     lines.push(Line::from(""));
     let hint = if vm.can_stop_daemon {
-        " s · stop daemon    k / Enter · keep daemon    Esc · cancel "
+        hint_line(
+            &[
+                ("s", Some("stop daemon")),
+                ("k / Enter", Some("keep daemon")),
+                ("Esc", Some("cancel")),
+            ],
+            "    ",
+            no_color,
+        )
     } else {
-        " k / Enter · quit    Esc · cancel "
+        hint_line(
+            &[("k / Enter", Some("quit")), ("Esc", Some("cancel"))],
+            "    ",
+            no_color,
+        )
     };
-    lines.push(Line::from(Span::styled(hint, hint_style(no_color))));
+    lines.push(hint);
 
     let h = lines.len() as u16 + 2;
     let area = centered(f.area(), 62, h);

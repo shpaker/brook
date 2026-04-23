@@ -8,7 +8,8 @@ name = "brook_runtime"
 path = "src/lib.rs"
 
 [dependencies]
-serde      = { workspace = true }
-serde_yaml = { workspace = true }
-anyhow     = { workspace = true }
-tempfile   = { workspace = true }
+serde       = { workspace = true }
+serde_yaml  = { workspace = true }
+anyhow      = { workspace = true }
+tempfile    = { workspace = true }
+directories = { workspace = true }

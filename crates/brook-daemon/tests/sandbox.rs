@@ -56,12 +56,14 @@ fn write_config(dir: &Path, default_dir: &Path) {
 
 async fn mock_server() -> MockServer {
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
+    // `HttpInspectClient` делает GET с `Range: bytes=0-0`; отвечаем 206
+    // с Content-Range, чтобы inspect увидел total_size и accepts_ranges.
+    Mock::given(method("GET"))
         .and(path("/f.bin"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("accept-ranges", "bytes")
-                .insert_header("content-length", "1048576")
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 0-0/1048576")
+                .insert_header("content-length", "1")
                 .insert_header("etag", "\"sandbox\""),
         )
         .mount(&server)

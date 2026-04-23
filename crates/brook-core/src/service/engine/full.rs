@@ -165,9 +165,8 @@ where
     let mut cursor: u32 = 0;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(range_err_to_piece)?;
-        let mut slice: &[u8] = &chunk;
-        while !slice.is_empty() {
+        let mut chunk = chunk.map_err(range_err_to_piece)?;
+        while !chunk.is_empty() {
             if cursor >= total_pieces {
                 return Err(PieceError::Transient("server overshoots total_size".into()));
             }
@@ -175,14 +174,17 @@ where
             let piece_end = piece_start + piece_size_at(cursor, piece_size, total_size);
             let offset_in_piece = absolute.saturating_sub(piece_start);
             let room = (piece_end - absolute) as usize;
-            let take = slice.len().min(room);
+            let take = chunk.len().min(room);
+            // `split_to` — zero-copy: `head` забирает refcount на первые
+            // `take` байт, `chunk` остаётся хвостом. Никаких memcpy до
+            // pwrite.
+            let head = chunk.split_to(take);
             storage
-                .write_piece_bytes(cursor, offset_in_piece, &slice[..take])
+                .write_piece_bytes(cursor, offset_in_piece, head)
                 .await
                 .map_err(|e| PieceError::Permanent(format!("write: {e}")))?;
             absolute += take as u64;
             bytes_done.fetch_add(take as u64, Ordering::Relaxed);
-            slice = &slice[take..];
             if absolute == piece_end {
                 completed.push(cursor);
                 cursor += 1;

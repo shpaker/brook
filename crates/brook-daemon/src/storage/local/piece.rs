@@ -30,9 +30,13 @@ use std::path::{
     Path,
     PathBuf,
 };
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering,
+};
 use std::sync::{
     Arc,
-    Mutex,
+    RwLock,
 };
 
 use brook_core::{
@@ -40,6 +44,7 @@ use brook_core::{
     Result as CoreResult,
     TPieceStorage,
 };
+use bytes::Bytes;
 
 use super::layout::{
     offset_for,
@@ -66,7 +71,7 @@ use crate::storage::pieces::SqlitePieceRepository;
 /// с переданными» + «`pieces` для `file_id` уже инициализированы»
 /// + «`.data.brook` существует».
 pub struct LocalPieceStorage {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Inner>,
     data_path: PathBuf,
     target_path: PathBuf,
     file_id: FileId,
@@ -80,11 +85,21 @@ pub struct LocalPieceStorage {
     piece_size: u64,
 }
 
+/// Разделяемое состояние хранилища.
+///
+/// Горячий путь (`write_piece_bytes` / `commit_done`) берёт **read-lock**
+/// на `file` — это позволяет N воркерам одновременно вызывать
+/// `pwrite_full`/`sync_data` на одном fd (оба — thread-safe syscall'ы,
+/// `&File` достаточно). `finalize`/`abort` берут write-lock и
+/// дожидаются, пока все in-flight writer'ы отпустят read-lock, после
+/// чего забирают `File` из `Option` (`take`) для переименования или
+/// удаления. Флаги `finalized`/`aborted` держим отдельными
+/// `AtomicBool`: их проверка не требует lock'а и дешевле Mutex'а.
 struct Inner {
     /// Handle на `.data.brook`. `None` после `finalize`/`abort`.
-    data: Option<File>,
-    finalized: bool,
-    aborted: bool,
+    file: RwLock<Option<File>>,
+    finalized: AtomicBool,
+    aborted: AtomicBool,
 }
 
 impl LocalPieceStorage {
@@ -170,11 +185,11 @@ impl LocalPieceStorage {
         }
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(Inner {
-                data: Some(data),
-                finalized: false,
-                aborted: false,
-            })),
+            inner: Arc::new(Inner {
+                file: RwLock::new(Some(data)),
+                finalized: AtomicBool::new(false),
+                aborted: AtomicBool::new(false),
+            }),
             data_path,
             target_path,
             file_id: id,
@@ -201,7 +216,7 @@ impl TPieceStorage for LocalPieceStorage {
         &self,
         piece_index: u32,
         offset_in_piece: u64,
-        bytes: &[u8],
+        bytes: Bytes,
     ) -> CoreResult<()> {
         Ok(self
             .write_piece_bytes_inner(piece_index, offset_in_piece, bytes)
@@ -233,7 +248,7 @@ impl LocalPieceStorage {
         &self,
         piece_index: u32,
         offset_in_piece: u64,
-        bytes: &[u8],
+        bytes: Bytes,
     ) -> StorageResult<()> {
         let count = piece_count(self.total_size, self.piece_size);
         if piece_index >= count {
@@ -254,21 +269,26 @@ impl LocalPieceStorage {
             });
         }
         let abs = offset_for(piece_index, self.piece_size) + offset_in_piece;
-        let bytes = bytes.to_vec();
         let inner = Arc::clone(&self.inner);
 
         tokio::task::spawn_blocking(move || -> StorageResult<()> {
-            let guard = inner.lock().expect("mutex poisoned");
-            if guard.finalized {
+            // Флаги читаем атомиками — без блокировки. Между проверкой
+            // и самим pwrite состояние не изменится: finalize/abort
+            // берут write-lock на `file`, а мы держим read-lock ниже,
+            // так что они дождутся нашего выхода.
+            if inner.finalized.load(Ordering::Acquire) {
                 return Err(StorageError::AfterFinalize { op: "write" });
             }
-            if guard.aborted {
+            if inner.aborted.load(Ordering::Acquire) {
                 return Err(StorageError::AfterAbort { op: "write" });
             }
+            let guard = inner.file.read().expect("rwlock poisoned");
             let file = guard
-                .data
                 .as_ref()
                 .expect("data handle present while !finalized && !aborted");
+            // `pwrite(2)` поточно-безопасен по контракту POSIX: можно
+            // звать из N потоков одновременно на одном fd — именно
+            // ради этого мы сняли старый Mutex с горячего пути.
             pwrite_full(file, &bytes, abs)?;
             Ok(())
         })
@@ -282,18 +302,16 @@ impl LocalPieceStorage {
         // sync_data() здесь, затем UPDATE в pieces.
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> StorageResult<()> {
-            let guard = inner.lock().expect("mutex poisoned");
-            if guard.finalized {
+            if inner.finalized.load(Ordering::Acquire) {
                 return Err(StorageError::AfterFinalize { op: "commit" });
             }
-            if guard.aborted {
+            if inner.aborted.load(Ordering::Acquire) {
                 return Err(StorageError::AfterAbort { op: "commit" });
             }
-            guard
-                .data
-                .as_ref()
-                .expect("data handle present")
-                .sync_data()?;
+            let guard = inner.file.read().expect("rwlock poisoned");
+            // sync_data на одном fd из нескольких потоков
+            // поточно-безопасен (fsync/fdatasync — thread-safe).
+            guard.as_ref().expect("data handle present").sync_data()?;
             Ok(())
         })
         .await??;
@@ -310,21 +328,23 @@ impl LocalPieceStorage {
         let target_path = self.target_path.clone();
 
         let renamed = tokio::task::spawn_blocking(move || -> StorageResult<bool> {
-            let mut guard = inner.lock().expect("mutex poisoned");
-            if guard.aborted {
+            if inner.aborted.load(Ordering::Acquire) {
                 return Err(StorageError::AfterAbort { op: "finalize" });
             }
-            if guard.finalized {
+            if inner.finalized.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            let file = guard
-                .data
-                .take()
-                .expect("data handle present while !finalized");
+            // Write-lock: дожидаемся, пока все in-flight write/commit
+            // отпустят read-lock. После этого fd больше никто не держит.
+            let mut guard = inner.file.write().expect("rwlock poisoned");
+            let file = guard.take().expect("data handle present while !finalized");
             file.sync_all()?;
             drop(file);
             std::fs::rename(&data_path, &target_path)?;
-            guard.finalized = true;
+            // Release-запись: write-lock уже гарантирует happens-before
+            // относительно будущих read-lock'ов, но флаг — это быстрый
+            // путь проверки без lock'а, так что помечаем явно.
+            inner.finalized.store(true, Ordering::Release);
             Ok(true)
         })
         .await??;
@@ -344,10 +364,12 @@ impl LocalPieceStorage {
         let data_path = self.data_path.clone();
 
         tokio::task::spawn_blocking(move || -> StorageResult<()> {
-            let mut guard = inner.lock().expect("mutex poisoned");
-            guard.data = None;
+            // Тот же приём, что и в finalize: write-lock дожидается
+            // in-flight writer'ов, после чего fd уходит в Drop.
+            let mut guard = inner.file.write().expect("rwlock poisoned");
+            *guard = None;
             let _ = std::fs::remove_file(&data_path);
-            guard.aborted = true;
+            inner.aborted.store(true, Ordering::Release);
             Ok(())
         })
         .await??;
@@ -375,6 +397,11 @@ mod tests {
     /// Тестовая раскладка: 20 байт, piece_size = 8 → 3 piece'а (8/8/4).
     const TOTAL: u64 = 20;
     const PIECE: u64 = 8;
+
+    /// Сахар для тестов: `b"..."` → `Bytes`. `from_static` не копирует.
+    fn bs(s: &'static [u8]) -> Bytes {
+        Bytes::from_static(s)
+    }
 
     fn read_file(path: &Path) -> Vec<u8> {
         let mut f = std::fs::File::open(path).unwrap();
@@ -407,7 +434,16 @@ mod tests {
         let id = d.id;
         files.insert(&d).await.unwrap();
         files
-            .set_inspect_fields(id, Some(TOTAL), Some(PIECE), None, None, None)
+            .set_inspect_fields(
+                id,
+                Some(TOTAL),
+                Some(PIECE),
+                None,
+                None,
+                None,
+                true,
+                filename.into(),
+            )
             .await
             .unwrap();
         (db, files, pieces, id)
@@ -445,10 +481,10 @@ mod tests {
 
         assert_eq!(s.pending_pieces().await.unwrap(), vec![0, 1, 2]);
 
-        s.write_piece_bytes(0, 0, b"AAAA").await.unwrap();
-        s.write_piece_bytes(0, 4, b"BBBB").await.unwrap();
-        s.write_piece_bytes(1, 0, b"CCCCDDDD").await.unwrap();
-        s.write_piece_bytes(2, 0, b"EEEE").await.unwrap();
+        s.write_piece_bytes(0, 0, bs(b"AAAA")).await.unwrap();
+        s.write_piece_bytes(0, 4, bs(b"BBBB")).await.unwrap();
+        s.write_piece_bytes(1, 0, bs(b"CCCCDDDD")).await.unwrap();
+        s.write_piece_bytes(2, 0, bs(b"EEEE")).await.unwrap();
 
         s.commit_done(0).await.unwrap();
         s.commit_done(1).await.unwrap();
@@ -482,8 +518,8 @@ mod tests {
             )
             .await
             .unwrap();
-            s.write_piece_bytes(0, 0, b"AAAABBBB").await.unwrap();
-            s.write_piece_bytes(1, 0, b"CCCCDDDD").await.unwrap();
+            s.write_piece_bytes(0, 0, bs(b"AAAABBBB")).await.unwrap();
+            s.write_piece_bytes(1, 0, bs(b"CCCCDDDD")).await.unwrap();
             s.commit_done(0).await.unwrap();
             s.commit_done(1).await.unwrap();
         }
@@ -501,7 +537,7 @@ mod tests {
         .unwrap();
         assert_eq!(s.pending_pieces().await.unwrap(), vec![2]);
 
-        s.write_piece_bytes(2, 0, b"EEEE").await.unwrap();
+        s.write_piece_bytes(2, 0, bs(b"EEEE")).await.unwrap();
         s.commit_done(2).await.unwrap();
         s.finalize().await.unwrap();
 
@@ -516,7 +552,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (_db, _files, pieces, id, s) = open_fresh(dir.path(), "a.bin").await;
 
-        s.write_piece_bytes(0, 0, b"AAAABBBB").await.unwrap();
+        s.write_piece_bytes(0, 0, bs(b"AAAABBBB")).await.unwrap();
         s.commit_done(0).await.unwrap();
         s.abort().await.unwrap();
 
@@ -524,7 +560,7 @@ mod tests {
         assert!(!dir.path().join("a.bin").exists());
         assert!(!pieces.is_initialized(id).await.unwrap());
 
-        assert!(s.write_piece_bytes(1, 0, b"CC").await.is_err());
+        assert!(s.write_piece_bytes(1, 0, bs(b"CC")).await.is_err());
         assert!(s.commit_done(1).await.is_err());
     }
 
@@ -545,12 +581,21 @@ mod tests {
             )
             .await
             .unwrap();
-            s.write_piece_bytes(0, 0, b"XXXXYYYY").await.unwrap();
+            s.write_piece_bytes(0, 0, bs(b"XXXXYYYY")).await.unwrap();
             s.commit_done(0).await.unwrap();
         }
 
         files
-            .set_inspect_fields(id, Some(32), Some(PIECE), None, None, None)
+            .set_inspect_fields(
+                id,
+                Some(32),
+                Some(PIECE),
+                None,
+                None,
+                None,
+                true,
+                "m.bin".into(),
+            )
             .await
             .unwrap();
         let s = LocalPieceStorage::open(
@@ -572,8 +617,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let (_db, _files, _pieces, _id, s) = open_fresh(dir.path(), "b.bin").await;
 
-        assert!(s.write_piece_bytes(2, 0, b"EEEEE").await.is_err());
-        assert!(s.write_piece_bytes(99, 0, b"Z").await.is_err());
+        assert!(s.write_piece_bytes(2, 0, bs(b"EEEEE")).await.is_err());
+        assert!(s.write_piece_bytes(99, 0, bs(b"Z")).await.is_err());
     }
 
     #[tokio::test]
@@ -592,7 +637,7 @@ mod tests {
             )
             .await
             .unwrap();
-            s.write_piece_bytes(0, 0, b"AAAABBBB").await.unwrap();
+            s.write_piece_bytes(0, 0, bs(b"AAAABBBB")).await.unwrap();
             s.commit_done(0).await.unwrap();
         }
         let s = LocalPieceStorage::open(
@@ -614,15 +659,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let (_db, _files, _pieces, _id, s) = open_fresh(dir.path(), "f.bin").await;
 
-        s.write_piece_bytes(0, 0, b"AAAABBBB").await.unwrap();
-        s.write_piece_bytes(1, 0, b"CCCCDDDD").await.unwrap();
-        s.write_piece_bytes(2, 0, b"EEEE").await.unwrap();
+        s.write_piece_bytes(0, 0, bs(b"AAAABBBB")).await.unwrap();
+        s.write_piece_bytes(1, 0, bs(b"CCCCDDDD")).await.unwrap();
+        s.write_piece_bytes(2, 0, bs(b"EEEE")).await.unwrap();
         s.commit_done(0).await.unwrap();
         s.commit_done(1).await.unwrap();
         s.commit_done(2).await.unwrap();
         s.finalize().await.unwrap();
 
-        assert!(s.write_piece_bytes(0, 0, b"ZZZZ").await.is_err());
+        assert!(s.write_piece_bytes(0, 0, bs(b"ZZZZ")).await.is_err());
         assert!(s.commit_done(0).await.is_err());
     }
 

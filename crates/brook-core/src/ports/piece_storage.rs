@@ -20,6 +20,8 @@
 
 use std::future::Future;
 
+use bytes::Bytes;
+
 use crate::domain::{
     FileId,
     FileSpec,
@@ -38,11 +40,18 @@ pub trait TPieceStorage: Send + Sync {
     /// **Инвариант**: вызов НЕ фиксирует piece как готовый и НЕ делает
     /// `fsync`. После рестарта эти байты могут пропасть — это ожидаемо,
     /// они будут перекачаны.
+    ///
+    /// Принимаем `Bytes` по владению (а не `&[u8]`), чтобы адаптеры
+    /// могли переехать в `spawn_blocking` без `.to_vec()`: `Bytes` —
+    /// refcounted zero-copy буфер, клонирование/передача по владению
+    /// не копирует байты. Сеть (reqwest) уже отдаёт `Bytes`, так что
+    /// путь «сокет → pwrite» становится по-настоящему zero-copy
+    /// после финального пакетирования в engine.
     fn write_piece_bytes(
         &self,
         piece_index: u32,
         offset_in_piece: u64,
-        bytes: &[u8],
+        bytes: Bytes,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Пометить piece как полностью завершённый и зафиксировать на диске.
@@ -146,6 +155,27 @@ pub trait TPieceStorageFactory: Send + Sync {
     type Storage: TPieceStorage;
     type StreamStorage: TStreamStorage;
 
+    /// Синхронная фаза «предстарта», которую `DownloadManager` вызывает
+    /// из `add()` **до** вставки записи в очередь через `TQueueStore`.
+    ///
+    /// Делает один HEAD к источнику, резолвит имя файла
+    /// (`spec.filename` → `Content-Disposition` → URL-tail), валидирует
+    /// его и проверяет, что целевой файл ещё не существует. Все
+    /// inspect-поля (size, etag, last_modified, effective_url,
+    /// accepts_ranges) плюс resolved-имя персистятся здесь же: дальше
+    /// `prepare()` читает их из БД и больше в сеть не ходит.
+    ///
+    /// Ошибки:
+    /// * [`Error::FileExists`] — в `target_dir` уже лежит файл с
+    ///   таким именем; клиент получает `AlreadyExists` из RPC `Add`
+    ///   и открывает rename-модалку.
+    /// * прочие сетевые / валидационные — маппятся менеджером в
+    ///   обычные RPC-ошибки.
+    ///
+    /// Возвращает итоговое имя файла (то же, что потом попадает в
+    /// `spec.filename` записи в очереди).
+    fn resolve(&self, id: FileId, spec: &FileSpec) -> impl Future<Output = Result<String>> + Send;
+
     /// Подготовить piece-хранилище.
     ///
     /// `id` нужен фабрике, чтобы связать persisted-state загрузки
@@ -154,6 +184,10 @@ pub trait TPieceStorageFactory: Send + Sync {
     /// хранилищем. Без id фабрика не смогла бы писать
     /// inspect-поля в `file_settings` или делать resume
     /// через общий `SharedDb`.
+    ///
+    /// Предполагает, что `resolve()` уже был вызван для этого `id`:
+    /// `spec.filename` заполнено, inspect-поля лежат в `file_settings`.
+    /// В обычном пути `prepare()` не делает сетевых запросов.
     fn prepare(
         &self,
         id: FileId,

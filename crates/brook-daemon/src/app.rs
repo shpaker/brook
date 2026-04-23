@@ -51,8 +51,11 @@ use brook_http::{
     HttpInspectClient,
     RangeFetchClient,
 };
-use brook_runtime::Endpoint;
 use brook_runtime::constants::ENDPOINT_FILENAME;
+use brook_runtime::{
+    AppPaths,
+    Endpoint,
+};
 use fs4::fs_std::FileExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -76,9 +79,9 @@ use crate::storage::pieces::SqlitePieceRepository;
 use crate::storage::sandbox::ClampedPathPolicy;
 use crate::storage::workers::SqliteWorkerRepository;
 
-/// Имя lock-файла в CWD (гарантирует single-instance).
+/// Имя lock-файла (гарантирует single-instance демона на пользователя).
 pub const LOCK_FILENAME: &str = ".brook.lock";
-/// Имя БД очереди в CWD.
+/// Имя БД очереди.
 pub const DB_FILENAME: &str = "brook.db";
 /// Дедлайн graceful-shutdown после приёма сигнала.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
@@ -95,8 +98,9 @@ pub type ProdManager =
 pub type ProdService =
     BrookService<ProdFactory, ProdQueue, ProdFetch, ProdWorkerRepo, ProdAttemptRepo>;
 
-/// Пути к артефактам демона (БД, lock, конфиг). В проде всё в CWD; в
-/// интеграционных тестах — в tempdir.
+/// Пути к артефактам демона (БД, lock, конфиг). В проде они резолвятся из
+/// [`AppPaths`] по платформенным правилам; в интеграционных тестах —
+/// колокатятся в один tempdir через [`Paths::in_dir`].
 pub struct Paths {
     pub lock: PathBuf,
     pub db: PathBuf,
@@ -105,10 +109,19 @@ pub struct Paths {
 }
 
 impl Paths {
-    pub fn in_cwd() -> Self {
-        Self::in_dir(Path::new("."))
+    /// Раскладка, как её видит `brook server` в проде: config/data/cache —
+    /// три разных каталога (на macOS config и data совпадают).
+    pub fn from_app_paths(app: &AppPaths) -> Self {
+        Self {
+            lock: app.cache_dir.join(LOCK_FILENAME),
+            db: app.data_dir.join(DB_FILENAME),
+            config: app.config_dir.join(DEFAULT_CONFIG_FILENAME),
+            endpoint: app.endpoint(),
+        }
     }
 
+    /// Все четыре файла в одном каталоге. Используется интеграционными
+    /// тестами (tempdir).
     pub fn in_dir(dir: &Path) -> Self {
         Self {
             lock: dir.join(LOCK_FILENAME),
@@ -154,7 +167,9 @@ pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> 
             .with_context(|| format!("canonicalize sandbox root {}", args.directory.display()))?,
     );
 
-    // 1. Lock (блокирует второй запуск в том же CWD).
+    // 1. Lock (блокирует второй запуск). Каталоги могут отсутствовать при
+    // первом старте — создаём лениво перед `open`.
+    ensure_parent(&paths.lock)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -170,11 +185,13 @@ pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> 
     })?;
 
     // 2. Config.
+    ensure_parent(&paths.config)?;
     let settings = Settings::load_or_init(&paths.config)
         .with_context(|| format!("load config {}", paths.config.display()))?;
     let daemon = DaemonRuntime::from_settings(&settings).context("derive daemon runtime")?;
 
     // 3. Repositories (поверх общего `brook.db`).
+    ensure_parent(&paths.db)?;
     let shared_db = SharedDb::open(&paths.db).context("open brook.db")?;
     let files_repo = Arc::new(SqliteFileRepository::new(shared_db.clone()));
     let pieces_repo = Arc::new(SqlitePieceRepository::new(shared_db.clone()));
@@ -330,6 +347,19 @@ pub async fn serve(runtime: Runtime, shutdown: impl Future<Output = ()> + Send) 
     // увидеть endpoint-файл и промахнуться в probe (порт уже свободен).
     Endpoint::remove(&endpoint_path);
     drop(lock); // явно: flock снимается здесь, а не в конце main.
+    Ok(())
+}
+
+/// Создаёт родительский каталог для `p`, если он ещё не существует.
+/// На платформо-зависимой раскладке на первом старте `~/Library/…/brook/`
+/// может отсутствовать — это не ошибка.
+fn ensure_parent(p: &Path) -> Result<()> {
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
+    }
     Ok(())
 }
 
