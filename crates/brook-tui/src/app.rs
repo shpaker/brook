@@ -34,7 +34,6 @@ use crate::model::{
     ConnectionState,
     Mode,
     RenameModal,
-    TwoButtonFocus,
     ViewModel,
 };
 use crate::{
@@ -209,10 +208,7 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
             // просто тост, без алерта: призраки всплывают только по
             // нормальным pause/resume, где Mode::Normal.
             if matches!(vm.mode, Mode::Normal) {
-                vm.mode = Mode::Ghost {
-                    ids,
-                    focus: TwoButtonFocus::Yes,
-                };
+                vm.mode = Mode::Ghost { ids };
             } else {
                 vm.set_toast("download not found on daemon");
             }
@@ -296,10 +292,7 @@ fn handle_key_normal(
         KeyCode::Char('d') => {
             let ids = vm.action_targets();
             if !ids.is_empty() {
-                vm.mode = Mode::ConfirmDelete {
-                    ids,
-                    focus: TwoButtonFocus::Yes,
-                };
+                vm.mode = Mode::ConfirmDelete { ids };
             }
         }
         _ => {}
@@ -330,10 +323,7 @@ fn r_action_cursor(
             command::resume(channel.clone(), tx.clone(), vec![id]);
         }
         S::Failed => {
-            vm.mode = Mode::ConfirmRetry {
-                ids: vec![id],
-                focus: TwoButtonFocus::Yes,
-            };
+            vm.mode = Mode::ConfirmRetry { ids: vec![id] };
         }
         S::Done => {
             command::reveal_in_finder(&row.target_dir, &row.filename);
@@ -410,7 +400,6 @@ fn handle_key_add(
                 vm.mode = Mode::Duplicate {
                     form: AddForm { url, folder },
                     existing_id,
-                    focus: TwoButtonFocus::No,
                 };
                 return;
             }
@@ -454,27 +443,15 @@ fn handle_key_duplicate(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::Duplicate { form, focus, .. } = &vm.mode else {
+    let Mode::Duplicate { form, .. } = &vm.mode else {
         return;
     };
     let form = form.clone();
-    let focus = *focus;
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
-        KeyCode::Tab => {
-            if let Mode::Duplicate { focus, .. } = &mut vm.mode {
-                *focus = focus.toggled();
-            }
-        }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             vm.mode = Mode::Normal;
             command::add(channel, tx, form, None);
-        }
-        KeyCode::Enter => {
-            vm.mode = Mode::Normal;
-            if focus == TwoButtonFocus::Yes {
-                command::add(channel, tx, form, None);
-            }
         }
         _ => {}
     }
@@ -486,27 +463,15 @@ fn handle_key_confirm(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::ConfirmDelete { ids, focus } = &vm.mode else {
+    let Mode::ConfirmDelete { ids } = &vm.mode else {
         return;
     };
     let ids = ids.clone();
-    let focus = *focus;
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
-        KeyCode::Tab => {
-            if let Mode::ConfirmDelete { focus, .. } = &mut vm.mode {
-                *focus = focus.toggled();
-            }
-        }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             vm.mode = Mode::Normal;
             command::remove(channel, tx, ids);
-        }
-        KeyCode::Enter => {
-            vm.mode = Mode::Normal;
-            if focus == TwoButtonFocus::Yes {
-                command::remove(channel, tx, ids);
-            }
         }
         _ => {}
     }
@@ -518,27 +483,15 @@ fn handle_key_confirm_retry(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::ConfirmRetry { ids, focus } = &vm.mode else {
+    let Mode::ConfirmRetry { ids } = &vm.mode else {
         return;
     };
     let ids = ids.clone();
-    let focus = *focus;
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
-        KeyCode::Tab => {
-            if let Mode::ConfirmRetry { focus, .. } = &mut vm.mode {
-                *focus = focus.toggled();
-            }
-        }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             vm.mode = Mode::Normal;
             command::retry(channel, tx, ids);
-        }
-        KeyCode::Enter => {
-            vm.mode = Mode::Normal;
-            if focus == TwoButtonFocus::Yes {
-                command::retry(channel, tx, ids);
-            }
         }
         _ => {}
     }
@@ -550,19 +503,12 @@ fn handle_key_ghost(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::Ghost { ids, focus } = &vm.mode else {
+    let Mode::Ghost { ids } = &vm.mode else {
         return;
     };
     let ids = ids.clone();
-    let focus = *focus;
     match k.code {
-        KeyCode::Esc => vm.mode = Mode::Normal,
-        KeyCode::Tab => {
-            if let Mode::Ghost { focus, .. } = &mut vm.mode {
-                *focus = focus.toggled();
-            }
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') => {
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             vm.drop_rows(&ids);
             vm.mode = Mode::Normal;
             command::remove(channel, tx, ids);
@@ -575,23 +521,6 @@ fn handle_key_ghost(
                 command::add(channel.clone(), tx.clone(), form, None);
             }
         }
-        KeyCode::Enter => match focus {
-            TwoButtonFocus::No => {
-                // no = убрать призраков из ViewModel + дёрнуть Remove
-                vm.drop_rows(&ids);
-                vm.mode = Mode::Normal;
-                command::remove(channel, tx, ids);
-            }
-            TwoButtonFocus::Yes => {
-                // yes = перекачать по сохранённым url/folder
-                let forms = ghost_redownload_forms(vm, &ids);
-                vm.drop_rows(&ids);
-                vm.mode = Mode::Normal;
-                for form in forms {
-                    command::add(channel.clone(), tx.clone(), form, None);
-                }
-            }
-        },
         _ => {}
     }
 }

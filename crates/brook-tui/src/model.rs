@@ -124,11 +124,10 @@ pub struct Toast {
 pub enum Mode {
     Normal,
     Add(AddModal),
-    /// URL уже в очереди. yes = добавить дубль, no = отмена.
+    /// URL уже в очереди. y = добавить дубль, n/Esc = отмена.
     Duplicate {
         form: AddForm,
         existing_id: String,
-        focus: TwoButtonFocus,
     },
     /// Демон вернул `AlreadyExists`: в target-каталоге лежит файл с
     /// таким же именем. Открываем модалку, чтобы пользователь выбрал
@@ -136,42 +135,23 @@ pub enum Mode {
     RenameOnConflict {
         modal: RenameModal,
     },
-    /// yes = удалить, no = отмена.
+    /// y = удалить, n/Esc = отмена.
     ConfirmDelete {
         ids: Vec<String>,
-        focus: TwoButtonFocus,
     },
     /// Подтверждение перезапуска упавшей загрузки. `r` на Failed
-    /// не дёргает retry молча — сначала спрашиваем. yes = повторить, no = отмена.
+    /// не дёргает retry молча — сначала спрашиваем. y = повторить, n/Esc = отмена.
     ConfirmRetry {
         ids: Vec<String>,
-        focus: TwoButtonFocus,
     },
     /// Демон не знает id, по которому TUI пытался pause/resume.
-    /// yes = перекачать, no = убрать запись из списка.
+    /// y = перекачать, n/Esc = убрать запись из списка.
     Ghost {
         ids: Vec<String>,
-        focus: TwoButtonFocus,
     },
     /// Выход из TUI. y = выйти (демон останавливается если TUI его запускал),
-    /// n/Esc = отмена. Только шоткаты, Tab/Enter не работают.
+    /// n/Esc = отмена.
     QuitConfirm,
-}
-
-/// Фокус в любой двухкнопочной модалке (yes / no).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TwoButtonFocus {
-    Yes,
-    No,
-}
-
-impl TwoButtonFocus {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Yes => Self::No,
-            Self::No => Self::Yes,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -36,7 +36,6 @@ use crate::model::{
     AddModal,
     Mode,
     RenameModal,
-    TwoButtonFocus,
     ViewModel,
 };
 
@@ -44,14 +43,10 @@ pub fn draw_overlay(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     match &vm.mode {
         Mode::Normal => {}
         Mode::Add(m) => draw_add(f, m, no_color),
-        Mode::Duplicate {
-            form,
-            existing_id,
-            focus,
-        } => draw_duplicate(f, vm, form, existing_id, *focus, no_color),
-        Mode::ConfirmDelete { ids, focus } => draw_confirm_delete(f, vm, ids, *focus, no_color),
-        Mode::ConfirmRetry { ids, focus } => draw_confirm_retry(f, vm, ids, *focus, no_color),
-        Mode::Ghost { ids, focus } => draw_ghost(f, vm, ids, *focus, no_color),
+        Mode::Duplicate { form, existing_id } => draw_duplicate(f, vm, form, existing_id, no_color),
+        Mode::ConfirmDelete { ids } => draw_confirm_delete(f, vm, ids, no_color),
+        Mode::ConfirmRetry { ids } => draw_confirm_retry(f, vm, ids, no_color),
+        Mode::Ghost { ids } => draw_ghost(f, vm, ids, no_color),
         Mode::RenameOnConflict { modal } => draw_rename(f, modal, no_color),
         Mode::QuitConfirm => draw_quit_confirm(f, vm, no_color),
     }
@@ -180,25 +175,14 @@ fn hint_line(items: &[HintItem], no_color: bool) -> Line<'static> {
 /// Кнопки `[  <y>es  |  <n>o  ]` для нижней рамки.
 /// Сфокусированная кнопка рисуется через `word_with_key` (первая буква
 /// accent — шоткат `y`/`n`, остаток dim), несфокусированная — полностью dim.
-fn bottom_yes_no(focus: TwoButtonFocus, no_color: bool) -> Line<'static> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
+fn bottom_yes_no(no_color: bool) -> Line<'static> {
     let desc_style = if no_color {
-        dim
+        Style::default().add_modifier(Modifier::DIM)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-
-    let [y1, y2] = if focus == TwoButtonFocus::Yes {
-        super::chrome::word_with_key("yes", no_color)
-    } else {
-        [Span::styled("y", dim), Span::styled("es", dim)]
-    };
-    let [n1, n2] = if focus == TwoButtonFocus::No {
-        super::chrome::word_with_key("no", no_color)
-    } else {
-        [Span::styled("n", dim), Span::styled("o", dim)]
-    };
-
+    let [y1, y2] = super::chrome::word_with_key("yes", no_color);
+    let [n1, n2] = super::chrome::word_with_key("no", no_color);
     Line::from(vec![
         Span::styled("[  ", desc_style),
         y1,
@@ -246,12 +230,11 @@ fn draw_duplicate(
     vm: &ViewModel,
     _form: &crate::events::AddForm,
     existing_id: &str,
-    focus: TwoButtonFocus,
     no_color: bool,
 ) {
     let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = modal_block("duplicate url", bottom_yes_no(focus, no_color), no_color);
+    let block = modal_block("duplicate url", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -270,16 +253,10 @@ fn draw_duplicate(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_confirm_delete(
-    f: &mut Frame,
-    vm: &ViewModel,
-    ids: &[String],
-    focus: TwoButtonFocus,
-    no_color: bool,
-) {
+fn draw_confirm_delete(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
     let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = modal_block("delete download?", bottom_yes_no(focus, no_color), no_color);
+    let block = modal_block("delete download?", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -301,16 +278,10 @@ fn draw_confirm_delete(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_confirm_retry(
-    f: &mut Frame,
-    vm: &ViewModel,
-    ids: &[String],
-    focus: TwoButtonFocus,
-    no_color: bool,
-) {
+fn draw_confirm_retry(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
     let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = modal_block("retry download?", bottom_yes_no(focus, no_color), no_color);
+    let block = modal_block("retry download?", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -332,20 +303,10 @@ fn draw_confirm_retry(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_ghost(
-    f: &mut Frame,
-    vm: &ViewModel,
-    ids: &[String],
-    focus: TwoButtonFocus,
-    no_color: bool,
-) {
+fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
     let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = modal_block(
-        "download not found",
-        bottom_yes_no(focus, no_color),
-        no_color,
-    );
+    let block = modal_block("download not found", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
