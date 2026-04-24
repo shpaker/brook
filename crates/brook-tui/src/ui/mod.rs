@@ -55,6 +55,9 @@ pub fn draw(f: &mut Frame, vm: &ViewModel) {
     f.render_widget(block, area);
 
     // Внутри — только список карточек с паддингом 1 по краям.
+    // Крайнюю правую колонку внутри `list_area` забирает всегда
+    // видимый скроллбар из `list::draw` — так между ним и рамкой
+    // остаётся 1-колонка воздуха, симметричная левому паддингу.
     let list_area = Rect {
         x: inner.x.saturating_add(1),
         y: inner.y.saturating_add(1),

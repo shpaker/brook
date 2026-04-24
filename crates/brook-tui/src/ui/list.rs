@@ -1,8 +1,21 @@
 //! Вертикальный список карточек. Скролл — курсор держим в видимой
 //! области; каждая карточка фиксированной высоты (`CARD_HEIGHT`).
+//! Крайний правый столбец области отведён под всегда видимый
+//! скроллбар: даже когда весь список помещается во viewport или
+//! пуст — трек рисуется, чтобы фрейм оставался визуально стабильным.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{
+    Color,
+    Modifier,
+    Style,
+};
+use ratatui::widgets::{
+    Scrollbar,
+    ScrollbarOrientation,
+    ScrollbarState,
+};
 
 use crate::model::ViewModel;
 use crate::ui::card::{
@@ -10,38 +23,124 @@ use crate::ui::card::{
     CARD_HEIGHT,
 };
 
+/// Ширина колонки под всегда видимый скроллбар справа.
+const SCROLLBAR_WIDTH: u16 = 1;
+/// Зазор между контентом карточек и скроллбаром — две колонки воздуха,
+/// чтобы текст/прогресс-бар не «лип» к треку.
+const SCROLLBAR_GAP: u16 = 2;
+/// Сколько колонок суммарно забираем справа у области списка:
+/// сам скроллбар + зазор перед ним.
+const RIGHT_RESERVED: u16 = SCROLLBAR_WIDTH + SCROLLBAR_GAP;
+
 pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
-    if area.height < CARD_HEIGHT {
+    if area.width <= RIGHT_RESERVED {
         return;
     }
+    let cards_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width - RIGHT_RESERVED,
+        height: area.height,
+    };
+    let scrollbar_area = Rect {
+        x: area.x + area.width - SCROLLBAR_WIDTH,
+        y: area.y,
+        width: SCROLLBAR_WIDTH,
+        height: area.height,
+    };
+
     let ids = vm.visible_ids();
-    if ids.is_empty() {
-        return;
-    }
-    let cursor = vm.cursor.min(ids.len() - 1);
+    let viewport_cards = (cards_area.height / CARD_HEIGHT) as usize;
 
-    let viewport_cards = (area.height / CARD_HEIGHT) as usize;
-    if viewport_cards == 0 {
-        return;
-    }
-    let scroll = compute_scroll(cursor, viewport_cards, ids.len());
+    let (scroll, total) = if ids.is_empty() || viewport_cards == 0 {
+        (0usize, ids.len())
+    } else {
+        let cursor = vm.cursor.min(ids.len() - 1);
+        (compute_scroll(cursor, viewport_cards, ids.len()), ids.len())
+    };
 
-    for slot in 0..viewport_cards {
-        let idx = scroll + slot;
-        if idx >= ids.len() {
-            break;
+    if cards_area.height >= CARD_HEIGHT && !ids.is_empty() && viewport_cards > 0 {
+        let cursor = vm.cursor.min(ids.len() - 1);
+        for slot in 0..viewport_cards {
+            let idx = scroll + slot;
+            if idx >= ids.len() {
+                break;
+            }
+            let Some(row) = vm.downloads.get(&ids[idx]) else {
+                continue;
+            };
+            let card_area = Rect {
+                x: cards_area.x,
+                y: cards_area.y + slot as u16 * CARD_HEIGHT,
+                width: cards_area.width,
+                height: CARD_HEIGHT,
+            };
+            card::draw(f, card_area, row, idx == cursor, no_color);
         }
-        let Some(row) = vm.downloads.get(&ids[idx]) else {
-            continue;
-        };
-        let card_area = Rect {
-            x: area.x,
-            y: area.y + slot as u16 * CARD_HEIGHT,
-            width: area.width,
-            height: CARD_HEIGHT,
-        };
-        card::draw(f, card_area, row, idx == cursor, no_color);
     }
+
+    draw_scrollbar(f, scrollbar_area, scroll, viewport_cards, total, no_color);
+}
+
+fn draw_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    viewport: usize,
+    total: usize,
+    no_color: bool,
+) {
+    if area.height == 0 {
+        return;
+    }
+
+    let (track_style, thumb_style) = if no_color {
+        (
+            Style::default().add_modifier(Modifier::DIM),
+            Style::default().add_modifier(Modifier::DIM),
+        )
+    } else {
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
+        )
+    };
+
+    let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .thumb_symbol("┃")
+        .track_style(track_style)
+        .thumb_style(thumb_style);
+
+    // `ratatui::Scrollbar` трактует `position` как индекс верхней
+    // строки в «скроллируемом пространстве» длиной `content_length`
+    // и клампит его к `[0, content_length - 1]`. В нашей модели
+    // `scroll ∈ [0, total - viewport]` — это количество возможных
+    // верхних позиций, поэтому виджету нужно отдавать
+    // `content_length = total - viewport + 1` (а `viewport_length`
+    // оставляем настоящим, чтобы сохранить пропорцию тамба
+    // `viewport / total`). Иначе при скролле в самый низ тамб
+    // упирается в ~середину трека, а не в его конец.
+    //
+    // Плюс особый случай «скроллить некуда» (пусто или всё влезает):
+    // ratatui не рисует скроллбар при `content_length == 0`, а при
+    // целиком помещающемся контенте тамб занимал бы лишь часть
+    // трека — обе ситуации ломают «всегда видимый» скроллбар. Для
+    // них подставляем (1, 1, 0): полный трек, тамб во всю высоту —
+    // визуальный сигнал «двигаться некуда».
+    let (content_len, viewport_len, pos) = if total == 0 || total <= viewport {
+        (1, 1, 0)
+    } else {
+        (total - viewport + 1, viewport, scroll)
+    };
+
+    let mut state = ScrollbarState::new(content_len)
+        .viewport_content_length(viewport_len)
+        .position(pos);
+
+    f.render_stateful_widget(widget, area, &mut state);
 }
 
 fn compute_scroll(cursor: usize, viewport: usize, total: usize) -> usize {
