@@ -1,13 +1,28 @@
-//! Top/bottom titles для внешней rounded-рамки.
+//! Титулы внешней rounded-рамки.
 //!
-//! Обе «шапки» — `Line`-титулы `Block`'а (`title` / `title_bottom`).
-//! Верх: `[ brook | 127.0.0.1:<port> ]`, низ: `[ ␣ action | a add | d
-//! delete | q quit ]`. Toast подменяет нижний хинт-бар своей строкой.
+//! Верх рамки — один центрированный brand-титул
+//! `[ brook | 127.0.0.1:<port> ]` (при reconnect/offline вместо адреса
+//! показывается причина).
+//!
+//! Низ рамки — хинт-бар со всеми действиями нормального режима,
+//! сгруппированными по центру через `|`: `[ add | <primary> | delete |
+//! quit ]`. `<primary>` зависит от строки под курсором
+//! (pause/resume/retry/reveal); для пустого списка или Unspecified-строки
+//! primary и delete пропускаются — остаётся `[ add | quit ]`. Тост
+//! (`toast_line`, align Left) при активном `vm.toast` рисуется на той
+//! же нижней линии слева — ratatui поддерживает несколько titles на
+//! одной рамке.
+//!
+//! Подсказки клавиш встроены прямо в слова действий: первая буква
+//! accent (`Color::Cyan`), остаток dim (`Color::DarkGray`). В `no_color`
+//! оба span'а получают `Modifier::DIM`, но раскладка «клавиша отдельным
+//! span'ом» сохраняется (см. CLAUDE.md, §TUI hint bars).
 
 use brook_proto::brook::v1::FileStatus;
 use ratatui::layout::Alignment;
 use ratatui::style::{
     Color,
+    Modifier,
     Style,
 };
 use ratatui::text::{
@@ -28,9 +43,34 @@ fn accent(s: impl Into<String>) -> Span<'static> {
     Span::styled(s.into(), Style::default().fg(Color::Cyan))
 }
 
-/// Верхний титул: `[ brook | 127.0.0.1:<port> ]`. При reconnect/offline
-/// во втором сегменте показывается причина, а не адрес.
-pub fn top_title(vm: &ViewModel) -> Line<'static> {
+/// Подсветка клавиши первой буквой слова.
+///
+/// Возвращает два span'а: первую букву (accent, клавиша) и остаток слова
+/// (dim, описание). В `no_color` оба получают `Modifier::DIM`, но
+/// структура spans сохраняется — контракт §TUI hint bars в CLAUDE.md.
+pub fn word_with_key(word: &str, no_color: bool) -> [Span<'static>; 2] {
+    let mut chars = word.chars();
+    let head: String = chars.next().map(|c| c.to_string()).unwrap_or_default();
+    let tail: String = chars.collect();
+    let (key_style, desc_style) = if no_color {
+        let d = Style::default().add_modifier(Modifier::DIM);
+        (d, d)
+    } else {
+        (
+            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    [
+        Span::styled(head, key_style),
+        Span::styled(tail, desc_style),
+    ]
+}
+
+/// Верхний brand-титул: `[  brook | 127.0.0.1:<port>  ]` по центру. При
+/// reconnect/offline во втором сегменте показывается причина вместо
+/// адреса.
+pub fn top_brand(vm: &ViewModel) -> Line<'static> {
     let (tail, tail_style): (String, Style) = match &vm.connection {
         ConnectionState::Connected => (
             format!("127.0.0.1:{}", vm.port),
@@ -47,56 +87,71 @@ pub fn top_title(vm: &ViewModel) -> Line<'static> {
     };
 
     Line::from(vec![
-        dim("[ "),
+        dim("[  "),
         accent("brook"),
         dim(" | "),
         Span::styled(tail, tail_style),
-        dim(" ]"),
+        dim("  ]"),
     ])
     .alignment(Alignment::Center)
 }
 
-/// Нижний хинт-бар: `[ ␣ <verb> | a add | d delete | q quit ]`.
-/// `<verb>` зависит от статуса строки под курсором — pause/resume/
-/// retry/reveal; если действия нет (Cancelled или пустой список) —
-/// рисуем `—`, чтобы ширина бара оставалась предсказуемой.
-pub fn hints_bar(action_word: &str) -> Line<'static> {
-    Line::from(vec![
-        dim("[ "),
-        accent("␣"),
-        dim(format!(" {action_word} ")),
-        dim("| "),
-        accent("a"),
-        dim(" add "),
-        dim("| "),
-        accent("d"),
-        dim(" delete "),
-        dim("| "),
-        accent("q"),
-        dim(" quit "),
-        dim("]"),
-    ])
-    .alignment(Alignment::Center)
+/// Нижний хинт-бар: `[ add | <primary> | delete | quit ]` по центру.
+///
+/// `add` и `quit` показываются всегда — это глобальные клавиши нормального
+/// режима. `<primary>` выбирается по статусу строки под курсором
+/// (pause/resume/retry/reveal); если её нет или Unspecified, primary и
+/// delete пропускаются и остаётся `[ add | quit ]`. Разделитель — ` | `
+/// (dim); первая буква каждого слова accent (клавиша), остаток dim; в
+/// `no_color` оба получают `Modifier::DIM`.
+pub fn hints_bar(vm: &ViewModel, no_color: bool) -> Line<'static> {
+    let (primary, secondary) = cursor_actions(vm);
+    let words: Vec<&'static str> = ["add", primary, secondary, "quit"]
+        .into_iter()
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(words.len() * 3 + 2);
+    spans.push(dim("[  "));
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            spans.push(dim("  |  "));
+        }
+        let [key, tail] = word_with_key(word, no_color);
+        spans.push(key);
+        spans.push(tail);
+    }
+    spans.push(dim("  ]"));
+    Line::from(spans).alignment(Alignment::Center)
 }
 
-/// Конкретный глагол для `␣ <verb>` в хинт-баре. Берётся по статусу
-/// строки под курсором, чтобы пользователь видел что именно сейчас
-/// сделает Space.
-pub fn action_word(vm: &ViewModel) -> &'static str {
+/// Действия для строки под курсором: (primary, secondary).
+///
+/// Primary зависит от статуса: pause для активных, resume/retry/reveal
+/// для Paused/Failed/Done. Для Cancelled и Unspecified primary пусто.
+/// Secondary всегда `delete`, кроме Unspecified. Если видимый список
+/// пуст — оба слова пусты.
+fn cursor_actions(vm: &ViewModel) -> (&'static str, &'static str) {
     let visible = vm.visible_ids();
     let Some(id) = visible.get(vm.cursor.min(visible.len().saturating_sub(1))) else {
-        return "—";
+        return ("", "");
     };
     let Some(row) = vm.downloads.get(id) else {
-        return "—";
+        return ("", "");
     };
-    match row.status {
+    let primary = match row.status {
         FileStatus::Running | FileStatus::Retrying | FileStatus::Pending => "pause",
         FileStatus::Paused => "resume",
         FileStatus::Failed => "retry",
         FileStatus::Done => "reveal",
-        FileStatus::Cancelled | FileStatus::Unspecified => "—",
-    }
+        FileStatus::Cancelled | FileStatus::Unspecified => "",
+    };
+    let secondary = if matches!(row.status, FileStatus::Unspecified) {
+        ""
+    } else {
+        "delete"
+    };
+    (primary, secondary)
 }
 
 /// Toast-подпись слева в нижней рамке. Показывается, пока `vm.toast`

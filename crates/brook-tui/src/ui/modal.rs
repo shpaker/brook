@@ -29,7 +29,10 @@ use ratatui::widgets::{
 use crate::model::{
     AddField,
     AddModal,
+    DuplicateFocus,
+    GhostFocus,
     Mode,
+    QuitFocus,
     RenameModal,
     ViewModel,
 };
@@ -38,12 +41,16 @@ pub fn draw_overlay(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     match &vm.mode {
         Mode::Normal => {}
         Mode::Add(m) => draw_add(f, m, no_color),
-        Mode::Duplicate { form, existing_id } => draw_duplicate(f, vm, form, existing_id, no_color),
+        Mode::Duplicate {
+            form,
+            existing_id,
+            focus,
+        } => draw_duplicate(f, vm, form, existing_id, *focus, no_color),
         Mode::ConfirmDelete { ids } => draw_confirm_delete(f, vm, ids, no_color),
         Mode::ConfirmRetry { ids } => draw_confirm_retry(f, vm, ids, no_color),
-        Mode::Ghost { ids } => draw_ghost(f, vm, ids, no_color),
+        Mode::Ghost { ids, focus } => draw_ghost(f, vm, ids, *focus, no_color),
         Mode::RenameOnConflict { modal } => draw_rename(f, modal, no_color),
-        Mode::QuitConfirm => draw_quit_confirm(f, vm, no_color),
+        Mode::QuitConfirm { focus } => draw_quit_confirm(f, vm, *focus, no_color),
     }
 }
 
@@ -201,9 +208,10 @@ fn draw_duplicate(
     vm: &ViewModel,
     _form: &crate::events::AddForm,
     existing_id: &str,
+    focus: DuplicateFocus,
     no_color: bool,
 ) {
-    let area = centered(f.area(), 60, 7);
+    let area = centered(f.area(), 60, 8);
     f.render_widget(Clear, area);
     let block = block("duplicate url", no_color);
     let inner = block.inner(area);
@@ -220,15 +228,15 @@ fn draw_duplicate(
         Line::from(" this url is already in the queue."),
         Line::from(format!(" existing: {existing_label}")),
         Line::from(""),
-        hint_line(
+        buttons_line(
             &[
-                ("o", Some("open existing")),
-                ("a", Some("add anyway")),
-                ("Esc", Some("cancel")),
+                ("open existing", focus == DuplicateFocus::OpenExisting),
+                ("add anyway", focus == DuplicateFocus::AddAnyway),
             ],
-            "    ",
             no_color,
         ),
+        Line::from(""),
+        tab_enter_esc_hint(no_color),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -295,8 +303,8 @@ fn draw_confirm_retry(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: b
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
-    let area = centered(f.area(), 60, 8);
+fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], focus: GhostFocus, no_color: bool) {
+    let area = centered(f.area(), 60, 9);
     f.render_widget(Clear, area);
     let block = block("download not found", no_color);
     let inner = block.inner(area);
@@ -316,20 +324,20 @@ fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
         Line::from(format!(" {summary}")),
         Line::from(" the daemon has no record of it anymore."),
         Line::from(""),
-        hint_line(
+        buttons_line(
             &[
-                ("r", Some("redownload")),
-                ("d", Some("delete")),
-                ("Esc", Some("cancel")),
+                ("redownload", focus == GhostFocus::Redownload),
+                ("delete", focus == GhostFocus::Delete),
             ],
-            "    ",
             no_color,
         ),
+        Line::from(""),
+        tab_enter_esc_hint(no_color),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
+fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, focus: QuitFocus, no_color: bool) {
     let running = vm
         .downloads
         .values()
@@ -343,28 +351,27 @@ fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     } else {
         lines.push(Line::from(" no active downloads."));
     }
-    // Пункт «остановить демон» и соответствующий хинт скрываем, если
-    // TUI не поднимал демон сам (remote-сессия или внешне запущенный
-    // локальный процесс) — гасить чужой демон мы не имеем права.
+    lines.push(Line::from(""));
+    // Пункт «остановить демон» скрываем, если TUI не поднимал демон
+    // сам (remote-сессия или внешне запущенный локальный процесс) —
+    // гасить чужой демон мы не имеем права; остаётся только «keep».
     if vm.can_stop_daemon {
-        lines.push(Line::from(" [ quit + stop daemon ]"));
+        lines.push(buttons_line(
+            &[
+                ("keep running", focus == QuitFocus::Keep),
+                ("stop daemon", focus == QuitFocus::StopDaemon),
+            ],
+            no_color,
+        ));
+    } else {
+        lines.push(buttons_line(&[("quit", true)], no_color));
     }
-    lines.push(Line::from(" [ quit, keep daemon ⏎ ]"));
-    lines.push(Line::from(" [ cancel ␛ ]"));
     lines.push(Line::from(""));
     let hint = if vm.can_stop_daemon {
-        hint_line(
-            &[
-                ("s", Some("stop daemon")),
-                ("k / Enter", Some("keep daemon")),
-                ("Esc", Some("cancel")),
-            ],
-            "    ",
-            no_color,
-        )
+        tab_enter_esc_hint(no_color)
     } else {
         hint_line(
-            &[("k / Enter", Some("quit")), ("Esc", Some("cancel"))],
+            &[("Enter", Some("ok")), ("Esc", Some("cancel"))],
             "    ",
             no_color,
         )
@@ -378,6 +385,42 @@ fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Строка из кнопок `[ label ]`. Сфокусированная рисуется REVERSED,
+/// остальные — dim. Кнопки разделены двумя пробелами; перед первой и
+/// после последней — по пробелу. Выровнена по центру.
+fn buttons_line(buttons: &[(&'static str, bool)], no_color: bool) -> Line<'static> {
+    let focused_style = if no_color {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::REVERSED)
+    };
+    let idle_style = Style::default().add_modifier(Modifier::DIM);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(buttons.len() * 2 + 1);
+    for (i, (label, focused)) in buttons.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", idle_style));
+        }
+        let text = format!(" {label} ");
+        let style = if *focused { focused_style } else { idle_style };
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans).alignment(Alignment::Center)
+}
+
+fn tab_enter_esc_hint(no_color: bool) -> Line<'static> {
+    hint_line(
+        &[
+            ("Tab", Some("switch")),
+            ("Enter", Some("ok")),
+            ("Esc", Some("cancel")),
+        ],
+        "    ",
+        no_color,
+    )
 }
 
 // Чтобы Mode::Duplicate можно было рендерить без лишнего заимствования.

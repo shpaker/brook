@@ -46,6 +46,13 @@ pub fn eta(secs: u64) -> String {
     }
 }
 
+/// Проценты в виде `"  0.0%"` … `"100.0%"`: 6 символов, ведущие пробелы
+/// сохраняют правую кромку выровненной между кадрами, пока значение
+/// переходит через 9.9 → 10.0 → 99.9 → 100.0.
+pub fn percent(fraction: f64) -> String {
+    format!("{:>5.1}%", (fraction * 100.0).clamp(0.0, 100.0))
+}
+
 /// Обрезка `…` **справа** — для имён файлов.
 pub fn right_ellipsis(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -83,5 +90,20 @@ mod tests {
     fn right_ellipsis_truncates() {
         assert_eq!(right_ellipsis("hello world", 8), "hello w…");
         assert_eq!(right_ellipsis("short", 10), "short");
+    }
+
+    #[test]
+    fn percent_formatting() {
+        assert_eq!(percent(0.0), "  0.0%");
+        assert_eq!(percent(0.5), " 50.0%");
+        assert_eq!(percent(0.999), " 99.9%");
+        assert_eq!(percent(1.0), "100.0%");
+        // clamp: выходы за [0, 1] не ломают ширину
+        assert_eq!(percent(-0.1), "  0.0%");
+        assert_eq!(percent(1.5), "100.0%");
+        // Все значения имеют одинаковую ширину — критично для right-alignment
+        assert_eq!(percent(0.05).chars().count(), 6);
+        assert_eq!(percent(0.5).chars().count(), 6);
+        assert_eq!(percent(1.0).chars().count(), 6);
     }
 }

@@ -16,7 +16,10 @@ use ratatui::widgets::Paragraph;
 
 use crate::format;
 use crate::model::DownloadRow;
-use crate::ui::progress::progress_line;
+use crate::ui::progress::{
+    progress_line,
+    ratio,
+};
 
 /// Высота одной карточки: 3 строки содержимого + 1 пустой разделитель.
 pub const CARD_HEIGHT: u16 = 4;
@@ -26,18 +29,15 @@ pub const CARD_HEIGHT: u16 = 4;
 /// первым символом контента идёт status-glyph, а сама подпись — через
 /// один пробел после него.
 const GUTTER: u16 = 3;
-/// Правый блок первой строки: `␣  <action>  ` = 6 колонок. Для Cancelled
-/// рисуются шесть пробелов — чтобы правый край не «прыгал».
-const RIGHT_MARGIN: u16 = 6;
 
 pub fn draw(f: &mut Frame, area: Rect, row: &DownloadRow, is_cursor: bool, no_color: bool) {
-    if area.height == 0 || area.width < GUTTER + RIGHT_MARGIN + 4 {
+    if area.height == 0 || area.width < GUTTER + 4 {
         return;
     }
     let ticker = ticker_span(is_cursor, no_color);
 
     let content_width = area.width.saturating_sub(GUTTER);
-    let line1 = title_line(row, ticker.clone(), area.width, no_color);
+    let line1 = title_line(row, ticker.clone(), area.width);
     let line2_bar = progress_line(row, content_width);
     let line2 = prefix_with_ticker(ticker.clone(), line2_bar);
     let line3 = meta_line(row, ticker, area.width);
@@ -75,53 +75,53 @@ fn err_span<S: Into<String>>(s: S) -> Span<'static> {
     Span::styled(s.into(), Style::default().fg(Color::Red))
 }
 
-fn title_line(
-    row: &DownloadRow,
-    ticker: Span<'static>,
-    width: u16,
-    _no_color: bool,
-) -> Line<'static> {
-    let action = action_glyph(row.status);
+fn title_line(row: &DownloadRow, ticker: Span<'static>, width: u16) -> Line<'static> {
+    // Fixed-width `"  0.0%"`..`"100.0%"` — чтобы правая кромка `%` не
+    // «прыгала» при переходе 9.9 → 10.0 → 99.9 → 100.0.
+    const PERCENT_WIDTH: u16 = 6;
+    const GAP_MIN: u16 = 1;
 
     let name_is_dim = matches!(
         row.status,
         FileStatus::Done | FileStatus::Failed | FileStatus::Cancelled
     );
-
-    // ticker(1) + gutter(2) + name + pad + right(6) = width.
-    let name_space = width.saturating_sub(GUTTER).saturating_sub(RIGHT_MARGIN) as usize;
-    let name = format::right_ellipsis(row.display_name(), name_space);
-    let name_pad = name_space.saturating_sub(name.chars().count());
-
-    let name_style = if name_is_dim {
+    let base_style = if name_is_dim {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default()
     };
 
-    let mut spans = vec![
+    let available = width.saturating_sub(GUTTER) as usize;
+    let show_percent = row.progress.bytes_total > 0 && width >= GUTTER + PERCENT_WIDTH + GAP_MIN;
+
+    if !show_percent {
+        // Размер неизвестен (streaming без Content-Length, свежий
+        // Pending без тиков) — либо окно слишком узкое. Имя во всю
+        // ширину, как до появления процента.
+        let name = format::right_ellipsis(row.display_name(), available);
+        return Line::from(vec![
+            ticker,
+            Span::raw("  "),
+            Span::styled(name, base_style),
+        ]);
+    }
+
+    let name_space = available
+        .saturating_sub(PERCENT_WIDTH as usize)
+        .saturating_sub(GAP_MIN as usize);
+    let name = format::right_ellipsis(row.display_name(), name_space);
+    let pad = available
+        .saturating_sub(name.chars().count())
+        .saturating_sub(PERCENT_WIDTH as usize);
+    let percent = format::percent(ratio(row));
+
+    Line::from(vec![
         ticker,
         Span::raw("  "),
-        Span::styled(name, name_style),
-        Span::raw(" ".repeat(name_pad)),
-    ];
-    spans.extend(right_hint(action));
-    Line::from(spans)
-}
-
-/// Правый хинт 1-й строки: `␣  <action>  ` (6 колонок). Для статусов без
-/// действия (Cancelled/Unspecified) — шесть пробелов, чтобы ширина
-/// осталась фиксированной и список не дёргался.
-fn right_hint(action: &'static str) -> Vec<Span<'static>> {
-    if action == " " {
-        vec![Span::raw("      ")]
-    } else {
-        vec![
-            dim("␣  ".to_string()),
-            dim(action.to_string()),
-            dim("  ".to_string()),
-        ]
-    }
+        Span::styled(name, base_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(percent, base_style),
+    ])
 }
 
 fn meta_line(row: &DownloadRow, ticker: Span<'static>, width: u16) -> Line<'static> {
@@ -165,42 +165,34 @@ fn status_glyph(s: FileStatus) -> &'static str {
     }
 }
 
-fn action_glyph(s: FileStatus) -> &'static str {
-    match s {
-        FileStatus::Running | FileStatus::Retrying | FileStatus::Pending => "⏸",
-        FileStatus::Paused => "⏵",
-        FileStatus::Failed => "↻",
-        FileStatus::Done => "→",
-        FileStatus::Cancelled | FileStatus::Unspecified => " ",
-    }
-}
-
 /// Возвращает (meta-text, is_error_style).
 fn meta_text(row: &DownloadRow) -> (String, bool) {
     let p = &row.progress;
     match row.status {
         FileStatus::Running => {
-            let eta = p.eta_secs.map(format::eta).unwrap_or_else(|| "—".into());
             let done = format::bytes(p.bytes_done);
-            let total = if p.bytes_total > 0 {
-                format::bytes(p.bytes_total)
-            } else {
-                "—".into()
-            };
             let speed = format::speed(p.speed_bps);
-            (
-                format!("{eta} left  ·  {done} of {total}  ·  {speed}"),
-                false,
-            )
+            if p.bytes_total > 0 {
+                let eta = p.eta_secs.map(format::eta).unwrap_or_else(|| "—".into());
+                let total = format::bytes(p.bytes_total);
+                (
+                    format!("{eta} left  ·  {done} of {total}  ·  {speed}"),
+                    false,
+                )
+            } else {
+                // Размер неизвестен (streaming без Content-Length): ETA
+                // посчитать нечем — `remaining` неизвестен.
+                (format!("unknown time left  ·  {done}  ·  {speed}"), false)
+            }
         }
         FileStatus::Paused => {
             let done = format::bytes(p.bytes_done);
-            let total = if p.bytes_total > 0 {
-                format::bytes(p.bytes_total)
+            if p.bytes_total > 0 {
+                let total = format::bytes(p.bytes_total);
+                (format!("paused  ·  {done} of {total}"), false)
             } else {
-                "—".into()
-            };
-            (format!("paused  ·  {done} of {total}"), false)
+                (format!("paused  ·  {done}"), false)
+            }
         }
         FileStatus::Retrying => {
             let err = row.error.as_deref().unwrap_or("transient error");
@@ -215,8 +207,15 @@ fn meta_text(row: &DownloadRow) -> (String, bool) {
         }
         FileStatus::Pending => (format!("queued  ·  {}", url_host(&row.url)), false),
         FileStatus::Done => {
-            let size = if p.bytes_total > 0 {
-                format::bytes(p.bytes_total)
+            // Для стриминга bytes_total = 0 — общий размер известен
+            // только по факту скачивания, берём bytes_done как итог.
+            let final_size = if p.bytes_total > 0 {
+                p.bytes_total
+            } else {
+                p.bytes_done
+            };
+            let size = if final_size > 0 {
+                format::bytes(final_size)
             } else {
                 "—".into()
             };

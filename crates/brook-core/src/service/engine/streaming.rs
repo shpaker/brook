@@ -15,6 +15,10 @@ use std::sync::atomic::{
     AtomicU64,
     Ordering,
 };
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use futures_util::StreamExt;
 use tokio::sync::{
@@ -31,6 +35,7 @@ use super::StreamingEngineInputs;
 use super::supervisor::{
     Outcome,
     RunState,
+    SpeedMeter,
     emit_status,
 };
 use crate::domain::{
@@ -91,6 +96,7 @@ pub(super) async fn run_streaming_engine<SS, F, WR, AR>(
 
     let bytes_done = Arc::new(AtomicU64::new(0));
     let (state_tx, mut state_rx) = watch::channel(RunState::Running);
+    let mut speed_meter = SpeedMeter::new(Duration::from_secs(3));
 
     // Основной цикл качания. На Pause — прерываем стрим и ждём Resume;
     // на Resume — стартуем заново (truncate через abort+open не делаем:
@@ -112,6 +118,7 @@ pub(super) async fn run_streaming_engine<SS, F, WR, AR>(
                                 FileCommand::Resume => {
                                     let _ = state_tx.send(RunState::Running);
                                     emit_status(&events_tx, id, FileStatus::Running);
+                                    speed_meter.reset();
                                 }
                                 FileCommand::Cancel => {
                                     let _ = state_tx.send(RunState::Stopping);
@@ -161,6 +168,7 @@ pub(super) async fn run_streaming_engine<SS, F, WR, AR>(
                         FileCommand::Pause => {
                             let _ = state_tx.send(RunState::Paused);
                             emit_status(&events_tx, id, FileStatus::Paused);
+                            speed_meter.reset();
                             // Уронить стрим — соединение закроется.
                             drop(byte_stream);
                             continue 'outer;
@@ -174,7 +182,7 @@ pub(super) async fn run_streaming_engine<SS, F, WR, AR>(
                     }
                 }
                 _ = progress_tick.tick() => {
-                    emit_progress_streaming(&progress_tx, id, &bytes_done);
+                    emit_progress_streaming(&progress_tx, id, &bytes_done, &mut speed_meter);
                 }
                 chunk = byte_stream.next() => {
                     match chunk {
@@ -243,7 +251,7 @@ pub(super) async fn run_streaming_engine<SS, F, WR, AR>(
         Outcome::Completed => match stream.finalize().await {
             Ok(()) => {
                 info!(%id, "streaming download completed");
-                emit_progress_streaming(&progress_tx, id, &bytes_done);
+                emit_progress_streaming(&progress_tx, id, &bytes_done, &mut speed_meter);
                 emit_status(&events_tx, id, FileStatus::Done);
                 let _ = events_tx.send(FileLifecycleEvent::Completed { id });
             }
@@ -273,15 +281,18 @@ fn emit_progress_streaming(
     tx: &broadcast::Sender<ProgressEvent>,
     id: FileId,
     bytes_done: &AtomicU64,
+    meter: &mut SpeedMeter,
 ) {
     let done = bytes_done.load(Ordering::Relaxed);
+    meter.observe(Instant::now(), done);
     let progress = Progress {
         bytes_done: done,
         // 0 = «размер неизвестен». TUI понимает это как indeterminate-gauge.
         bytes_total: 0,
         pieces_done: 0,
         pieces_total: 0,
-        speed_bps: 0.0,
+        speed_bps: meter.speed_bps(),
+        // ETA непредставима без total_size — TUI покажет «unknown».
         eta_secs: None,
     };
     let _ = tx.send(ProgressEvent::Tick { id, progress });

@@ -32,7 +32,10 @@ use crate::events::{
 use crate::model::{
     AddModal,
     ConnectionState,
+    DuplicateFocus,
+    GhostFocus,
     Mode,
+    QuitFocus,
     RenameModal,
     ViewModel,
 };
@@ -208,7 +211,10 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
             // просто тост, без алерта: призраки всплывают только по
             // нормальным pause/resume, где Mode::Normal.
             if matches!(vm.mode, Mode::Normal) {
-                vm.mode = Mode::Ghost { ids };
+                vm.mode = Mode::Ghost {
+                    ids,
+                    focus: GhostFocus::Redownload,
+                };
             } else {
                 vm.set_toast("download not found on daemon");
             }
@@ -253,7 +259,7 @@ fn handle_key(
             handle_key_rename(vm, k, channel.clone(), tx.clone());
             false
         }
-        Mode::QuitConfirm => handle_key_quit_confirm(vm, k, channel.clone(), tx.clone()),
+        Mode::QuitConfirm { .. } => handle_key_quit_confirm(vm, k, channel.clone(), tx.clone()),
     }
 }
 
@@ -266,7 +272,9 @@ fn handle_key_normal(
     let visible_len = vm.visible_ids().len();
     match k.code {
         KeyCode::Char('q') => {
-            vm.mode = Mode::QuitConfirm;
+            vm.mode = Mode::QuitConfirm {
+                focus: QuitFocus::Keep,
+            };
             return false;
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -276,7 +284,13 @@ fn handle_key_normal(
             vm.cursor = vm.cursor.saturating_add(1);
             vm.clamp_cursor(visible_len);
         }
-        KeyCode::Char(' ') => primary_action(vm, channel, tx),
+        // `r` — первая буква primary-действий группы
+        // resume/retry/reveal (соответственно Paused/Failed/Done).
+        KeyCode::Char('r') => r_action_cursor(vm, channel, tx),
+        // `p` — первая буква `pause` (Running/Retrying/Pending).
+        KeyCode::Char('p') => p_action_cursor(vm, channel, tx),
+        // Enter оставлен как исторический alias reveal'а — no-op для
+        // не-Done, никакой подсказки про него в UI нет.
         KeyCode::Enter => reveal_cursor(vm),
         KeyCode::Char('a') => {
             let default_dir = vm.settings.default_dir.clone();
@@ -294,10 +308,41 @@ fn handle_key_normal(
     false
 }
 
-/// Space на курсоре: действие зависит от статуса строки (зеркалит
-/// `<action>`-глиф из карточки). Для Failed — открывает модалку
-/// подтверждения вместо молчаливого retry.
-fn primary_action(
+/// `r` на курсоре: reveal для Done, resume для Paused, retry (через
+/// ConfirmRetry) для Failed. Для остальных статусов — no-op; на таких
+/// строках в карточке справа показан `pause  delete` (или пусто), так
+/// что `r` там не должна вызывать никаких действий.
+fn r_action_cursor(
+    vm: &mut ViewModel,
+    channel: &AuthedChannel,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    use brook_proto::brook::v1::FileStatus as S;
+    let visible = vm.visible_ids();
+    let Some(id) = visible.get(vm.cursor.min(visible.len().saturating_sub(1))) else {
+        return;
+    };
+    let id = id.clone();
+    let Some(row) = vm.downloads.get(&id) else {
+        return;
+    };
+    match row.status {
+        S::Paused => {
+            command::resume(channel.clone(), tx.clone(), vec![id]);
+        }
+        S::Failed => {
+            vm.mode = Mode::ConfirmRetry { ids: vec![id] };
+        }
+        S::Done => {
+            command::reveal_in_finder(&row.target_dir, &row.filename);
+        }
+        S::Running | S::Retrying | S::Pending | S::Cancelled | S::Unspecified => {}
+    }
+}
+
+/// `p` на курсоре: pause для Running/Retrying/Pending. Остальные
+/// статусы — no-op.
+fn p_action_cursor(
     vm: &mut ViewModel,
     channel: &AuthedChannel,
     tx: &mpsc::UnboundedSender<UiEvent>,
@@ -315,16 +360,7 @@ fn primary_action(
         S::Running | S::Retrying | S::Pending => {
             command::pause(channel.clone(), tx.clone(), vec![id]);
         }
-        S::Paused => {
-            command::resume(channel.clone(), tx.clone(), vec![id]);
-        }
-        S::Failed => {
-            vm.mode = Mode::ConfirmRetry { ids: vec![id] };
-        }
-        S::Done => {
-            command::reveal_in_finder(&row.target_dir, &row.filename);
-        }
-        S::Cancelled | S::Unspecified => {}
+        S::Paused | S::Failed | S::Done | S::Cancelled | S::Unspecified => {}
     }
 }
 
@@ -372,6 +408,7 @@ fn handle_key_add(
                 vm.mode = Mode::Duplicate {
                     form: AddForm { url, folder },
                     existing_id,
+                    focus: DuplicateFocus::OpenExisting,
                 };
                 return;
             }
@@ -415,25 +452,37 @@ fn handle_key_duplicate(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::Duplicate { form, existing_id } = &vm.mode else {
+    let Mode::Duplicate {
+        form,
+        existing_id,
+        focus,
+    } = &vm.mode
+    else {
         return;
     };
     let form = form.clone();
     let existing_id = existing_id.clone();
+    let focus = *focus;
     match k.code {
         KeyCode::Esc => vm.mode = Mode::Normal,
-        KeyCode::Char('o') => {
-            // Прыжок курсора на существующую запись.
-            let visible = vm.visible_ids();
-            if let Some(pos) = visible.iter().position(|id| id == &existing_id) {
-                vm.cursor = pos;
+        KeyCode::Tab => {
+            if let Mode::Duplicate { focus, .. } = &mut vm.mode {
+                *focus = focus.toggled();
             }
-            vm.mode = Mode::Normal;
         }
-        KeyCode::Char('a') => {
-            vm.mode = Mode::Normal;
-            command::add(channel, tx, form, None);
-        }
+        KeyCode::Enter => match focus {
+            DuplicateFocus::OpenExisting => {
+                let visible = vm.visible_ids();
+                if let Some(pos) = visible.iter().position(|id| id == &existing_id) {
+                    vm.cursor = pos;
+                }
+                vm.mode = Mode::Normal;
+            }
+            DuplicateFocus::AddAnyway => {
+                vm.mode = Mode::Normal;
+                command::add(channel, tx, form, None);
+            }
+        },
         _ => {}
     }
 }
@@ -484,38 +533,46 @@ fn handle_key_ghost(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::Ghost { ids } = &vm.mode else {
+    let Mode::Ghost { ids, focus } = &vm.mode else {
         return;
     };
     let ids = ids.clone();
+    let focus = *focus;
     match k.code {
         KeyCode::Esc => vm.mode = Mode::Normal,
-        KeyCode::Char('d') | KeyCode::Char('D') => {
-            // Выкинуть призраки из ViewModel + дёрнуть Remove (идемпотентен,
-            // если запись уже не числится — просто подчищает очередь на
-            // стороне демона).
-            vm.drop_rows(&ids);
-            vm.mode = Mode::Normal;
-            command::remove(channel, tx, ids);
-        }
-        KeyCode::Char('r') | KeyCode::Char('R') => {
-            // Пере-загрузка: снимаем призраков, перезапускаем Add по
-            // сохранённым url/folder. Делаем по всем id из алерта — если
-            // их несколько, улетит пачка Add'ов.
-            let forms: Vec<AddForm> = ids
-                .iter()
-                .filter_map(|id| vm.downloads.get(id))
-                .map(|row| AddForm {
-                    url: row.url.clone(),
-                    folder: row.target_dir.clone(),
-                })
-                .collect();
-            vm.drop_rows(&ids);
-            vm.mode = Mode::Normal;
-            for form in forms {
-                command::add(channel.clone(), tx.clone(), form, None);
+        KeyCode::Tab => {
+            if let Mode::Ghost { focus, .. } = &mut vm.mode {
+                *focus = focus.toggled();
             }
         }
+        KeyCode::Enter => match focus {
+            GhostFocus::Delete => {
+                // Выкинуть призраков из ViewModel + дёрнуть Remove
+                // (идемпотентен; если записи уже не числится — просто
+                // подчищает очередь на стороне демона).
+                vm.drop_rows(&ids);
+                vm.mode = Mode::Normal;
+                command::remove(channel, tx, ids);
+            }
+            GhostFocus::Redownload => {
+                // Пере-загрузка: снимаем призраков, перезапускаем Add
+                // по сохранённым url/folder. Делаем по всем id из
+                // алерта — если их несколько, улетит пачка Add'ов.
+                let forms: Vec<AddForm> = ids
+                    .iter()
+                    .filter_map(|id| vm.downloads.get(id))
+                    .map(|row| AddForm {
+                        url: row.url.clone(),
+                        folder: row.target_dir.clone(),
+                    })
+                    .collect();
+                vm.drop_rows(&ids);
+                vm.mode = Mode::Normal;
+                for form in forms {
+                    command::add(channel.clone(), tx.clone(), form, None);
+                }
+            }
+        },
         _ => {}
     }
 }
@@ -527,27 +584,42 @@ fn handle_key_quit_confirm(
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
     // Три варианта quit-модалки:
-    //   s        — выход с остановкой демона (Shutdown RPC → Quit)
-    //   k / Enter — выход без остановки демона (демон продолжает работать)
-    //   Esc      — отмена, остаёмся в TUI
-    // Пункт «s» скрыт, если `can_stop_daemon = false` (remote или
-    // внешне запущенный локальный демон) — мы его не поднимали, нам
-    // его и не гасить.
+    //   Tab       — переключить фокус между «keep running» и «stop daemon»
+    //   Enter     — подтвердить сфокусированный вариант
+    //   Esc       — отмена, остаёмся в TUI
+    // Кнопка «stop daemon» скрыта и Tab no-op, если `can_stop_daemon =
+    // false` (remote или внешне запущенный локальный демон) — мы его не
+    // поднимали, нам его и не гасить; фокус всегда `Keep`.
+    let Mode::QuitConfirm { focus } = &vm.mode else {
+        return false;
+    };
+    let focus = *focus;
     match k.code {
         KeyCode::Esc => {
             vm.mode = Mode::Normal;
             false
         }
-        KeyCode::Char('s') | KeyCode::Char('S') if vm.can_stop_daemon => {
-            // Сам RPC уходит в фон; по его завершении в канал падает
-            // `UiEvent::Quit` и мы выйдем из цикла. Даже если Shutdown
-            // ответил ошибкой — закрываемся, чтобы не зависнуть в
-            // модалке.
-            command::shutdown_daemon(channel, tx);
-            vm.mode = Mode::Normal;
+        KeyCode::Tab if vm.can_stop_daemon => {
+            if let Mode::QuitConfirm { focus } = &mut vm.mode {
+                *focus = focus.toggled();
+            }
             false
         }
-        KeyCode::Enter | KeyCode::Char('k') | KeyCode::Char('K') => true,
+        KeyCode::Enter => match focus {
+            QuitFocus::Keep => true,
+            QuitFocus::StopDaemon if vm.can_stop_daemon => {
+                // Сам RPC уходит в фон; по его завершении в канал
+                // падает `UiEvent::Quit` и мы выйдем из цикла. Даже
+                // если Shutdown ответил ошибкой — закрываемся, чтобы
+                // не зависнуть в модалке.
+                command::shutdown_daemon(channel, tx);
+                vm.mode = Mode::Normal;
+                false
+            }
+            // `StopDaemon` недостижим при !can_stop_daemon (Tab не
+            // переключает); на всякий случай — выход без остановки.
+            QuitFocus::StopDaemon => true,
+        },
         _ => false,
     }
 }
