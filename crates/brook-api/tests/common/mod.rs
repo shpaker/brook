@@ -76,7 +76,6 @@ pub fn fast_engine_config() -> EngineConfig {
 pub struct HarnessBuilder {
     piece_count: u32,
     piece_size: u64,
-    max_concurrent: usize,
     events_capacity: usize,
     fetch_delay: Option<Duration>,
 }
@@ -86,7 +85,6 @@ impl Default for HarnessBuilder {
         Self {
             piece_count: 2,
             piece_size: 10,
-            max_concurrent: 2,
             events_capacity: 64,
             fetch_delay: None,
         }
@@ -105,11 +103,6 @@ impl HarnessBuilder {
         self
     }
 
-    pub fn max_concurrent(mut self, n: usize) -> Self {
-        self.max_concurrent = n;
-        self
-    }
-
     pub async fn build(self) -> TestHarness {
         let factory = Arc::new(MemoryPieceStorageFactory::new(
             self.piece_count,
@@ -123,7 +116,6 @@ impl HarnessBuilder {
         }
         let fetch = Arc::new(fetch);
         let cfg = ManagerConfig {
-            max_concurrent: self.max_concurrent,
             events_capacity: self.events_capacity,
             engine: fast_engine_config(),
         };

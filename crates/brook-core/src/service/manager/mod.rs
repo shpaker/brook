@@ -2,7 +2,6 @@
 //!
 //! Отвечает за:
 //! - реестр загрузок (`records`) и активных движков (`engines`);
-//! - ограничение параллельности (`max_concurrent`);
 //! - fan-in событий в два broadcast-канала —
 //!   `broadcast::Sender<FileLifecycleEvent>` (для `WatchFile`) и
 //!   `broadcast::Sender<ProgressEvent>` (для `WatchProgress`);
@@ -99,9 +98,6 @@ use crate::service::engine::{
 /// Конфигурация менеджера.
 #[derive(Clone)]
 pub struct ManagerConfig {
-    /// Максимум одновременно активных движков. Остальные держатся в `waiting`.
-    /// Дефолт 3 — согласован с MVP; финальное значение придёт из `settings` в 3.x.
-    pub max_concurrent: usize,
     /// Ёмкость центрального broadcast-канала событий.
     pub events_capacity: usize,
     /// Конфигурация, которая прокидывается в каждый движок.
@@ -111,7 +107,6 @@ pub struct ManagerConfig {
 impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
-            max_concurrent: 3,
             events_capacity: 1024,
             engine: EngineConfig::default(),
         }
@@ -178,7 +173,7 @@ where
 pub(super) struct Inner {
     pub(super) records: HashMap<FileId, File>,
     pub(super) engines: HashMap<FileId, EngineHandle>,
-    /// Упорядоченная очередь id в ожидании слота. Id может быть и в
+    /// Упорядоченная очередь id для спавна движков. Id может быть и в
     /// `Paused` (пользователь попросил pause до старта) — такие при
     /// продвижении пропускаются.
     pub(super) waiting: VecDeque<FileId>,

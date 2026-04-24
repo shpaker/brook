@@ -46,8 +46,6 @@ pub const DEFAULT_CONFIG_FILENAME: &str = "brook.yaml";
 const DEFAULT_YAML: &str = "\
 # Конфигурация brook server. Перезапустите демон после правок.
 download:
-  # Сколько загрузок одновременно активны; остальные ждут в очереди.
-  max_concurrent: 3
   # Дефолтный каталог назначения (перекрывается FileSpec.target_dir).
   default_dir: ~/Downloads
   # Целевое число piece'ов на файл (перекрывается в FileSpec).
@@ -88,8 +86,6 @@ pub struct Settings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DownloadSection {
-    #[serde(default = "d_max_concurrent")]
-    pub max_concurrent: u32,
     #[serde(default = "d_default_dir")]
     pub default_dir: String,
     #[serde(default = "d_piece_target_count")]
@@ -105,7 +101,6 @@ pub struct DownloadSection {
 impl Default for DownloadSection {
     fn default() -> Self {
         Self {
-            max_concurrent: d_max_concurrent(),
             default_dir: d_default_dir(),
             piece_target_count: d_piece_target_count(),
             piece_size_min_mib: d_piece_size_min_mib(),
@@ -167,9 +162,6 @@ pub enum OnDuplicateUrl {
 
 // `serde(default = "...")` требует функций без аргументов, поэтому
 // константы живут внутри функций-геттеров, а не `const`.
-fn d_max_concurrent() -> u32 {
-    3
-}
 fn d_default_dir() -> String {
     "~/Downloads".into()
 }
@@ -259,12 +251,6 @@ impl Settings {
     /// Семантические инварианты, которые не ловятся serde-парсером.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let d = &self.download;
-        if d.max_concurrent == 0 {
-            return Err(ConfigError::Invalid {
-                key: "download.max_concurrent",
-                reason: "must be ≥ 1".into(),
-            });
-        }
         if d.piece_target_count == 0 {
             return Err(ConfigError::Invalid {
                 key: "download.piece_target_count",
@@ -311,7 +297,6 @@ fn is_power_of_two_u32(n: u32) -> bool {
 /// Global-only конфигурация — всё, что не переопределяется в `FileSpec`.
 #[derive(Debug, Clone)]
 pub struct DaemonRuntime {
-    pub max_concurrent: usize,
     pub api_bind: IpAddr,
     pub api_port: u16,
     pub default_dir: PathBuf,
@@ -344,7 +329,6 @@ impl DaemonRuntime {
             reason: format!("not an IP address: {e}"),
         })?;
         Ok(Self {
-            max_concurrent: d.max_concurrent as usize,
             api_bind,
             api_port: s.api.port,
             default_dir: expand_home(&d.default_dir, "download.default_dir")?,
@@ -498,7 +482,6 @@ mod tests {
     fn runtime_projection_expands_home_and_converts_units() {
         let s = Settings::default();
         let rt = DaemonRuntime::from_settings(&s).unwrap();
-        assert_eq!(rt.max_concurrent, 3);
         assert_eq!(rt.api_port, 7090);
         assert_eq!(rt.api_bind, IpAddr::from_str("127.0.0.1").unwrap());
         assert!(

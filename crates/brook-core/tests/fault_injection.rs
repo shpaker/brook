@@ -59,7 +59,6 @@ fn spin_up_manager(
     let fetch = RangeFetchClient::new(HttpClientBuilder::new().build());
     let queue = MemoryTQueueStore::new();
     let cfg = ManagerConfig {
-        max_concurrent: 4,
         events_capacity: 1024,
         engine: EngineConfig {
             write_buffer: 8 * 1024,

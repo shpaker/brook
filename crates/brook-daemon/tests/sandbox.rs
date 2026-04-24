@@ -36,7 +36,6 @@ use wiremock::{
 fn write_config(dir: &Path, default_dir: &Path) {
     let yaml = format!(
         "download:\n  \
-           max_concurrent: 1\n  \
            default_dir: {}\n  \
            piece_target_count: 1\n  \
            piece_size_min_mib: 1\n  \

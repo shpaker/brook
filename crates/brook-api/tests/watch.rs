@@ -18,7 +18,10 @@ fn spec(url: &str) -> proto::FileSpec {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn initial_snapshots_delivered() {
-    let mut h = HarnessBuilder::default().max_concurrent(0).build().await;
+    let mut h = HarnessBuilder::default()
+        .fetch_delay(Duration::from_millis(500))
+        .build()
+        .await;
     let id_a = h
         .client
         .add(proto::AddRequest {
@@ -68,7 +71,10 @@ async fn initial_snapshots_delivered() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_forwards_state_changes() {
-    let mut h = HarnessBuilder::default().max_concurrent(0).build().await;
+    let mut h = HarnessBuilder::default()
+        .fetch_delay(Duration::from_millis(500))
+        .build()
+        .await;
     let id = h
         .client
         .add(proto::AddRequest {
@@ -132,7 +138,7 @@ async fn lagged_client_gets_reconciliation() {
     // 5. Начинаем читать: ожидаем увидеть хотя бы один дополнительный
     //    snapshot (реконсиляция после Lagged).
     let mut h = HarnessBuilder::default()
-        .max_concurrent(0)
+        .fetch_delay(Duration::from_millis(500))
         .events_capacity(2)
         .build()
         .await;

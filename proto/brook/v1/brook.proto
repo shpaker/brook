@@ -182,9 +182,8 @@ message ShutdownRequest {
 message GetSettingsResponse {
   // Дефолт для префилла Add-модалки.
   string default_dir = 1;
-  reserved 2, 3, 5, 6, 7, 8;
-  reserved "default_workers", "max_workers", "piece_target_count",
-           "piece_size_min", "piece_size_max", "on_duplicate_url";
-  // Лимит одновременных активных загрузок (справочно для UI).
-  uint32 max_concurrent = 4;
+  reserved 2, 3, 4, 5, 6, 7, 8;
+  reserved "default_workers", "max_workers", "max_concurrent",
+           "piece_target_count", "piece_size_min", "piece_size_max",
+           "on_duplicate_url";
 }
