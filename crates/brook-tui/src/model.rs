@@ -64,7 +64,7 @@ pub struct DownloadRow {
     pub max_attempts: u32,
     pub error: Option<String>,
     /// Секунды с эпохи — достаточно для сортировки, без Timestamp-церемоний.
-    pub updated_at: i64,
+    pub created_at: i64,
     /// Активные куски по piece_index. Завершившиеся piece'ы
     /// выкидываются (fraction >= 1.0), поэтому размер карты
     /// ограничен числом воркеров.
@@ -85,7 +85,7 @@ impl DownloadRow {
             attempt: d.attempt,
             max_attempts: 0, // brook-proto не передаёт max; подтянем при бэкенд-расширении
             error: d.error.clone(),
-            updated_at: d.updated_at.as_ref().map(|t| t.seconds).unwrap_or(0),
+            created_at: d.created_at.as_ref().map(|t| t.seconds).unwrap_or(0),
             workers: HashMap::new(),
         }
     }
@@ -343,7 +343,7 @@ impl ViewModel {
         ids.sort_by(|a, b| {
             state_rank(a.status)
                 .cmp(&state_rank(b.status))
-                .then(b.updated_at.cmp(&a.updated_at))
+                .then(b.created_at.cmp(&a.created_at))
         });
         ids.into_iter().map(|r| r.id.clone()).collect()
     }
