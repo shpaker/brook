@@ -11,7 +11,13 @@
 //!    `TerminalGuard` (восстановит экран даже при panic через Drop).
 //! 4. Гоняет event-loop из `app::run` до `q`.
 
-use std::io;
+use std::fs::File;
+use std::io::{
+    self,
+    Read,
+    Seek,
+    SeekFrom,
+};
 use std::path::Path;
 use std::process::{
     Command,
@@ -98,7 +104,9 @@ pub async fn run(args: TuiArgs) -> Result<()> {
     // Путь к sidecar — тот же, что у локального демона (платформо-зависимый
     // cache-каталог или `BROOK_APP_DIR`). Для `--remote` не нужен, но
     // резолв дешёвый и не ломается без HOME.
-    let endpoint_path = AppPaths::resolve()?.endpoint();
+    let app_paths = AppPaths::resolve()?;
+    let endpoint_path = app_paths.endpoint();
+    let startup_log = app_paths.startup_log();
 
     // Выбор адреса: `--remote` побеждает всё. Иначе — endpoint-файл или
     // дефолтный loopback-порт.
@@ -132,9 +140,9 @@ pub async fn run(args: TuiArgs) -> Result<()> {
             // Локальный демон не отвечает — поднимаем сами. Sidecar мог
             // остаться от мёртвого — удаляем.
             Endpoint::remove(&endpoint_path);
-            spawn_daemon().context("spawn brook server")?;
+            spawn_daemon(&startup_log).context("spawn brook server")?;
             spawned_self = true;
-            wait_for_daemon(pass.clone(), &endpoint_path).await?
+            wait_for_daemon(pass.clone(), &endpoint_path, &startup_log).await?
         }
     };
     let _ = pass;
@@ -216,22 +224,31 @@ async fn probe(
 }
 
 /// Поднять демон через `current_exe() server` как детач-процесс. Стдио
-/// глушим — иначе логи демона полезут в alt-screen и испортят UI.
+/// не глушим в `/dev/null`, а перенаправляем в `startup_log`: если
+/// демон упадёт до записи endpoint-файла (битый конфиг, занятый порт),
+/// [`wait_for_daemon`] покажет хвост этого лога в ошибке.
 ///
 /// `--directory` для спавна — `~/Downloads` (sandbox-root по умолчанию).
 /// Если пользователь хочет другой корень — он явно гоняет
 /// `brook server --directory X` сам.
-fn spawn_daemon() -> Result<()> {
+fn spawn_daemon(startup_log: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("current_exe")?;
     let default_dir = default_sandbox_dir()
         .context("resolve default sandbox dir (pass `brook server --directory X` manually)")?;
+    // File::create truncates — каждая итерация автоспавна начинает лог с
+    // чистого листа, чтобы хвост относился именно к этой попытке.
+    let log = File::create(startup_log)
+        .with_context(|| format!("open startup log {}", startup_log.display()))?;
+    let log_err = log
+        .try_clone()
+        .context("clone startup log handle for stderr")?;
     Command::new(&exe)
         .arg("server")
         .arg("--directory")
         .arg(&default_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .spawn()
         .with_context(|| format!("spawn {} server", exe.display()))?;
     Ok(())
@@ -260,6 +277,7 @@ fn default_sandbox_dir() -> Result<std::path::PathBuf> {
 async fn wait_for_daemon(
     pass: Option<Arc<String>>,
     endpoint_path: &Path,
+    startup_log: &Path,
 ) -> Result<(AuthedChannel, GetSettingsResponse)> {
     const ATTEMPTS: u32 = 30;
     const DELAY: Duration = Duration::from_millis(100);
@@ -274,10 +292,33 @@ async fn wait_for_daemon(
         }
         tokio::time::sleep(DELAY).await;
     }
-    Err(anyhow!(
+    let base = format!(
         "daemon did not come up in time: {}",
         last_err.as_deref().unwrap_or("no endpoint file")
-    ))
+    );
+    match read_log_tail(startup_log, 8 * 1024) {
+        Some(tail) => Err(anyhow!("{base}\ndaemon stderr (last lines):\n{tail}")),
+        None => Err(anyhow!(base)),
+    }
+}
+
+/// Прочитать последние `max_bytes` байт лог-файла. Best-effort: если
+/// файла нет, он пуст или нечитаем — возвращаем `None`, вызов падает
+/// на обычное сообщение без хвоста.
+fn read_log_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let start = len.saturating_sub(max_bytes);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).trim_end().to_string();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// RAII-обёртка над ratatui-терминалом: включает raw mode + alternate

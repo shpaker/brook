@@ -21,7 +21,10 @@ use anyhow::{
     Result,
 };
 
-use crate::constants::ENDPOINT_FILENAME;
+use crate::constants::{
+    ENDPOINT_FILENAME,
+    STARTUP_LOG_FILENAME,
+};
 
 /// Имя env-переменной, полностью переопределяющей app-каталоги.
 pub const APP_DIR_ENV: &str = "BROOK_APP_DIR";
@@ -63,11 +66,39 @@ impl AppPaths {
     pub fn endpoint(&self) -> PathBuf {
         self.cache_dir.join(ENDPOINT_FILENAME)
     }
+
+    /// Путь к `.brook.startup.log`. TUI перенаправляет сюда stdio
+    /// спавненного `brook server`, чтобы на таймауте wait_for_daemon
+    /// показать хвост и объяснить, почему демон не поднялся.
+    pub fn startup_log(&self) -> PathBuf {
+        self.cache_dir.join(STARTUP_LOG_FILENAME)
+    }
 }
 
 fn env_override() -> Option<PathBuf> {
     match std::env::var(APP_DIR_ENV) {
         Ok(s) if !s.is_empty() => Some(PathBuf::from(s)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn startup_log_lives_next_to_endpoint_in_cache_dir() {
+        let p = AppPaths {
+            config_dir: PathBuf::from("/tmp/cfg"),
+            data_dir: PathBuf::from("/tmp/data"),
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+        assert_eq!(p.endpoint(), PathBuf::from("/tmp/cache/.brook.endpoint"));
+        assert_eq!(
+            p.startup_log(),
+            PathBuf::from("/tmp/cache/.brook.startup.log")
+        );
     }
 }
