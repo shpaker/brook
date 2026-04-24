@@ -449,7 +449,7 @@ fn handle_key_duplicate(
     let form = form.clone();
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             vm.mode = Mode::Normal;
             command::add(channel, tx, form, None);
         }
@@ -469,7 +469,7 @@ fn handle_key_confirm(
     let ids = ids.clone();
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             vm.mode = Mode::Normal;
             command::remove(channel, tx, ids);
         }
@@ -489,7 +489,7 @@ fn handle_key_confirm_retry(
     let ids = ids.clone();
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             vm.mode = Mode::Normal;
             command::retry(channel, tx, ids);
         }
@@ -513,7 +513,7 @@ fn handle_key_ghost(
             vm.mode = Mode::Normal;
             command::remove(channel, tx, ids);
         }
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             let forms = ghost_redownload_forms(vm, &ids);
             vm.drop_rows(&ids);
             vm.mode = Mode::Normal;
@@ -541,13 +541,12 @@ fn handle_key_quit_confirm(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
-    // y = выйти; n/Esc = отмена. Tab/Enter не работают.
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             vm.mode = Mode::Normal;
             false
         }
-        KeyCode::Char('y') | KeyCode::Char('Y') => quit_yes(vm, channel, tx),
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => quit_yes(vm, channel, tx),
         _ => false,
     }
 }
