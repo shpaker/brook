@@ -415,6 +415,9 @@ fn handle_key_add(
                 folder,
                 linear,
             };
+            // Сбрасываем режим до отправки команды: повторный Enter до ответа
+            // сервера иначе добавил бы тот же URL ещё раз.
+            vm.mode = Mode::Normal;
             command::add(channel, tx, form, None);
         }
         _ => {}
@@ -441,7 +444,7 @@ fn handle_key_rename(
                 return;
             }
             let form = modal.form.clone();
-            modal.error = None;
+            vm.mode = Mode::Normal;
             command::add(channel, tx, form, Some(name));
         }
         _ => {}
@@ -481,7 +484,11 @@ fn handle_key_confirm(
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            // Убираем из ViewModel немедленно — не ждём gRPC-ответа. Отмена
+            // работающей загрузки на сервере может занять секунду (дожидается
+            // воркеров), оптимистичное удаление делает UI мгновенным.
             vm.mode = Mode::Normal;
+            vm.drop_rows(&ids);
             command::remove(channel, tx, ids);
         }
         _ => {}

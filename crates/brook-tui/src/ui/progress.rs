@@ -91,11 +91,14 @@ fn chunked_bar(bar: &BarState, width: usize) -> Line<'static> {
             .worker_positions
             .iter()
             .any(|&p| p as usize >= seg_from && (p as usize) < seg_to);
-        let all_done = bar.segments[seg_from..seg_to].iter().all(|&f| f >= 1.0);
+        // Ячейка показывает ━, если хотя бы один кусок в диапазоне завершён.
+        // Строгое «all >= 1.0» давало бы ─ когда ячейка покрывает 2 куска
+        // и только один из них готов — ◆ исчезал бы без следа.
+        let any_done = bar.segments[seg_from..seg_to].iter().any(|&f| f > 0.0);
 
         spans.push(if is_active {
             Span::styled("◆", active_style)
-        } else if all_done {
+        } else if any_done {
             Span::styled("━", done_style)
         } else {
             Span::styled("─", pending_style)
