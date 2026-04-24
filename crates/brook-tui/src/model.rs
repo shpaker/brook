@@ -124,12 +124,11 @@ pub struct Toast {
 pub enum Mode {
     Normal,
     Add(AddModal),
-    /// URL уже в очереди. Tab переключает фокус между «open existing»
-    /// и «add anyway», Enter подтверждает фокусное действие.
+    /// URL уже в очереди. yes = добавить дубль, no = отмена.
     Duplicate {
         form: AddForm,
         existing_id: String,
-        focus: DuplicateFocus,
+        focus: TwoButtonFocus,
     },
     /// Демон вернул `AlreadyExists`: в target-каталоге лежит файл с
     /// таким же именем. Открываем модалку, чтобы пользователь выбрал
@@ -137,71 +136,42 @@ pub enum Mode {
     RenameOnConflict {
         modal: RenameModal,
     },
+    /// yes = удалить, no = отмена.
     ConfirmDelete {
         ids: Vec<String>,
+        focus: TwoButtonFocus,
     },
     /// Подтверждение перезапуска упавшей загрузки. `r` на Failed
-    /// не дёргает retry молча — сначала спрашиваем.
+    /// не дёргает retry молча — сначала спрашиваем. yes = повторить, no = отмена.
     ConfirmRetry {
         ids: Vec<String>,
+        focus: TwoButtonFocus,
     },
     /// Демон не знает id, по которому TUI пытался pause/resume.
-    /// Tab переключает фокус между «redownload» и «delete», Enter
-    /// подтверждает фокусное действие.
+    /// yes = перекачать, no = убрать запись из списка.
     Ghost {
         ids: Vec<String>,
-        focus: GhostFocus,
+        focus: TwoButtonFocus,
     },
-    /// На выходе из TUI: гасить демон, которого мы же подняли
-    /// (`can_stop_daemon = true`), или оставить крутиться в фоне.
-    /// Tab переключает фокус между «keep» и «stop daemon» (если
-    /// `can_stop_daemon = false`, доступен только keep).
+    /// Выход из TUI. yes = выйти (демон останавливается если TUI его запускал),
+    /// no = отмена. Tab переключает фокус между кнопками.
     QuitConfirm {
-        focus: QuitFocus,
+        focus: TwoButtonFocus,
     },
 }
 
+/// Фокус в любой двухкнопочной модалке (yes / no).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DuplicateFocus {
-    OpenExisting,
-    AddAnyway,
+pub enum TwoButtonFocus {
+    Yes,
+    No,
 }
 
-impl DuplicateFocus {
+impl TwoButtonFocus {
     pub fn toggled(self) -> Self {
         match self {
-            Self::OpenExisting => Self::AddAnyway,
-            Self::AddAnyway => Self::OpenExisting,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhostFocus {
-    Redownload,
-    Delete,
-}
-
-impl GhostFocus {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Redownload => Self::Delete,
-            Self::Delete => Self::Redownload,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuitFocus {
-    Keep,
-    StopDaemon,
-}
-
-impl QuitFocus {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Keep => Self::StopDaemon,
-            Self::StopDaemon => Self::Keep,
+            Self::Yes => Self::No,
+            Self::No => Self::Yes,
         }
     }
 }
