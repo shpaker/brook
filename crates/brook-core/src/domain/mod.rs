@@ -39,7 +39,11 @@ pub use id::{
     FileId,
     WorkerId,
 };
-pub use progress::Progress;
+pub use progress::{
+    BAR_SEGMENTS,
+    BarState,
+    Progress,
+};
 pub use reason::{
     FailureReason,
     ReasonCode,

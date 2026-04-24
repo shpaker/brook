@@ -2,11 +2,19 @@
 //! статусу. Возвращает `Line` фиксированной длины `width`; рендерится
 //! как третья строка карточки.
 //!
-//! Искры `◆` на позициях активных piece'ов планировались, но
-//! `WorkerSegment`-данные до proto не проброшены — пока сегменты не
-//! появятся в `WatchProgress`, искры остаются визуальным TODO.
+//! Когда бэкенд присылает `BarState` (загрузка не линейная, размер известен),
+//! рендерим chunked bar из трёх состояний ячейки:
+//! - **Active** `◆` Cyan — воркер качает прямо сейчас.
+//! - **Done**   `━` DarkGray — кусок завершён.
+//! - **Pending** `─` DarkGray — ещё не начат.
+//!
+//! TUI масштабирует N≤100 бэкендных сегментов к реальной ширине бара:
+//! несколько сегментов на ячейку → агрегация по приоритету Active > Done > Pending.
 
-use brook_proto::brook::v1::FileStatus;
+use brook_proto::brook::v1::{
+    BarState,
+    FileStatus,
+};
 use ratatui::style::{
     Color,
     Style,
@@ -27,11 +35,74 @@ pub fn progress_line(row: &DownloadRow, width: u16) -> Line<'static> {
     match row.status {
         FileStatus::Done => full_bar(width, accent_dim()),
         FileStatus::Pending | FileStatus::Cancelled | FileStatus::Unspecified => full_track(width),
-        FileStatus::Failed => failed_bar(row, width),
-        FileStatus::Paused => filled_bar(row, width, Color::Yellow),
-        FileStatus::Retrying => filled_bar(row, width, Color::Yellow),
-        FileStatus::Running => filled_bar(row, width, Color::Cyan),
+        FileStatus::Failed => {
+            if let Some(bar) = &row.progress.bar
+                && !bar.segments.is_empty()
+            {
+                chunked_bar(bar, width)
+            } else {
+                failed_bar(row, width)
+            }
+        }
+        FileStatus::Paused | FileStatus::Retrying => {
+            if let Some(bar) = &row.progress.bar
+                && !bar.segments.is_empty()
+            {
+                chunked_bar(bar, width)
+            } else {
+                filled_bar(row, width, Color::Yellow)
+            }
+        }
+        FileStatus::Running => {
+            if let Some(bar) = &row.progress.bar
+                && !bar.segments.is_empty()
+            {
+                chunked_bar(bar, width)
+            } else {
+                filled_bar(row, width, Color::Cyan)
+            }
+        }
     }
+}
+
+/// Chunked bar: N≤100 сегментов бэкенда → `width` ячеек.
+///
+/// Приоритет ячейки: Active (`◆` Cyan) > Done (`━` DarkGray) > Pending (`─` DarkGray).
+/// Один сегмент может растягиваться на несколько ячеек (W > N) или
+/// несколько сегментов могут попасть в одну ячейку (W < N) — агрегация
+/// одинакова.
+fn chunked_bar(bar: &BarState, width: usize) -> Line<'static> {
+    let s = bar.segments.len();
+    if s == 0 || width == 0 {
+        return full_track(width);
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(width);
+    let active_style = Style::default().fg(Color::Cyan);
+    let done_style = Style::default().fg(Color::DarkGray);
+    let pending_style = Style::default().fg(Color::DarkGray);
+
+    for cell in 0..width {
+        // Диапазон сегментов, которые попадают в эту ячейку.
+        let seg_from = cell * s / width;
+        let seg_to = (((cell + 1) * s / width).min(s)).max(seg_from + 1);
+
+        let is_active = bar
+            .worker_positions
+            .iter()
+            .any(|&p| p as usize >= seg_from && (p as usize) < seg_to);
+        let all_done = bar.segments[seg_from..seg_to].iter().all(|&f| f >= 1.0);
+
+        spans.push(if is_active {
+            Span::styled("◆", active_style)
+        } else if all_done {
+            Span::styled("━", done_style)
+        } else {
+            Span::styled("─", pending_style)
+        });
+    }
+
+    Line::from(spans)
 }
 
 fn accent_dim() -> Style {

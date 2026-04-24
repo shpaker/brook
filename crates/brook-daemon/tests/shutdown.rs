@@ -159,6 +159,7 @@ async fn shutdown_persists_and_restart_resumes() {
                 url: url.clone(),
                 target_dir: downloads.path().to_string_lossy().into(),
                 filename: Some("f.bin".into()),
+                linear: false,
             }),
         })
         .await

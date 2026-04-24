@@ -476,6 +476,7 @@ fn row_to_download(
         url: r.url,
         target_dir: PathBuf::from(r.target_dir),
         filename: r.filename,
+        linear: false,
     };
     let error = if matches!(status, FileStatus::Failed) {
         last_reason_message
@@ -536,6 +537,7 @@ mod tests {
             url: "https://example.com/file.bin".into(),
             target_dir: PathBuf::from("/tmp/brook"),
             filename: Some("file.bin".into()),
+            linear: false,
         };
         File::new(FileId::new(), spec)
     }
