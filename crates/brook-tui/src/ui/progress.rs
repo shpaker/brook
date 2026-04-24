@@ -78,7 +78,6 @@ fn chunked_bar(bar: &BarState, width: usize) -> Line<'static> {
     }
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(width);
-    let active_style = Style::default().fg(Color::Cyan);
     let done_style = Style::default().fg(Color::DarkGray);
     let pending_style = Style::default().fg(Color::DarkGray);
 
@@ -87,18 +86,10 @@ fn chunked_bar(bar: &BarState, width: usize) -> Line<'static> {
         let seg_from = cell * s / width;
         let seg_to = (((cell + 1) * s / width).min(s)).max(seg_from + 1);
 
-        let is_active = bar
-            .worker_positions
-            .iter()
-            .any(|&p| p as usize >= seg_from && (p as usize) < seg_to);
         // Ячейка показывает ━, если хотя бы один кусок в диапазоне завершён.
-        // Строгое «all >= 1.0» давало бы ─ когда ячейка покрывает 2 куска
-        // и только один из них готов — ◆ исчезал бы без следа.
         let any_done = bar.segments[seg_from..seg_to].iter().any(|&f| f > 0.0);
 
-        spans.push(if is_active {
-            Span::styled("◆", active_style)
-        } else if any_done {
+        spans.push(if any_done {
             Span::styled("━", done_style)
         } else {
             Span::styled("─", pending_style)
