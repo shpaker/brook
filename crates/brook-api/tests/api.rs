@@ -52,9 +52,31 @@ fn find_status(h: &common::TestHarness, id_str: &str) -> FileStatus {
         .status
 }
 
+async fn wait_for_status(
+    h: &common::TestHarness,
+    id_str: &str,
+    want: FileStatus,
+    timeout: Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if find_status(h, id_str) == want {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timeout waiting for status {want:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn add_pause_remove_roundtrip() {
-    let mut h = HarnessBuilder::default().max_concurrent(0).build().await;
+    // Медленный fetch, чтобы engine не успел завершить загрузку до pause.
+    let mut h = HarnessBuilder::default()
+        .fetch_delay(Duration::from_millis(500))
+        .build()
+        .await;
     assert!(h.manager.snapshot().is_empty());
 
     let id = h
@@ -69,7 +91,6 @@ async fn add_pause_remove_roundtrip() {
         .expect("id present");
     let id_str = id.value.clone();
     assert_eq!(h.manager.snapshot().len(), 1);
-    assert_eq!(find_status(&h, &id_str), FileStatus::Pending);
 
     // Pause, затем remove — без Cancel RPC'а это штатный путь для
     // не-активных записей.
@@ -79,7 +100,9 @@ async fn add_pause_remove_roundtrip() {
         })
         .await
         .unwrap();
-    assert_eq!(find_status(&h, &id_str), FileStatus::Paused);
+    // На активной engine pause асинхронный — ждём, пока fan_in_lifecycle
+    // запишет Paused в records.
+    wait_for_status(&h, &id_str, FileStatus::Paused, Duration::from_secs(2)).await;
 
     h.client
         .remove(proto::RemoveRequest { id: Some(id) })
@@ -89,8 +112,11 @@ async fn add_pause_remove_roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pause_and_resume_unqueued() {
-    let mut h = HarnessBuilder::default().max_concurrent(0).build().await;
+async fn pause_and_resume_roundtrip() {
+    let mut h = HarnessBuilder::default()
+        .fetch_delay(Duration::from_millis(500))
+        .build()
+        .await;
     let id = h
         .client
         .add(proto::AddRequest {
@@ -109,18 +135,19 @@ async fn pause_and_resume_unqueued() {
         })
         .await
         .unwrap();
-    assert_eq!(find_status(&h, &id_str), FileStatus::Paused);
+    wait_for_status(&h, &id_str, FileStatus::Paused, Duration::from_secs(2)).await;
 
     h.client
         .resume(proto::IdRequest { id: Some(id) })
         .await
         .unwrap();
-    assert_eq!(find_status(&h, &id_str), FileStatus::Pending);
+    // После resume статус — Pending или уже Running, лишь бы не Paused.
+    assert_ne!(find_status(&h, &id_str), FileStatus::Paused);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn download_runs_to_completion() {
-    let h = HarnessBuilder::default().max_concurrent(2).build().await;
+    let h = HarnessBuilder::default().build().await;
     let id = h
         .client
         .clone()
@@ -139,7 +166,6 @@ async fn download_runs_to_completion() {
 #[tokio::test(flavor = "multi_thread")]
 async fn remove_on_active_cancels_and_succeeds() {
     let mut h = HarnessBuilder::default()
-        .max_concurrent(1)
         .fetch_delay(Duration::from_millis(500))
         .build()
         .await;
@@ -174,7 +200,10 @@ async fn remove_on_active_cancels_and_succeeds() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_requires_failed_state() {
-    let mut h = HarnessBuilder::default().max_concurrent(0).build().await;
+    let mut h = HarnessBuilder::default()
+        .fetch_delay(Duration::from_millis(500))
+        .build()
+        .await;
     let id = h
         .client
         .add(proto::AddRequest {
@@ -232,6 +261,5 @@ async fn get_settings_returns_defaults() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.max_concurrent, 3);
     assert!(resp.default_dir.is_empty());
 }

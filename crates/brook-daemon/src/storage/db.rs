@@ -248,6 +248,24 @@ fn migrate(conn: &mut Connection) -> DbResult<()> {
         tx.commit()?;
     }
 
+    // V3: колонка `linear` в `files`. Флаг «последовательная загрузка» —
+    // сохраняется при добавлении и восстанавливается при reopen.
+    // DEFAULT 0 = VdC-режим для старых записей.
+    if current < 3 {
+        let tx = conn.transaction()?;
+        match tx.execute(
+            "ALTER TABLE files ADD COLUMN linear INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(e.into()),
+        }
+        tx.pragma_update(None, "user_version", 3i64)?;
+        tx.commit()?;
+    }
+
     Ok(())
 }
 
@@ -281,7 +299,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let tables = table_names(&conn);
         for t in [
@@ -326,7 +344,7 @@ mod tests {
             let version: i64 = conn
                 .pragma_query_value(None, "user_version", |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 2);
+            assert_eq!(version, 3);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM statuses"), 7);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 9);
         }

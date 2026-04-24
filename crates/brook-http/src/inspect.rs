@@ -5,8 +5,10 @@
 //! `drop(resp)` — тело ответа не тянем:
 //! - `206 Partial Content` → `Content-Range: bytes 0-0/TOTAL` → размер
 //!   известен, `accepts_ranges = true`. Вариант `.../*` → `total_size = None`.
-//! - `200 OK` → сервер проигнорировал Range; `total_size` — из
-//!   `Content-Length` (может быть `None` для chunked), `accepts_ranges = false`
+//! - `200 OK + Content-Range` → сервер поддерживает ranges, но возвращает
+//!   неправильный статус (старый Apache, ряд CDN). `accepts_ranges = true`.
+//! - `200 OK` без `Content-Range` → сервер проигнорировал Range; `total_size`
+//!   из `Content-Length` (может быть `None` для chunked), `accepts_ranges = false`
 //!   независимо от декларированного `Accept-Ranges` (он соврал).
 //! - иначе → `InspectError::UnexpectedStatus`.
 //!
@@ -89,16 +91,37 @@ impl THttpInspect for HttpInspectClient {
                 effective_url,
             })
         } else if status.is_success() {
-            // 200 OK — сервер не уважает Range. Верим только Content-Length;
-            // Accept-Ranges игнорируем (сервер мог соврать).
-            Ok(InspectReport {
-                total_size: parse_content_length(headers.get(CONTENT_LENGTH)),
-                accepts_ranges: false,
-                etag: header_str(&headers, ETAG),
-                last_modified: header_str(&headers, LAST_MODIFIED),
-                filename: pick_filename(headers.get(CONTENT_DISPOSITION), &parsed),
-                effective_url,
-            })
+            // 200 OK — формально сервер не выполнил Range. Но некоторые серверы
+            // (старый Apache, ряд CDN) возвращают 200 вместо 206 и при этом
+            // всё равно кладут Content-Range в заголовки — это значит ranges
+            // реально работают, просто статус неправильный.
+            // Accept-Ranges игнорируем: сервер мог соврать (и вернуть 200
+            // с полным телом + Accept-Ranges: bytes одновременно).
+            if let Some(cr) = headers.get(CONTENT_RANGE) {
+                // 200 + Content-Range: сервер поддерживает ranges (нестандартно,
+                // но надёжно). Отличаем «заголовок присутствует» от «заголовка нет»
+                // до вызова parse_content_range_total, потому что та возвращает
+                // Ok(None) для обоих случаев (absent и «bytes 0-0/*»).
+                let total = parse_content_range_total(Some(cr)).map_err(InspectError::Malformed)?;
+                Ok(InspectReport {
+                    total_size: total,
+                    accepts_ranges: true,
+                    etag: header_str(&headers, ETAG),
+                    last_modified: header_str(&headers, LAST_MODIFIED),
+                    filename: pick_filename(headers.get(CONTENT_DISPOSITION), &parsed),
+                    effective_url,
+                })
+            } else {
+                // Нет Content-Range → размер из Content-Length, ranges недоступны.
+                Ok(InspectReport {
+                    total_size: parse_content_length(headers.get(CONTENT_LENGTH)),
+                    accepts_ranges: false,
+                    etag: header_str(&headers, ETAG),
+                    last_modified: header_str(&headers, LAST_MODIFIED),
+                    filename: pick_filename(headers.get(CONTENT_DISPOSITION), &parsed),
+                    effective_url,
+                })
+            }
         } else {
             Err(InspectError::UnexpectedStatus {
                 code: status.as_u16(),
@@ -371,6 +394,33 @@ mod tests {
             !rep.accepts_ranges,
             "200 — Range не поддерживается, невзирая на Accept-Ranges"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_200_with_content_range_treats_as_range_supported() {
+        // Некоторые серверы возвращают 200 вместо 206, но всё равно кладут
+        // Content-Range — это значит ranges работают (нестандартно).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/f.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Range", "bytes 0-0/9999")
+                    .set_body_bytes(vec![0u8; 1]),
+            )
+            .mount(&server)
+            .await;
+
+        let ins = HttpInspectClient::new(client());
+        let rep = ins
+            .inspect(&format!("{}/f.bin", server.uri()))
+            .await
+            .unwrap();
+        assert!(
+            rep.accepts_ranges,
+            "200 + Content-Range → сервер поддерживает ranges"
+        );
+        assert_eq!(rep.total_size, Some(9999));
     }
 
     #[tokio::test]

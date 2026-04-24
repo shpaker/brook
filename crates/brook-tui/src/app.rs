@@ -379,10 +379,13 @@ fn handle_key_add(
         KeyCode::Esc => vm.mode = Mode::Normal,
         KeyCode::Tab => m.toggle_field(),
         KeyCode::Backspace => m.backspace(),
+        KeyCode::Char('l') | KeyCode::Char('L') => m.linear = !m.linear,
         KeyCode::Char(c) => m.insert_char(c),
         KeyCode::Enter => {
             let url = m.url.trim().to_string();
             let folder = m.folder.trim().to_string();
+            // Извлекаем `linear` до immutable-заимствования `vm` ниже.
+            let linear = m.linear;
             if url.is_empty() {
                 m.error = Some("url is required".into());
                 return;
@@ -398,12 +401,23 @@ fn handle_key_add(
             // Клиентская проверка URL-дубля.
             if let Some(existing_id) = vm.find_by_url(&url) {
                 vm.mode = Mode::Duplicate {
-                    form: AddForm { url, folder },
+                    form: AddForm {
+                        url,
+                        folder,
+                        linear,
+                    },
                     existing_id,
                 };
                 return;
             }
-            let form = AddForm { url, folder };
+            let form = AddForm {
+                url,
+                folder,
+                linear,
+            };
+            // Сбрасываем режим до отправки команды: повторный Enter до ответа
+            // сервера иначе добавил бы тот же URL ещё раз.
+            vm.mode = Mode::Normal;
             command::add(channel, tx, form, None);
         }
         _ => {}
@@ -430,7 +444,7 @@ fn handle_key_rename(
                 return;
             }
             let form = modal.form.clone();
-            modal.error = None;
+            vm.mode = Mode::Normal;
             command::add(channel, tx, form, Some(name));
         }
         _ => {}
@@ -470,7 +484,11 @@ fn handle_key_confirm(
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            // Убираем из ViewModel немедленно — не ждём gRPC-ответа. Отмена
+            // работающей загрузки на сервере может занять секунду (дожидается
+            // воркеров), оптимистичное удаление делает UI мгновенным.
             vm.mode = Mode::Normal;
+            vm.drop_rows(&ids);
             command::remove(channel, tx, ids);
         }
         _ => {}
@@ -531,6 +549,7 @@ fn ghost_redownload_forms(vm: &ViewModel, ids: &[String]) -> Vec<AddForm> {
         .map(|row| AddForm {
             url: row.url.clone(),
             folder: row.target_dir.clone(),
+            linear: false,
         })
         .collect()
 }

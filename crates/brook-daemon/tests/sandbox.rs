@@ -36,7 +36,6 @@ use wiremock::{
 fn write_config(dir: &Path, default_dir: &Path) {
     let yaml = format!(
         "download:\n  \
-           max_concurrent: 1\n  \
            default_dir: {}\n  \
            piece_target_count: 1\n  \
            piece_size_min_mib: 1\n  \
@@ -119,6 +118,7 @@ async fn add_rejects_target_dir_outside_sandbox() {
                 url: url.clone(),
                 target_dir: outside.path().to_string_lossy().into(),
                 filename: Some("f.bin".into()),
+                linear: false,
             }),
         })
         .await
@@ -137,6 +137,7 @@ async fn add_rejects_target_dir_outside_sandbox() {
                 url: url.clone(),
                 target_dir: escape.to_string_lossy().into(),
                 filename: Some("f.bin".into()),
+                linear: false,
             }),
         })
         .await
@@ -154,6 +155,7 @@ async fn add_rejects_target_dir_outside_sandbox() {
                 url: url.clone(),
                 target_dir: sandbox.path().to_string_lossy().into(),
                 filename: Some("ok.bin".into()),
+                linear: false,
             }),
         })
         .await

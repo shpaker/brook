@@ -264,6 +264,7 @@ mod tests {
             url: "https://example.com/file.bin".into(),
             target_dir: PathBuf::from("/tmp/brook"),
             filename: Some("file.bin".into()),
+            linear: false,
         };
         File::new(FileId::new(), spec)
     }

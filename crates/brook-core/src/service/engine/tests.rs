@@ -216,6 +216,7 @@ fn inputs_range(plan: TestPlan) -> EngineInputs {
             url: "https://test/f".into(),
             target_dir: "/tmp".into(),
             filename: Some("f".into()),
+            linear: false,
         },
         total_size: plan.total(),
         piece_size: plan.piece_size,

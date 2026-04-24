@@ -59,7 +59,6 @@ fn spin_up_manager(
     let fetch = RangeFetchClient::new(HttpClientBuilder::new().build());
     let queue = MemoryTQueueStore::new();
     let cfg = ManagerConfig {
-        max_concurrent: 4,
         events_capacity: 1024,
         engine: EngineConfig {
             write_buffer: 8 * 1024,
@@ -170,6 +169,7 @@ async fn midstream_abort_retries_and_completes() {
         url: format!("{}/f", server.uri()),
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
+        linear: false,
     };
     let _id = manager.add(spec).await.expect("add ok");
 
@@ -205,6 +205,7 @@ async fn server_500_retries_then_completes() {
         url: format!("{}/f", server.uri()),
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
+        linear: false,
     };
     manager.add(spec).await.expect("add ok");
 
@@ -238,6 +239,7 @@ async fn etag_change_fails_download() {
         url: format!("{}/f", server.uri()),
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
+        linear: false,
     };
     manager.add(spec).await.expect("add ok");
 
@@ -271,6 +273,7 @@ async fn no_content_length_uses_full_stream_fallback() {
         url: format!("{}/f", server.uri()),
         target_dir: "/tmp".into(),
         filename: Some("f.bin".into()),
+        linear: false,
     };
     manager.add(spec).await.expect("add ok");
 
@@ -337,6 +340,7 @@ async fn peak_rss_under_150mb_10_parallel_engines() {
             url: format!("{}/f", server.uri()),
             target_dir: "/tmp".into(),
             filename: Some("f.bin".into()),
+            linear: false,
         };
         manager.add(spec).await.expect("add ok");
     }

@@ -233,10 +233,7 @@ pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> 
     ));
 
     // 6. Manager + bootstrap.
-    let manager_cfg = ManagerConfig {
-        max_concurrent: daemon.max_concurrent,
-        ..Default::default()
-    };
+    let manager_cfg = ManagerConfig::default();
     let manager = Arc::new(DownloadManager::with_tracking(
         factory,
         queue,
@@ -373,7 +370,6 @@ fn ensure_parent(p: &Path) -> Result<()> {
 fn api_settings(rt: &DaemonRuntime) -> ApiSettings {
     ApiSettings {
         default_dir: rt.default_dir.to_string_lossy().into_owned(),
-        max_concurrent: rt.max_concurrent as u32,
     }
 }
 

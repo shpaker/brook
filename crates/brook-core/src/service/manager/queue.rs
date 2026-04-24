@@ -47,14 +47,11 @@ where
     WR: TWorkerRepo + Send + Sync + 'static,
     AR: TPieceAttemptRepo + Send + Sync + 'static,
 {
-    /// Продвинуть очередь — спаунить движки, пока есть слоты и ожидающие.
+    /// Продвинуть очередь — спаунить движки для всех ожидающих по порядку.
     pub(super) async fn try_spawn_next(&self) {
         loop {
             let next = {
                 let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-                if inner.engines.len() >= self.shared.config.max_concurrent {
-                    return;
-                }
                 // Перебираем `waiting` до первого подходящего (Queued);
                 // Paused/Cancelled игнорируем и пропускаем.
                 let mut picked: Option<FileId> = None;

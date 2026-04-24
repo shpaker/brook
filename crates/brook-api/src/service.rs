@@ -64,19 +64,9 @@ where
 /// Рантайм-снимок `brook.yaml`, которым обслуживается `GetSettings`.
 /// `brook-daemon` собирает его из `DaemonRuntime` на старте; в тестах
 /// `default()` даёт разумные значения.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ApiSettings {
     pub default_dir: String,
-    pub max_concurrent: u32,
-}
-
-impl Default for ApiSettings {
-    fn default() -> Self {
-        Self {
-            default_dir: String::new(),
-            max_concurrent: 3,
-        }
-    }
 }
 
 impl<PF, QS, F, WR, AR> BrookService<PF, QS, F, WR, AR>
@@ -202,7 +192,6 @@ where
         let s = &self.settings;
         Ok(Response::new(proto::GetSettingsResponse {
             default_dir: s.default_dir.clone(),
-            max_concurrent: s.max_concurrent,
         }))
     }
 

@@ -46,7 +46,6 @@ use wiremock::{
 fn write_config(dir: &Path, default_dir: &Path) {
     let yaml = format!(
         "download:\n  \
-           max_concurrent: 2\n  \
            default_dir: {}\n  \
            piece_target_count: 1\n  \
            piece_size_min_mib: 1\n  \
@@ -159,6 +158,7 @@ async fn shutdown_persists_and_restart_resumes() {
                 url: url.clone(),
                 target_dir: downloads.path().to_string_lossy().into(),
                 filename: Some("f.bin".into()),
+                linear: false,
             }),
         })
         .await
