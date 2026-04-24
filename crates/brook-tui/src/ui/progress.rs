@@ -68,7 +68,7 @@ fn failed_bar(row: &DownloadRow, width: usize) -> Line<'static> {
     ])
 }
 
-fn ratio(row: &DownloadRow) -> f64 {
+pub(crate) fn ratio(row: &DownloadRow) -> f64 {
     if row.progress.bytes_total == 0 {
         0.0
     } else {
