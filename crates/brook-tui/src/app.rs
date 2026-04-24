@@ -32,10 +32,7 @@ use crate::events::{
 use crate::model::{
     AddModal,
     ConnectionState,
-    DuplicateFocus,
-    GhostFocus,
     Mode,
-    QuitFocus,
     RenameModal,
     ViewModel,
 };
@@ -211,10 +208,7 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
             // просто тост, без алерта: призраки всплывают только по
             // нормальным pause/resume, где Mode::Normal.
             if matches!(vm.mode, Mode::Normal) {
-                vm.mode = Mode::Ghost {
-                    ids,
-                    focus: GhostFocus::Redownload,
-                };
+                vm.mode = Mode::Ghost { ids };
             } else {
                 vm.set_toast("download not found on daemon");
             }
@@ -259,7 +253,7 @@ fn handle_key(
             handle_key_rename(vm, k, channel.clone(), tx.clone());
             false
         }
-        Mode::QuitConfirm { .. } => handle_key_quit_confirm(vm, k, channel.clone(), tx.clone()),
+        Mode::QuitConfirm => handle_key_quit_confirm(vm, k, channel.clone(), tx.clone()),
     }
 }
 
@@ -272,9 +266,7 @@ fn handle_key_normal(
     let visible_len = vm.visible_ids().len();
     match k.code {
         KeyCode::Char('q') => {
-            vm.mode = Mode::QuitConfirm {
-                focus: QuitFocus::Keep,
-            };
+            vm.mode = Mode::QuitConfirm;
             return false;
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -408,7 +400,6 @@ fn handle_key_add(
                 vm.mode = Mode::Duplicate {
                     form: AddForm { url, folder },
                     existing_id,
-                    focus: DuplicateFocus::OpenExisting,
                 };
                 return;
             }
@@ -452,37 +443,16 @@ fn handle_key_duplicate(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::Duplicate {
-        form,
-        existing_id,
-        focus,
-    } = &vm.mode
-    else {
+    let Mode::Duplicate { form, .. } = &vm.mode else {
         return;
     };
     let form = form.clone();
-    let existing_id = existing_id.clone();
-    let focus = *focus;
     match k.code {
-        KeyCode::Esc => vm.mode = Mode::Normal,
-        KeyCode::Tab => {
-            if let Mode::Duplicate { focus, .. } = &mut vm.mode {
-                *focus = focus.toggled();
-            }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            vm.mode = Mode::Normal;
+            command::add(channel, tx, form, None);
         }
-        KeyCode::Enter => match focus {
-            DuplicateFocus::OpenExisting => {
-                let visible = vm.visible_ids();
-                if let Some(pos) = visible.iter().position(|id| id == &existing_id) {
-                    vm.cursor = pos;
-                }
-                vm.mode = Mode::Normal;
-            }
-            DuplicateFocus::AddAnyway => {
-                vm.mode = Mode::Normal;
-                command::add(channel, tx, form, None);
-            }
-        },
         _ => {}
     }
 }
@@ -499,7 +469,7 @@ fn handle_key_confirm(
     let ids = ids.clone();
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
-        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             vm.mode = Mode::Normal;
             command::remove(channel, tx, ids);
         }
@@ -519,7 +489,7 @@ fn handle_key_confirm_retry(
     let ids = ids.clone();
     match k.code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
-        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             vm.mode = Mode::Normal;
             command::retry(channel, tx, ids);
         }
@@ -533,48 +503,36 @@ fn handle_key_ghost(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) {
-    let Mode::Ghost { ids, focus } = &vm.mode else {
+    let Mode::Ghost { ids } = &vm.mode else {
         return;
     };
     let ids = ids.clone();
-    let focus = *focus;
     match k.code {
-        KeyCode::Esc => vm.mode = Mode::Normal,
-        KeyCode::Tab => {
-            if let Mode::Ghost { focus, .. } = &mut vm.mode {
-                *focus = focus.toggled();
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            vm.drop_rows(&ids);
+            vm.mode = Mode::Normal;
+            command::remove(channel, tx, ids);
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            let forms = ghost_redownload_forms(vm, &ids);
+            vm.drop_rows(&ids);
+            vm.mode = Mode::Normal;
+            for form in forms {
+                command::add(channel.clone(), tx.clone(), form, None);
             }
         }
-        KeyCode::Enter => match focus {
-            GhostFocus::Delete => {
-                // Выкинуть призраков из ViewModel + дёрнуть Remove
-                // (идемпотентен; если записи уже не числится — просто
-                // подчищает очередь на стороне демона).
-                vm.drop_rows(&ids);
-                vm.mode = Mode::Normal;
-                command::remove(channel, tx, ids);
-            }
-            GhostFocus::Redownload => {
-                // Пере-загрузка: снимаем призраков, перезапускаем Add
-                // по сохранённым url/folder. Делаем по всем id из
-                // алерта — если их несколько, улетит пачка Add'ов.
-                let forms: Vec<AddForm> = ids
-                    .iter()
-                    .filter_map(|id| vm.downloads.get(id))
-                    .map(|row| AddForm {
-                        url: row.url.clone(),
-                        folder: row.target_dir.clone(),
-                    })
-                    .collect();
-                vm.drop_rows(&ids);
-                vm.mode = Mode::Normal;
-                for form in forms {
-                    command::add(channel.clone(), tx.clone(), form, None);
-                }
-            }
-        },
         _ => {}
     }
+}
+
+fn ghost_redownload_forms(vm: &ViewModel, ids: &[String]) -> Vec<AddForm> {
+    ids.iter()
+        .filter_map(|id| vm.downloads.get(id))
+        .map(|row| AddForm {
+            url: row.url.clone(),
+            folder: row.target_dir.clone(),
+        })
+        .collect()
 }
 
 fn handle_key_quit_confirm(
@@ -583,44 +541,28 @@ fn handle_key_quit_confirm(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
-    // Три варианта quit-модалки:
-    //   Tab       — переключить фокус между «keep running» и «stop daemon»
-    //   Enter     — подтвердить сфокусированный вариант
-    //   Esc       — отмена, остаёмся в TUI
-    // Кнопка «stop daemon» скрыта и Tab no-op, если `can_stop_daemon =
-    // false` (remote или внешне запущенный локальный демон) — мы его не
-    // поднимали, нам его и не гасить; фокус всегда `Keep`.
-    let Mode::QuitConfirm { focus } = &vm.mode else {
-        return false;
-    };
-    let focus = *focus;
     match k.code {
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             vm.mode = Mode::Normal;
             false
         }
-        KeyCode::Tab if vm.can_stop_daemon => {
-            if let Mode::QuitConfirm { focus } = &mut vm.mode {
-                *focus = focus.toggled();
-            }
-            false
-        }
-        KeyCode::Enter => match focus {
-            QuitFocus::Keep => true,
-            QuitFocus::StopDaemon if vm.can_stop_daemon => {
-                // Сам RPC уходит в фон; по его завершении в канал
-                // падает `UiEvent::Quit` и мы выйдем из цикла. Даже
-                // если Shutdown ответил ошибкой — закрываемся, чтобы
-                // не зависнуть в модалке.
-                command::shutdown_daemon(channel, tx);
-                vm.mode = Mode::Normal;
-                false
-            }
-            // `StopDaemon` недостижим при !can_stop_daemon (Tab не
-            // переключает); на всякий случай — выход без остановки.
-            QuitFocus::StopDaemon => true,
-        },
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => quit_yes(vm, channel, tx),
         _ => false,
+    }
+}
+
+fn quit_yes(
+    vm: &mut ViewModel,
+    channel: AuthedChannel,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) -> bool {
+    if vm.can_stop_daemon {
+        // RPC уходит в фон; по завершении падает `UiEvent::Quit`.
+        command::shutdown_daemon(channel, tx);
+        vm.mode = Mode::Normal;
+        false
+    } else {
+        true
     }
 }
 

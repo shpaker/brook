@@ -1,8 +1,12 @@
 //! Модалки (§6.6).
 //!
-//! Рендер-инфраструктура: `centered` возвращает центрированный Rect
-//! под заданные размеры; `draw_*` функции печатают конкретные модалки
-//! поверх уже нарисованного UI (Clear + Block + Paragraph).
+//! Каждая модалка — `Rounded`-рамка шириной 62 и высотой 6:
+//!   - верхняя рамка: `[  title  ]` по центру
+//!   - нижняя рамка: `[  action  |  action  ]` по центру (кнопки или хинты)
+//!   - содержимое: 4 строки чистого текста (пустая · текст · текст · пустая)
+//!
+//! Дизайн согласован с chrome главного окна: скруглённые углы, cyan border,
+//! тот же формат `[  …  |  …  ]` для нижней подсказки.
 
 use brook_proto::brook::v1::FileStatus;
 use ratatui::Frame;
@@ -21,6 +25,7 @@ use ratatui::text::{
 };
 use ratatui::widgets::{
     Block,
+    BorderType,
     Borders,
     Clear,
     Paragraph,
@@ -29,10 +34,7 @@ use ratatui::widgets::{
 use crate::model::{
     AddField,
     AddModal,
-    DuplicateFocus,
-    GhostFocus,
     Mode,
-    QuitFocus,
     RenameModal,
     ViewModel,
 };
@@ -41,16 +43,12 @@ pub fn draw_overlay(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     match &vm.mode {
         Mode::Normal => {}
         Mode::Add(m) => draw_add(f, m, no_color),
-        Mode::Duplicate {
-            form,
-            existing_id,
-            focus,
-        } => draw_duplicate(f, vm, form, existing_id, *focus, no_color),
+        Mode::Duplicate { form, existing_id } => draw_duplicate(f, vm, form, existing_id, no_color),
         Mode::ConfirmDelete { ids } => draw_confirm_delete(f, vm, ids, no_color),
         Mode::ConfirmRetry { ids } => draw_confirm_retry(f, vm, ids, no_color),
-        Mode::Ghost { ids, focus } => draw_ghost(f, vm, ids, *focus, no_color),
+        Mode::Ghost { ids } => draw_ghost(f, vm, ids, no_color),
         Mode::RenameOnConflict { modal } => draw_rename(f, modal, no_color),
-        Mode::QuitConfirm { focus } => draw_quit_confirm(f, vm, *focus, no_color),
+        Mode::QuitConfirm => draw_quit_confirm(f, vm, no_color),
     }
 }
 
@@ -65,27 +63,52 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
-fn block<'a>(title: &'a str, no_color: bool) -> Block<'a> {
+/// Rounded-рамка с `[  title  ]` сверху и произвольной `bottom`-строкой снизу.
+/// Оба элемента выровнены по центру. Цвет рамки — Cyan (кроме no_color).
+fn modal_block<'a>(title: &'a str, bottom: Line<'static>, no_color: bool) -> Block<'a> {
+    let bracket_style = if no_color {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let top = Line::from(vec![
+        Span::styled("[  ", bracket_style),
+        Span::raw(title.to_owned()),
+        Span::styled("  ]", bracket_style),
+    ])
+    .alignment(Alignment::Center);
+
     let mut b = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {title} "));
+        .border_type(BorderType::Rounded)
+        .title(top)
+        .title_bottom(bottom);
     if !no_color {
-        b = b.border_style(Style::default().fg(Color::Cyan));
+        b = b.border_style(Style::default().fg(Color::DarkGray));
     }
     b
 }
 
 fn draw_add(f: &mut Frame, m: &AddModal, no_color: bool) {
-    let area = centered(f.area(), 60, 9);
+    let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = block("add download", no_color);
+    let bottom = hint_line(
+        &[
+            ("Tab", Some("switch")),
+            ("Enter", Some("add")),
+            ("Esc", Some("cancel")),
+        ],
+        no_color,
+    );
+    let block = modal_block("add download", bottom, no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines = vec![
+        Line::from(""),
         field_line("url   ", &m.url, m.field == AddField::Url, no_color),
         field_line("folder", &m.folder, m.field == AddField::Folder, no_color),
-        Line::from(""),
     ];
     if let Some(err) = &m.error {
         let style = if no_color {
@@ -97,15 +120,6 @@ fn draw_add(f: &mut Frame, m: &AddModal, no_color: bool) {
     } else {
         lines.push(Line::from(""));
     }
-    lines.push(hint_line(
-        &[
-            ("Tab", Some("switch")),
-            ("Enter", Some("add")),
-            ("Esc", Some("cancel")),
-        ],
-        "   ",
-        no_color,
-    ));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -127,16 +141,12 @@ fn field_line(label: &'static str, value: &str, focused: bool, no_color: bool) -
     ])
 }
 
-/// Пункт хинта: клавиша и опциональное описание (None — ключ без
-/// глагола, как одинокий `Esc` в confirm-модалках).
+/// Пункт хинта: клавиша и опциональное описание.
 type HintItem = (&'static str, Option<&'static str>);
 
-/// Собирает хинт-бар из пар (клавиша, описание). Клавиша рисуется
-/// accent-цветом, описание — dim; в no_color всё — `Modifier::DIM`,
-/// но остаётся раскладка по Span'ам. См. правило
-/// «TUI hint bars — символ клавиши всегда выделяется цветом» в
-/// CLAUDE.md.
-fn hint_line(items: &[HintItem], separator: &'static str, no_color: bool) -> Line<'static> {
+/// Строка хинтов в формате `[  Key · desc  |  Key · desc  ]`,
+/// согласованном с chrome главного окна. Выровнена по центру.
+fn hint_line(items: &[HintItem], no_color: bool) -> Line<'static> {
     let (key_style, desc_style) = if no_color {
         let dim = Style::default().add_modifier(Modifier::DIM);
         (dim, dim)
@@ -148,41 +158,58 @@ fn hint_line(items: &[HintItem], separator: &'static str, no_color: bool) -> Lin
     };
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len() * 3 + 2);
-    spans.push(Span::styled(" ", desc_style));
+    spans.push(Span::styled("[  ", desc_style));
     for (i, (key, desc)) in items.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(separator, desc_style));
+            spans.push(Span::styled("  |  ", desc_style));
         }
         spans.push(Span::styled(*key, key_style));
         if let Some(text) = desc {
             spans.push(Span::styled(format!(" · {text}"), desc_style));
         }
     }
-    spans.push(Span::styled(" ", desc_style));
-    Line::from(spans)
+    spans.push(Span::styled("  ]", desc_style));
+    Line::from(spans).alignment(Alignment::Center)
+}
+
+/// Кнопки `[  <y>es  |  <n>o  ]` для нижней рамки.
+/// Сфокусированная кнопка рисуется через `word_with_key` (первая буква
+/// accent — шоткат `y`/`n`, остаток dim), несфокусированная — полностью dim.
+fn bottom_yes_no(no_color: bool) -> Line<'static> {
+    let desc_style = if no_color {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let [y1, y2] = super::chrome::word_with_key("yes", no_color);
+    let [n1, n2] = super::chrome::word_with_key("no", no_color);
+    Line::from(vec![
+        Span::styled("[  ", desc_style),
+        y1,
+        y2,
+        Span::styled("  |  ", desc_style),
+        n1,
+        n2,
+        Span::styled("  ]", desc_style),
+    ])
+    .alignment(Alignment::Center)
 }
 
 fn draw_rename(f: &mut Frame, m: &RenameModal, no_color: bool) {
-    let area = centered(f.area(), 60, 8);
+    let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = block("file exists — pick a name", no_color);
+    let bottom = hint_line(
+        &[("Enter", Some("save")), ("Esc", Some("cancel"))],
+        no_color,
+    );
+    let block = modal_block("file exists — pick a name", bottom, no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let caret = "▌";
-    let value_style = if no_color {
-        Style::default()
-    } else {
-        Style::default().fg(Color::Yellow)
-    };
     let mut lines = vec![
-        Line::from(format!(" already in folder: {}", m.base)),
-        Line::from(vec![
-            Span::styled(" name   ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(m.name.clone(), value_style),
-            Span::styled(caret, value_style),
-        ]),
         Line::from(""),
+        Line::from(format!(" already in folder: {}", m.base)),
+        field_line("name   ", &m.name, true, no_color),
     ];
     if let Some(err) = &m.error {
         let style = if no_color {
@@ -194,11 +221,6 @@ fn draw_rename(f: &mut Frame, m: &RenameModal, no_color: bool) {
     } else {
         lines.push(Line::from(""));
     }
-    lines.push(hint_line(
-        &[("Enter", Some("save")), ("Esc", Some("cancel"))],
-        "    ",
-        no_color,
-    ));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -208,12 +230,11 @@ fn draw_duplicate(
     vm: &ViewModel,
     _form: &crate::events::AddForm,
     existing_id: &str,
-    focus: DuplicateFocus,
     no_color: bool,
 ) {
-    let area = centered(f.area(), 60, 8);
+    let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = block("duplicate url", no_color);
+    let block = modal_block("duplicate url", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -225,26 +246,17 @@ fn draw_duplicate(
 
     let lines = vec![
         Line::from(""),
-        Line::from(" this url is already in the queue."),
+        Line::from(" url is already in the queue — add anyway?"),
         Line::from(format!(" existing: {existing_label}")),
         Line::from(""),
-        buttons_line(
-            &[
-                ("open existing", focus == DuplicateFocus::OpenExisting),
-                ("add anyway", focus == DuplicateFocus::AddAnyway),
-            ],
-            no_color,
-        ),
-        Line::from(""),
-        tab_enter_esc_hint(no_color),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_confirm_delete(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
-    let area = centered(f.area(), 60, 7);
+    let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = block("delete download?", no_color);
+    let block = modal_block("delete download?", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -262,20 +274,14 @@ fn draw_confirm_delete(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: 
         Line::from(format!(" {summary}")),
         Line::from(" partial files will be removed."),
         Line::from(""),
-        hint_line(
-            &[("y", Some("yes")), ("n", Some("no")), ("Esc", None)],
-            "    ",
-            no_color,
-        )
-        .alignment(Alignment::Right),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_confirm_retry(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
-    let area = centered(f.area(), 60, 7);
+    let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = block("retry download?", no_color);
+    let block = modal_block("retry download?", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -293,20 +299,14 @@ fn draw_confirm_retry(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: b
         Line::from(format!(" {summary}")),
         Line::from(" download will resume from where it stopped."),
         Line::from(""),
-        hint_line(
-            &[("y", Some("yes")), ("n", Some("no")), ("Esc", None)],
-            "    ",
-            no_color,
-        )
-        .alignment(Alignment::Right),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], focus: GhostFocus, no_color: bool) {
-    let area = centered(f.area(), 60, 9);
+fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: bool) {
+    let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = block("download not found", no_color);
+    let block = modal_block("download not found", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -322,105 +322,56 @@ fn draw_ghost(f: &mut Frame, vm: &ViewModel, ids: &[String], focus: GhostFocus, 
     let lines = vec![
         Line::from(""),
         Line::from(format!(" {summary}")),
-        Line::from(" the daemon has no record of it anymore."),
+        Line::from(" the daemon has no record of it — redownload?"),
         Line::from(""),
-        buttons_line(
-            &[
-                ("redownload", focus == GhostFocus::Redownload),
-                ("delete", focus == GhostFocus::Delete),
-            ],
-            no_color,
-        ),
-        Line::from(""),
-        tab_enter_esc_hint(no_color),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, focus: QuitFocus, no_color: bool) {
+fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     let running = vm
         .downloads
         .values()
         .filter(|r| r.status == FileStatus::Running)
         .count();
 
-    let mut lines: Vec<Line> = Vec::with_capacity(8);
-    lines.push(Line::from(""));
-    if running > 0 {
-        lines.push(Line::from(format!(" {running} downloads are running.")));
+    let (line1, line2) = if vm.can_stop_daemon {
+        if running > 0 {
+            (
+                format!(" {running} downloads are running."),
+                " they will be interrupted on quit.".to_string(),
+            )
+        } else {
+            (
+                " no active downloads.".to_string(),
+                " daemon will stop on quit.".to_string(),
+            )
+        }
+    } else if running > 0 {
+        (
+            format!(" {running} downloads are running."),
+            " they will keep running after exit.".to_string(),
+        )
     } else {
-        lines.push(Line::from(" no active downloads."));
-    }
-    lines.push(Line::from(""));
-    // Пункт «остановить демон» скрываем, если TUI не поднимал демон
-    // сам (remote-сессия или внешне запущенный локальный процесс) —
-    // гасить чужой демон мы не имеем права; остаётся только «keep».
-    if vm.can_stop_daemon {
-        lines.push(buttons_line(
-            &[
-                ("keep running", focus == QuitFocus::Keep),
-                ("stop daemon", focus == QuitFocus::StopDaemon),
-            ],
-            no_color,
-        ));
-    } else {
-        lines.push(buttons_line(&[("quit", true)], no_color));
-    }
-    lines.push(Line::from(""));
-    let hint = if vm.can_stop_daemon {
-        tab_enter_esc_hint(no_color)
-    } else {
-        hint_line(
-            &[("Enter", Some("ok")), ("Esc", Some("cancel"))],
-            "    ",
-            no_color,
+        (
+            " no active downloads.".to_string(),
+            " daemon will keep running after exit.".to_string(),
         )
     };
-    lines.push(hint);
 
-    let h = lines.len() as u16 + 2;
-    let area = centered(f.area(), 62, h);
+    let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = block("quit brook", no_color);
+    let block = modal_block("quit brook", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(line1),
+        Line::from(line2),
+        Line::from(""),
+    ];
     f.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Строка из кнопок `[ label ]`. Сфокусированная рисуется REVERSED,
-/// остальные — dim. Кнопки разделены двумя пробелами; перед первой и
-/// после последней — по пробелу. Выровнена по центру.
-fn buttons_line(buttons: &[(&'static str, bool)], no_color: bool) -> Line<'static> {
-    let focused_style = if no_color {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::REVERSED)
-    };
-    let idle_style = Style::default().add_modifier(Modifier::DIM);
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(buttons.len() * 2 + 1);
-    for (i, (label, focused)) in buttons.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ", idle_style));
-        }
-        let text = format!(" {label} ");
-        let style = if *focused { focused_style } else { idle_style };
-        spans.push(Span::styled(text, style));
-    }
-    Line::from(spans).alignment(Alignment::Center)
-}
-
-fn tab_enter_esc_hint(no_color: bool) -> Line<'static> {
-    hint_line(
-        &[
-            ("Tab", Some("switch")),
-            ("Enter", Some("ok")),
-            ("Esc", Some("cancel")),
-        ],
-        "    ",
-        no_color,
-    )
 }
 
 // Чтобы Mode::Duplicate можно было рендерить без лишнего заимствования.

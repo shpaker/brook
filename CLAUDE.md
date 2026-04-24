@@ -99,10 +99,18 @@ Integration-тесты обходят `AppPaths` и кладут все четы
 - **`brook-core` layout — Hexagonal (Ports & Adapters).** New domain types go into `crates/brook-core/src/domain/` (pure, no I/O, no external-world dependencies). New outbound traits — into `crates/brook-core/src/ports/`. Application services (coordinators like `DownloadManager`, `DownloadEngine`) — into `crates/brook-core/src/service/` (to be created at stage 1.3). Concrete adapters (SQLite, HTTP clients, gRPC) **never** live in `brook-core` — they belong in `brook-daemon`, `brook-http`, `brook-api`, or other dedicated adapter crates. `brook-core` must not depend on `reqwest`, `rusqlite`, or any other I/O library; enforced by `cargo tree -p brook-core`. The public API of `brook-core` stays flat (`brook_core::DownloadId`, `brook_core::TPieceStorage`) — internal folders exist to keep layers from mixing, not to nest the API.
 - **DB access — only through repository structs.** Any SQLite manipulation in `brook.db` lives inside a dedicated repository struct. SQL strings and `rusqlite::Connection` usage never leak past the repository boundary — callers get domain methods, not queries.
 - **TUI hint bars — символ клавиши всегда выделяется цветом.** Любая подсказка о клавише рендерится минимум двумя `Span`'ами: сам ключевой символ — accent (`Color::Cyan`), остальное — dim (`Color::DarkGray`). Одним серым куском хинт класть нельзя — пользователь должен мгновенно видеть, какую клавишу нажать. В режиме `no_color` оба Span'а получают `Modifier::DIM`, но раскладка «клавиша отдельным span'ом» сохраняется. Допустимы две формы:
-  - **Отдельный ключ + описание**: `<key> · <действие>` или `<key> <действие>` — для многобуквенных клавиш вроде `Tab`/`Enter`/`Esc`, а также `y`/`n`-подтверждений. Эталон — `hint_line` в [crates/brook-tui/src/ui/modal.rs](crates/brook-tui/src/ui/modal.rs).
+  - **Отдельный ключ + описание**: `<key> · <действие>` — для многобуквенных клавиш вроде `Tab`/`Enter`/`Esc`. Эталон — `hint_line` в [crates/brook-tui/src/ui/modal.rs](crates/brook-tui/src/ui/modal.rs).
   - **Клавиша встроена первой буквой слова**: `<a>dd`, `<q>uit`, `<r>eveal`, `<p>ause` — первая буква accent, остаток dim. Используется, когда клавиша — одиночный Char и совпадает с первой буквой слова действия (верхняя рамка главного окна, правый блок карточек). Эталон — `word_with_key` в [crates/brook-tui/src/ui/chrome.rs](crates/brook-tui/src/ui/chrome.rs).
 
   Новые хинты собирать через эти хелперы, а не через одиночный `Span::styled(string, …)`.
+
+- **TUI модалки — структура и клавиатурный контракт.** Все модалки — `Rounded`-рамка 62×6, рамка `Color::DarkGray` (как у главного окна): заголовок `[  title  ]` в верхней рамке, действия в нижней; содержимое — только текст (4 строки: пустая · текст · текст · пустая). Хелперы: `bottom_yes_no`, `hint_line`, `modal_block` в [crates/brook-tui/src/ui/modal.rs](crates/brook-tui/src/ui/modal.rs).
+
+  Кнопки `yes`/`no` в нижней рамке рендерятся через `bottom_yes_no(no_color)`: оба слова через `word_with_key` — первая буква Cyan (шоткат), остаток DarkGray. Фокуса нет, Tab не работает. Цветовой блок REVERSED не используется.
+
+  Клавиатурный контракт, единый для всех `yes`/`no` модалок и **не указываемый явно в подсказках**:
+  - `y`/`Y` и `Enter` — всегда `yes` (подтвердить основное действие).
+  - `n`/`N` и `Esc` — всегда `no` (отмена / закрыть без действия).
 
 ## Formatting (Rust)
 

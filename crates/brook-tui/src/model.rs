@@ -124,12 +124,10 @@ pub struct Toast {
 pub enum Mode {
     Normal,
     Add(AddModal),
-    /// URL уже в очереди. Tab переключает фокус между «open existing»
-    /// и «add anyway», Enter подтверждает фокусное действие.
+    /// URL уже в очереди. y = добавить дубль, n/Esc = отмена.
     Duplicate {
         form: AddForm,
         existing_id: String,
-        focus: DuplicateFocus,
     },
     /// Демон вернул `AlreadyExists`: в target-каталоге лежит файл с
     /// таким же именем. Открываем модалку, чтобы пользователь выбрал
@@ -137,73 +135,23 @@ pub enum Mode {
     RenameOnConflict {
         modal: RenameModal,
     },
+    /// y = удалить, n/Esc = отмена.
     ConfirmDelete {
         ids: Vec<String>,
     },
     /// Подтверждение перезапуска упавшей загрузки. `r` на Failed
-    /// не дёргает retry молча — сначала спрашиваем.
+    /// не дёргает retry молча — сначала спрашиваем. y = повторить, n/Esc = отмена.
     ConfirmRetry {
         ids: Vec<String>,
     },
     /// Демон не знает id, по которому TUI пытался pause/resume.
-    /// Tab переключает фокус между «redownload» и «delete», Enter
-    /// подтверждает фокусное действие.
+    /// y = перекачать, n/Esc = убрать запись из списка.
     Ghost {
         ids: Vec<String>,
-        focus: GhostFocus,
     },
-    /// На выходе из TUI: гасить демон, которого мы же подняли
-    /// (`can_stop_daemon = true`), или оставить крутиться в фоне.
-    /// Tab переключает фокус между «keep» и «stop daemon» (если
-    /// `can_stop_daemon = false`, доступен только keep).
-    QuitConfirm {
-        focus: QuitFocus,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DuplicateFocus {
-    OpenExisting,
-    AddAnyway,
-}
-
-impl DuplicateFocus {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::OpenExisting => Self::AddAnyway,
-            Self::AddAnyway => Self::OpenExisting,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhostFocus {
-    Redownload,
-    Delete,
-}
-
-impl GhostFocus {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Redownload => Self::Delete,
-            Self::Delete => Self::Redownload,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuitFocus {
-    Keep,
-    StopDaemon,
-}
-
-impl QuitFocus {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Keep => Self::StopDaemon,
-            Self::StopDaemon => Self::Keep,
-        }
-    }
+    /// Выход из TUI. y = выйти (демон останавливается если TUI его запускал),
+    /// n/Esc = отмена.
+    QuitConfirm,
 }
 
 #[derive(Debug, Clone)]
