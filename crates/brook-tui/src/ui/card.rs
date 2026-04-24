@@ -37,10 +37,10 @@ pub fn draw(f: &mut Frame, area: Rect, row: &DownloadRow, is_cursor: bool, no_co
     let ticker = ticker_span(is_cursor, no_color);
 
     let content_width = area.width.saturating_sub(GUTTER);
-    let line1 = title_line(row, ticker.clone(), area.width);
-    let line2_bar = progress_line(row, content_width);
+    let line1 = title_line(row, ticker.clone(), area.width, is_cursor);
+    let line2_bar = progress_line(row, content_width, is_cursor);
     let line2 = prefix_with_ticker(ticker.clone(), line2_bar);
-    let line3 = meta_line(row, ticker, area.width);
+    let line3 = meta_line(row, ticker, area.width, is_cursor);
 
     let lines = vec![line1, line2, line3];
     f.render_widget(
@@ -67,28 +67,34 @@ fn ticker_span(is_cursor: bool, no_color: bool) -> Span<'static> {
     Span::styled(ch.to_string(), style)
 }
 
-fn dim<S: Into<String>>(s: S) -> Span<'static> {
-    Span::styled(s.into(), Style::default().fg(Color::DarkGray))
+fn accent<S: Into<String>>(s: S, is_cursor: bool) -> Span<'static> {
+    let color = if is_cursor {
+        Color::White
+    } else {
+        Color::DarkGray
+    };
+    Span::styled(s.into(), Style::default().fg(color))
 }
 
 fn err_span<S: Into<String>>(s: S) -> Span<'static> {
     Span::styled(s.into(), Style::default().fg(Color::Red))
 }
 
-fn title_line(row: &DownloadRow, ticker: Span<'static>, width: u16) -> Line<'static> {
+fn title_line(
+    row: &DownloadRow,
+    ticker: Span<'static>,
+    width: u16,
+    is_cursor: bool,
+) -> Line<'static> {
     // Fixed-width `"  0.0%"`..`"100.0%"` — чтобы правая кромка `%` не
     // «прыгала» при переходе 9.9 → 10.0 → 99.9 → 100.0.
     const PERCENT_WIDTH: u16 = 6;
     const GAP_MIN: u16 = 1;
 
-    let name_is_dim = matches!(
-        row.status,
-        FileStatus::Done | FileStatus::Failed | FileStatus::Cancelled
-    );
-    let base_style = if name_is_dim {
-        Style::default().fg(Color::DarkGray)
+    let base_style = if is_cursor {
+        Style::default().fg(Color::White)
     } else {
-        Style::default()
+        Style::default().fg(Color::DarkGray)
     };
 
     let available = width.saturating_sub(GUTTER) as usize;
@@ -124,7 +130,12 @@ fn title_line(row: &DownloadRow, ticker: Span<'static>, width: u16) -> Line<'sta
     ])
 }
 
-fn meta_line(row: &DownloadRow, ticker: Span<'static>, width: u16) -> Line<'static> {
+fn meta_line(
+    row: &DownloadRow,
+    ticker: Span<'static>,
+    width: u16,
+    is_cursor: bool,
+) -> Line<'static> {
     // После gutter идут glyph(1) + space(1), затем текст. Под сам текст
     // остаётся content_width - 2.
     let text_width = width.saturating_sub(GUTTER).saturating_sub(2) as usize;
@@ -133,13 +144,13 @@ fn meta_line(row: &DownloadRow, ticker: Span<'static>, width: u16) -> Line<'stat
     let value = if is_err {
         err_span(trimmed)
     } else {
-        dim(trimmed)
+        accent(trimmed, is_cursor)
     };
     let glyph = status_glyph(row.status);
     Line::from(vec![
         ticker,
         Span::raw("  "),
-        dim(glyph.to_string()),
+        accent(glyph.to_string(), is_cursor),
         Span::raw(" "),
         value,
     ])
