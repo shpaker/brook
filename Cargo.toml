@@ -17,19 +17,20 @@ edition = "2024"
 
 [workspace.dependencies]
 tokio              = { version = "1",    features = ["full"] }
-tonic              = { version = "0.12", features = ["transport"] }
-prost              = "0.13"
-prost-types        = "0.13"
-reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-reqwest-middleware = "0.3"
-ratatui            = "0.29"
-crossterm          = "0.28"
-rusqlite           = { version = "0.32", features = ["bundled"] }
+tonic              = { version = "0.14", features = ["transport"] }
+tonic-prost        = "0.14"
+prost              = "0.14"
+prost-types        = "0.14"
+reqwest            = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+reqwest-middleware = "0.5"
+ratatui            = "0.30"
+crossterm          = "0.29"
+rusqlite           = { version = "0.39", features = ["bundled"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror          = "2"
 anyhow             = "1"
-directories        = "5"
+directories        = "6"
 uuid               = { version = "1", features = ["v4"] }
 bytes              = "1"
 futures-core       = "0.3"
@@ -39,8 +40,8 @@ http               = "1"
 mime               = "0.3"
 url                = "2"
 wiremock           = "0.6"
-rand               = "0.8"
-fs4                = "0.13"
+rand               = "0.10"
+fs4                = "1"
 tempfile           = "3"
 serde              = { version = "1", features = ["derive"] }
 serde_yaml         = "0.9"
