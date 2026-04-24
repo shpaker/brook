@@ -658,7 +658,11 @@ pub(super) fn emit_progress(
             None
         },
     };
-    let bar = if !inputs.spec.linear && pieces_total > 0 {
+    // Chunked bar имеет смысл только при параллельной загрузке:
+    // linear=true → пользователь выбрал sequential, chunked избыточен;
+    // accepts_ranges=false → один воркер, куски идут строго по порядку,
+    //   TUI покажет обычный filled_bar как фолбек.
+    let bar = if !inputs.spec.linear && inputs.accepts_ranges && pieces_total > 0 {
         Some(compute_bar_state(
             done_piece_mask,
             active_pieces,
