@@ -361,8 +361,7 @@ fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
 
     let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let bottom = hint_line(&[("y", Some("quit")), ("n", Some("cancel"))], no_color);
-    let block = modal_block("quit brook", bottom, no_color);
+    let block = modal_block("quit brook", bottom_yes_no(no_color), no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
