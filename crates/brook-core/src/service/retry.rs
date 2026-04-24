@@ -11,7 +11,10 @@
 
 use std::time::Duration;
 
-use rand::Rng;
+// В rand 0.10 хелпер `random_range` переехал в расширенный трейт `RngExt`,
+// а `thread_rng()` переименован в `rng()`. Базовый `Rng` даёт только
+// «сырые» методы (`random`, `random_bool` и т.п.).
+use rand::RngExt;
 
 /// Политика расчёта задержки и решения «ретраить / сдаваться».
 ///
@@ -80,7 +83,7 @@ impl RetryPolicy {
         let factor = if self.jitter_ratio > 0.0 {
             let lo = 1.0 - self.jitter_ratio;
             let hi = 1.0 + self.jitter_ratio;
-            rand::thread_rng().gen_range(lo..=hi)
+            rand::rng().random_range(lo..=hi)
         } else {
             1.0
         };

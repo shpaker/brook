@@ -56,7 +56,6 @@ use brook_runtime::{
     AppPaths,
     Endpoint,
 };
-use fs4::fs_std::FileExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -177,11 +176,18 @@ pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> 
         .truncate(false)
         .open(&paths.lock)
         .with_context(|| format!("open lock {}", paths.lock.display()))?;
-    FileExt::try_lock_exclusive(&lock).map_err(|_| {
-        anyhow!(
+    // `File::try_lock` стабилизирован в stdlib (ранее брали через `fs4`).
+    // `TryLockError::WouldBlock` означает, что файл уже залочен другим
+    // процессом — это и есть «второй инстанс»; остальные I/O-ошибки
+    // прокидываем наверх.
+    lock.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => anyhow!(
             "another brook server instance is already running ({})",
             paths.lock.display()
-        )
+        ),
+        std::fs::TryLockError::Error(io) => {
+            anyhow::Error::new(io).context(format!("lock {}", paths.lock.display()))
+        }
     })?;
 
     // 2. Config.

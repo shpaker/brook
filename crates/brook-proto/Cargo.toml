@@ -7,6 +7,8 @@ edition.workspace = true
 prost       = { workspace = true }
 prost-types = { workspace = true }
 tonic       = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
-tonic-build = "0.12"
+# `tonic-prost-build` сам подтягивает `tonic-build` — явную строку не плодим.
+tonic-prost-build = "0.14"

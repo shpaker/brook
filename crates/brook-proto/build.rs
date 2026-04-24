@@ -8,7 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed={}", proto_file.display());
 
-    tonic_build::configure()
+    // В tonic 0.14 prost-кодогенерация вынесена в отдельный крейт
+    // `tonic-prost-build`; `tonic-build` оставлен как generic-ядро.
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .compile_protos(&[&proto_file], &[&proto_dir])?;

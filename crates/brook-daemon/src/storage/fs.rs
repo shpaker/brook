@@ -15,7 +15,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use fs4::fs_std::FileExt as Fs4FileExt;
+use fs4::FileExt as Fs4FileExt;
 
 /// Записать все байты `buf` в файл начиная со смещения `offset`.
 ///
