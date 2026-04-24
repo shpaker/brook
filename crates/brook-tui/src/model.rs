@@ -153,11 +153,9 @@ pub enum Mode {
         ids: Vec<String>,
         focus: TwoButtonFocus,
     },
-    /// Выход из TUI. yes = выйти (демон останавливается если TUI его запускал),
-    /// no = отмена. Tab переключает фокус между кнопками.
-    QuitConfirm {
-        focus: TwoButtonFocus,
-    },
+    /// Выход из TUI. y = выйти (демон останавливается если TUI его запускал),
+    /// n/Esc = отмена. Только шоткаты, Tab/Enter не работают.
+    QuitConfirm,
 }
 
 /// Фокус в любой двухкнопочной модалке (yes / no).

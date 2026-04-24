@@ -257,7 +257,7 @@ fn handle_key(
             handle_key_rename(vm, k, channel.clone(), tx.clone());
             false
         }
-        Mode::QuitConfirm { .. } => handle_key_quit_confirm(vm, k, channel.clone(), tx.clone()),
+        Mode::QuitConfirm => handle_key_quit_confirm(vm, k, channel.clone(), tx.clone()),
     }
 }
 
@@ -270,9 +270,7 @@ fn handle_key_normal(
     let visible_len = vm.visible_ids().len();
     match k.code {
         KeyCode::Char('q') => {
-            vm.mode = Mode::QuitConfirm {
-                focus: TwoButtonFocus::Yes,
-            };
+            vm.mode = Mode::QuitConfirm;
             return false;
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -462,11 +460,15 @@ fn handle_key_duplicate(
     let form = form.clone();
     let focus = *focus;
     match k.code {
-        KeyCode::Esc => vm.mode = Mode::Normal,
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
         KeyCode::Tab => {
             if let Mode::Duplicate { focus, .. } = &mut vm.mode {
                 *focus = focus.toggled();
             }
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            vm.mode = Mode::Normal;
+            command::add(channel, tx, form, None);
         }
         KeyCode::Enter => {
             vm.mode = Mode::Normal;
@@ -490,11 +492,15 @@ fn handle_key_confirm(
     let ids = ids.clone();
     let focus = *focus;
     match k.code {
-        KeyCode::Esc => vm.mode = Mode::Normal,
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
         KeyCode::Tab => {
             if let Mode::ConfirmDelete { focus, .. } = &mut vm.mode {
                 *focus = focus.toggled();
             }
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            vm.mode = Mode::Normal;
+            command::remove(channel, tx, ids);
         }
         KeyCode::Enter => {
             vm.mode = Mode::Normal;
@@ -518,11 +524,15 @@ fn handle_key_confirm_retry(
     let ids = ids.clone();
     let focus = *focus;
     match k.code {
-        KeyCode::Esc => vm.mode = Mode::Normal,
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
         KeyCode::Tab => {
             if let Mode::ConfirmRetry { focus, .. } = &mut vm.mode {
                 *focus = focus.toggled();
             }
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            vm.mode = Mode::Normal;
+            command::retry(channel, tx, ids);
         }
         KeyCode::Enter => {
             vm.mode = Mode::Normal;
@@ -552,27 +562,29 @@ fn handle_key_ghost(
                 *focus = focus.toggled();
             }
         }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            vm.drop_rows(&ids);
+            vm.mode = Mode::Normal;
+            command::remove(channel, tx, ids);
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let forms = ghost_redownload_forms(vm, &ids);
+            vm.drop_rows(&ids);
+            vm.mode = Mode::Normal;
+            for form in forms {
+                command::add(channel.clone(), tx.clone(), form, None);
+            }
+        }
         KeyCode::Enter => match focus {
             TwoButtonFocus::No => {
                 // no = убрать призраков из ViewModel + дёрнуть Remove
-                // (идемпотентен; если записи уже не числится — просто
-                // подчищает очередь на стороне демона).
                 vm.drop_rows(&ids);
                 vm.mode = Mode::Normal;
                 command::remove(channel, tx, ids);
             }
             TwoButtonFocus::Yes => {
-                // yes = перекачать: снимаем призраков, перезапускаем Add
-                // по сохранённым url/folder. Делаем по всем id из
-                // алерта — если их несколько, улетит пачка Add'ов.
-                let forms: Vec<AddForm> = ids
-                    .iter()
-                    .filter_map(|id| vm.downloads.get(id))
-                    .map(|row| AddForm {
-                        url: row.url.clone(),
-                        folder: row.target_dir.clone(),
-                    })
-                    .collect();
+                // yes = перекачать по сохранённым url/folder
+                let forms = ghost_redownload_forms(vm, &ids);
                 vm.drop_rows(&ids);
                 vm.mode = Mode::Normal;
                 for form in forms {
@@ -584,45 +596,45 @@ fn handle_key_ghost(
     }
 }
 
+fn ghost_redownload_forms(vm: &ViewModel, ids: &[String]) -> Vec<AddForm> {
+    ids.iter()
+        .filter_map(|id| vm.downloads.get(id))
+        .map(|row| AddForm {
+            url: row.url.clone(),
+            folder: row.target_dir.clone(),
+        })
+        .collect()
+}
+
 fn handle_key_quit_confirm(
     vm: &mut ViewModel,
     k: KeyEvent,
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
-    // yes = выйти (если TUI поднял демон — остановить его перед выходом).
-    // no  = отмена, остаёмся в TUI.
-    // Tab — переключить фокус; Esc — отмена.
-    let Mode::QuitConfirm { focus } = &vm.mode else {
-        return false;
-    };
-    let focus = *focus;
+    // y = выйти; n/Esc = отмена. Tab/Enter не работают.
     match k.code {
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
             vm.mode = Mode::Normal;
             false
         }
-        KeyCode::Tab => {
-            if let Mode::QuitConfirm { focus } = &mut vm.mode {
-                *focus = focus.toggled();
-            }
-            false
-        }
-        KeyCode::Enter => match focus {
-            TwoButtonFocus::No => {
-                vm.mode = Mode::Normal;
-                false
-            }
-            TwoButtonFocus::Yes if vm.can_stop_daemon => {
-                // Сам RPC уходит в фон; по его завершении в канал
-                // падает `UiEvent::Quit` и мы выйдем из цикла.
-                command::shutdown_daemon(channel, tx);
-                vm.mode = Mode::Normal;
-                false
-            }
-            TwoButtonFocus::Yes => true,
-        },
+        KeyCode::Char('y') | KeyCode::Char('Y') => quit_yes(vm, channel, tx),
         _ => false,
+    }
+}
+
+fn quit_yes(
+    vm: &mut ViewModel,
+    channel: AuthedChannel,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) -> bool {
+    if vm.can_stop_daemon {
+        // RPC уходит в фон; по завершении падает `UiEvent::Quit`.
+        command::shutdown_daemon(channel, tx);
+        vm.mode = Mode::Normal;
+        false
+    } else {
+        true
     }
 }
 

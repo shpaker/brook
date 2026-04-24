@@ -53,7 +53,7 @@ pub fn draw_overlay(f: &mut Frame, vm: &ViewModel, no_color: bool) {
         Mode::ConfirmRetry { ids, focus } => draw_confirm_retry(f, vm, ids, *focus, no_color),
         Mode::Ghost { ids, focus } => draw_ghost(f, vm, ids, *focus, no_color),
         Mode::RenameOnConflict { modal } => draw_rename(f, modal, no_color),
-        Mode::QuitConfirm { focus } => draw_quit_confirm(f, vm, *focus, no_color),
+        Mode::QuitConfirm => draw_quit_confirm(f, vm, no_color),
     }
 }
 
@@ -90,7 +90,7 @@ fn modal_block<'a>(title: &'a str, bottom: Line<'static>, no_color: bool) -> Blo
         .title(top)
         .title_bottom(bottom);
     if !no_color {
-        b = b.border_style(Style::default().fg(Color::Cyan));
+        b = b.border_style(Style::default().fg(Color::DarkGray));
     }
     b
 }
@@ -177,39 +177,35 @@ fn hint_line(items: &[HintItem], no_color: bool) -> Line<'static> {
     Line::from(spans).alignment(Alignment::Center)
 }
 
-/// Кнопки `[  yes  |  no  ]` для нижней рамки. Сфокусированная —
-/// Cyan REVERSED, другая — dim.
+/// Кнопки `[  <y>es  |  <n>o  ]` для нижней рамки.
+/// Сфокусированная кнопка рисуется через `word_with_key` (первая буква
+/// accent — шоткат `y`/`n`, остаток dim), несфокусированная — полностью dim.
 fn bottom_yes_no(focus: TwoButtonFocus, no_color: bool) -> Line<'static> {
-    let focused_style = if no_color {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::REVERSED)
-    };
-    let idle_style = Style::default().add_modifier(Modifier::DIM);
+    let dim = Style::default().add_modifier(Modifier::DIM);
     let desc_style = if no_color {
-        Style::default().add_modifier(Modifier::DIM)
+        dim
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let yes_style = if focus == TwoButtonFocus::Yes {
-        focused_style
+    let [y1, y2] = if focus == TwoButtonFocus::Yes {
+        super::chrome::word_with_key("yes", no_color)
     } else {
-        idle_style
+        [Span::styled("y", dim), Span::styled("es", dim)]
     };
-    let no_style = if focus == TwoButtonFocus::No {
-        focused_style
+    let [n1, n2] = if focus == TwoButtonFocus::No {
+        super::chrome::word_with_key("no", no_color)
     } else {
-        idle_style
+        [Span::styled("n", dim), Span::styled("o", dim)]
     };
 
     Line::from(vec![
         Span::styled("[  ", desc_style),
-        Span::styled("yes", yes_style),
+        y1,
+        y2,
         Span::styled("  |  ", desc_style),
-        Span::styled("no", no_style),
+        n1,
+        n2,
         Span::styled("  ]", desc_style),
     ])
     .alignment(Alignment::Center)
@@ -371,7 +367,7 @@ fn draw_ghost(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, focus: TwoButtonFocus, no_color: bool) {
+fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, no_color: bool) {
     let running = vm
         .downloads
         .values()
@@ -404,7 +400,8 @@ fn draw_quit_confirm(f: &mut Frame, vm: &ViewModel, focus: TwoButtonFocus, no_co
 
     let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
-    let block = modal_block("quit brook", bottom_yes_no(focus, no_color), no_color);
+    let bottom = hint_line(&[("y", Some("quit")), ("n", Some("cancel"))], no_color);
+    let block = modal_block("quit brook", bottom, no_color);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
