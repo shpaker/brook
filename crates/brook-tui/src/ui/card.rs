@@ -183,17 +183,27 @@ fn meta_text(row: &DownloadRow) -> (String, bool) {
         FileStatus::Running => {
             let done = format::bytes(p.bytes_done);
             let speed = format::speed(p.speed_bps);
+            // workers_count = 0 трактуем как «ещё не приехало» — UI ставит
+            // прочерк, чтобы не врать на первом кадре до первого тика.
+            let workers = if p.workers_count > 0 {
+                format!("{}w", p.workers_count)
+            } else {
+                "—".into()
+            };
             if p.bytes_total > 0 {
                 let eta = p.eta_secs.map(format::eta).unwrap_or_else(|| "—".into());
                 let total = format::bytes(p.bytes_total);
                 (
-                    format!("{eta} left  ·  {done} of {total}  ·  {speed}"),
+                    format!("{eta} left  ·  {done} of {total}  ·  {speed}  ·  {workers}"),
                     false,
                 )
             } else {
                 // Размер неизвестен (streaming без Content-Length): ETA
                 // посчитать нечем — `remaining` неизвестен.
-                (format!("unknown time left  ·  {done}  ·  {speed}"), false)
+                (
+                    format!("unknown time left  ·  {done}  ·  {speed}  ·  {workers}"),
+                    false,
+                )
             }
         }
         FileStatus::Paused => {
@@ -230,7 +240,24 @@ fn meta_text(row: &DownloadRow) -> (String, bool) {
             } else {
                 "—".into()
             };
-            (format!("done  ·  {}  ·  {size}", url_host(&row.url)), false)
+            // Скорость и кол-во воркеров демон считает on-the-fly из
+            // piece_attempts при чтении файла; для свежих/частично
+            // неполных done-файлов могут быть None — рисуем «—».
+            let speed = row
+                .avg_speed_bps
+                .map(format::speed)
+                .unwrap_or_else(|| "—".into());
+            let workers = row
+                .workers_count
+                .map(|n| format!("{n}w"))
+                .unwrap_or_else(|| "—".into());
+            (
+                format!(
+                    "done  ·  {}  ·  {size}  ·  {speed}  ·  {workers}",
+                    url_host(&row.url)
+                ),
+                false,
+            )
         }
         FileStatus::Failed => {
             let err = row.error.as_deref().unwrap_or("unknown error");

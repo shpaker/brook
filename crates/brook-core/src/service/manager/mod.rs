@@ -305,7 +305,7 @@ where
     /// `AlreadyExists` прямо в ответе на RPC `Add` (rename-модалка в TUI
     /// открывается моментально, а не по Failed-переходу). На ошибке
     /// резолва откатываем уже вставленную строку: `queue.remove` каскадом
-    /// снимет и `file_settings`.
+    /// снимет и `pieces`/`status_changes`.
     pub async fn add(&self, spec: FileSpec) -> Result<FileId> {
         let id = FileId::new();
         let mut file = File::new(id, spec.clone());

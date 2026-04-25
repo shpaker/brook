@@ -66,6 +66,15 @@ pub enum StorageError {
     #[error("{op} after abort")]
     AfterAbort { op: &'static str },
 
+    /// `.data.brook` исчез или был заменён другим inode'ом, пока fd
+    /// держался открытым (типично: пользователь удалил файл из
+    /// Finder/`rm` посреди загрузки). На Unix unlink открытого файла
+    /// не закрывает fd, и `pwrite` продолжает писать в осиротевший
+    /// inode молча — этот вариант поднимает ошибку до engine, и
+    /// загрузка переходит в `Failed`.
+    #[error("data file missing: {path}")]
+    DataFileMissing { path: String },
+
     /// Конструктор получил `piece_size == 0`.
     #[error("piece_size must be > 0")]
     InvalidPieceSize,

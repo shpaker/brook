@@ -115,6 +115,8 @@ pub fn file_to_proto(d: &File) -> proto::File {
         error: d.error.clone(),
         created_at: Some(systime_to_proto(d.created_at)),
         updated_at: Some(systime_to_proto(d.updated_at)),
+        avg_speed_bps: d.avg_speed_bps,
+        workers_count: d.workers_count,
     }
 }
 
@@ -168,6 +170,7 @@ fn progress_tick_from(id: FileId, p: &Progress) -> proto::ProgressTick {
         bytes_total: p.bytes_total,
         speed_bps: p.speed_bps,
         eta_secs: p.eta_secs,
+        workers_count: p.workers_count,
     }
 }
 
@@ -323,6 +326,7 @@ mod tests {
                 pieces_total: 2,
                 speed_bps: 123.4,
                 eta_secs: Some(42),
+                workers_count: 4,
             },
         });
         assert_eq!(tick.file_id.unwrap().value, id.to_string());
@@ -330,6 +334,7 @@ mod tests {
         assert_eq!(tick.bytes_done, 50);
         assert_eq!(tick.bytes_total, 100);
         assert_eq!(tick.eta_secs, Some(42));
+        assert_eq!(tick.workers_count, 4);
     }
 
     #[test]

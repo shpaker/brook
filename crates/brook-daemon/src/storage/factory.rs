@@ -158,9 +158,9 @@ where
         async move {
             let target_dir = policy.check_target_dir(&spec.target_dir)?;
 
-            // Штатный путь: inspect-поля уже уехали в `file_settings`
-            // из `resolve()` при `Add`. Ключевой инвариант — никакого
-            // HEAD'а здесь больше нет.
+            // Штатный путь: inspect-поля уже уехали в inspect-колонки
+            // `files` из `resolve()` при `Add`. Ключевой инвариант —
+            // никакого HEAD'а здесь больше нет.
             let fields = files_repo
                 .get_inspect_fields(id)
                 .await?

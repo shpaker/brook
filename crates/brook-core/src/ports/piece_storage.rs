@@ -179,15 +179,14 @@ pub trait TPieceStorageFactory: Send + Sync {
     /// Подготовить piece-хранилище.
     ///
     /// `id` нужен фабрике, чтобы связать persisted-state загрузки
-    /// в `brook.db` (строку в `files`/`file_settings`, а начиная
-    /// со stage 4 — и piece-таблицу) с конкретным открытым
-    /// хранилищем. Без id фабрика не смогла бы писать
-    /// inspect-поля в `file_settings` или делать resume
-    /// через общий `SharedDb`.
+    /// в `brook.db` (строку в `files`, а начиная со stage 4 —
+    /// и piece-таблицу) с конкретным открытым хранилищем. Без id
+    /// фабрика не смогла бы писать inspect-колонки `files` или
+    /// делать resume через общий `SharedDb`.
     ///
     /// Предполагает, что `resolve()` уже был вызван для этого `id`:
-    /// `spec.filename` заполнено, inspect-поля лежат в `file_settings`.
-    /// В обычном пути `prepare()` не делает сетевых запросов.
+    /// `spec.filename` заполнено, inspect-поля лежат в inspect-колонках
+    /// `files`. В обычном пути `prepare()` не делает сетевых запросов.
     fn prepare(
         &self,
         id: FileId,

@@ -72,6 +72,12 @@ message File {
   optional string error = 5;
   google.protobuf.Timestamp created_at = 6;
   google.protobuf.Timestamp updated_at = 7;
+  // Итоговая средняя скорость загрузки (байт/сек). Заполняется только
+  // для DONE — weighted average по байтам из всех успешных попыток.
+  optional double avg_speed_bps = 8;
+  // Кол-во разных воркеров, реально качавших хотя бы один piece файла.
+  // Заполняется только для DONE.
+  optional uint32 workers_count = 9;
 }
 
 // Смена статуса файла.
@@ -117,6 +123,9 @@ message ProgressTick {
   double speed_bps = 5;
   // Отсутствует, если неизвестно.
   optional uint64 eta_secs = 6;
+  // Сколько воркеров работает над файлом в текущей сессии. Фиксировано
+  // на сессию (compute_workers по total_size); для no-Range всегда 1.
+  uint32 workers_count = 7;
 }
 
 message AddRequest {

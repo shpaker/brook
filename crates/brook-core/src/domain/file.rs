@@ -26,6 +26,14 @@ pub struct File {
     pub created_at: SystemTime,
     /// Момент последнего изменения статуса.
     pub updated_at: SystemTime,
+
+    /// Итоговая средняя скорость загрузки (байт/сек). Заполняется
+    /// репозиторием on-the-fly только для `Done` (weighted average по
+    /// байтам из `piece_attempts`); для остальных статусов — `None`.
+    pub avg_speed_bps: Option<f64>,
+    /// Кол-во разных воркеров, реально качавших хотя бы один piece этого
+    /// файла. Заполняется тем же способом и тоже только для `Done`.
+    pub workers_count: Option<u32>,
 }
 
 impl File {
@@ -40,6 +48,8 @@ impl File {
             error: None,
             created_at: now,
             updated_at: now,
+            avg_speed_bps: None,
+            workers_count: None,
         }
     }
 }

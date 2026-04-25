@@ -53,6 +53,10 @@ use super::layout::{
     with_suffix,
 };
 use super::preallocate::open_or_preallocate;
+use super::verify::{
+    fd_dev_ino,
+    verify_data_file_present,
+};
 use crate::storage::error::{
     StorageError,
     StorageResult,
@@ -67,7 +71,7 @@ use crate::storage::pieces::SqlitePieceRepository;
 /// Создаётся через [`LocalPieceStorage::open`]. Конструктор делает либо
 /// «свежий» init (`delete_all` + преаллокация + `init`), либо resume
 /// (открытие существующего `.data.brook` без truncate). Решение
-/// принимается по парности «inspect-поля в `file_settings` совпадают
+/// принимается по парности «inspect-поля в `files` совпадают
 /// с переданными» + «`pieces` для `file_id` уже инициализированы»
 /// + «`.data.brook` существует».
 pub struct LocalPieceStorage {
@@ -100,12 +104,17 @@ struct Inner {
     file: RwLock<Option<File>>,
     finalized: AtomicBool,
     aborted: AtomicBool,
+    /// `(dev, ino)` файла на момент `open`. Иммутабельно для живого fd:
+    /// inode не мигрирует, пока мы держим хэндл. На горячем пути не
+    /// делаем `fstat` — только `stat` пути и сравниваем с этой парой.
+    expected_dev: u64,
+    expected_ino: u64,
 }
 
 impl LocalPieceStorage {
     /// Открыть хранилище для `id` (`filename` в `target_dir`) с известными
     /// `total_size` и `piece_size`. Inspect-поля должна была положить
-    /// в `file_settings` фабрика **до** этого вызова (stage 6).
+    /// в `files` фабрика **до** этого вызова (stage 6).
     ///
     /// Поведение по состоянию рядом лежащих файлов и БД:
     /// - inspect-поля совпадают, `pieces` инициализированы и `.data.brook`
@@ -178,6 +187,7 @@ impl LocalPieceStorage {
         }
 
         let data = open_or_preallocate(target_dir, &data_path, total_size, use_resume).await?;
+        let (expected_dev, expected_ino) = fd_dev_ino(&data)?;
 
         if !use_resume {
             let count = piece_count(total_size, piece_size);
@@ -189,6 +199,8 @@ impl LocalPieceStorage {
                 file: RwLock::new(Some(data)),
                 finalized: AtomicBool::new(false),
                 aborted: AtomicBool::new(false),
+                expected_dev,
+                expected_ino,
             }),
             data_path,
             target_path,
@@ -270,6 +282,7 @@ impl LocalPieceStorage {
         }
         let abs = offset_for(piece_index, self.piece_size) + offset_in_piece;
         let inner = Arc::clone(&self.inner);
+        let data_path = self.data_path.clone();
 
         tokio::task::spawn_blocking(move || -> StorageResult<()> {
             // Флаги читаем атомиками — без блокировки. Между проверкой
@@ -282,6 +295,11 @@ impl LocalPieceStorage {
             if inner.aborted.load(Ordering::Acquire) {
                 return Err(StorageError::AfterAbort { op: "write" });
             }
+            // Если пользователь удалил `.data.brook` (Finder/`rm`) —
+            // fd ещё жив, pwrite пройдёт «в воздух», прогресс будет
+            // расти, а файл так и не появится. Один stat пути ловит
+            // и удаление (ENOENT), и подмену (другой inode).
+            verify_data_file_present(&data_path, inner.expected_dev, inner.expected_ino)?;
             let guard = inner.file.read().expect("rwlock poisoned");
             let file = guard
                 .as_ref()
@@ -301,6 +319,7 @@ impl LocalPieceStorage {
         // «commit ⇒ persisted» держится именно этим порядком:
         // sync_data() здесь, затем UPDATE в pieces.
         let inner = Arc::clone(&self.inner);
+        let data_path = self.data_path.clone();
         tokio::task::spawn_blocking(move || -> StorageResult<()> {
             if inner.finalized.load(Ordering::Acquire) {
                 return Err(StorageError::AfterFinalize { op: "commit" });
@@ -308,6 +327,11 @@ impl LocalPieceStorage {
             if inner.aborted.load(Ordering::Acquire) {
                 return Err(StorageError::AfterAbort { op: "commit" });
             }
+            // Defense-in-depth: ловим случай, когда удаление произошло
+            // между последним write и этим commit. `sync_data` на
+            // осиротевшем inode молча преуспеет — без stat'а пути о
+            // потере данных мы бы узнали только при finalize.
+            verify_data_file_present(&data_path, inner.expected_dev, inner.expected_ino)?;
             let guard = inner.file.read().expect("rwlock poisoned");
             // sync_data на одном fd из нескольких потоков
             // поточно-безопасен (fsync/fdatasync — thread-safe).
@@ -652,6 +676,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(s.pending_pieces().await.unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn deleting_data_file_makes_write_fail_permanently() {
+        let dir = tempdir().unwrap();
+        let (_db, _files, _pieces, _id, s) = open_fresh(dir.path(), "del.bin").await;
+
+        // Один успешный write, чтобы убедиться: до удаления всё ок.
+        s.write_piece_bytes(0, 0, bs(b"AAAA")).await.unwrap();
+
+        // Имитация `rm`/Finder Trash: путь исчезает, fd остаётся жив.
+        std::fs::remove_file(dir.path().join("del.bin.data.brook")).unwrap();
+
+        let err = s
+            .write_piece_bytes(0, 4, bs(b"BBBB"))
+            .await
+            .expect_err("write must fail when path is unlinked");
+        let msg = format!("{err}");
+        assert!(msg.contains("data file missing"), "unexpected error: {msg}");
+        assert!(msg.contains("del.bin.data.brook"), "missing path: {msg}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replacing_data_file_with_different_inode_fails() {
+        let dir = tempdir().unwrap();
+        let (_db, _files, _pieces, _id, s) = open_fresh(dir.path(), "swap.bin").await;
+        s.write_piece_bytes(0, 0, bs(b"AAAA")).await.unwrap();
+
+        // Удалить и пересоздать: путь существует, но inode другой.
+        let p = dir.path().join("swap.bin.data.brook");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, b"\x00\x00\x00\x00").unwrap();
+
+        let err = s.write_piece_bytes(0, 4, bs(b"BBBB")).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("data file missing"),
+            "expected DataFileMissing, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn deleting_data_file_makes_commit_done_fail() {
+        let dir = tempdir().unwrap();
+        let (_db, _files, _pieces, _id, s) = open_fresh(dir.path(), "cmt.bin").await;
+        s.write_piece_bytes(0, 0, bs(b"AAAABBBB")).await.unwrap();
+
+        std::fs::remove_file(dir.path().join("cmt.bin.data.brook")).unwrap();
+
+        let err = s.commit_done(0).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("data file missing"),
+            "expected DataFileMissing, got: {err}"
+        );
     }
 
     #[tokio::test]

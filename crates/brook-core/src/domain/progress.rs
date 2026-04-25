@@ -24,6 +24,10 @@ pub struct Progress {
     pub speed_bps: f64,
     /// Оценка оставшегося времени, секунды. `None` — неизвестно.
     pub eta_secs: Option<u64>,
+    /// Сколько воркеров работает над файлом в этой engine-сессии.
+    /// Значение фиксируется при старте (`compute_workers`) и не меняется
+    /// до завершения; для no-Range всегда 1.
+    pub workers_count: u32,
 }
 
 impl Progress {
@@ -54,6 +58,7 @@ mod tests {
         assert_eq!(p.pieces_total, 0);
         assert_eq!(p.speed_bps, 0.0);
         assert_eq!(p.eta_secs, None);
+        assert_eq!(p.workers_count, 0);
     }
 
     #[test]

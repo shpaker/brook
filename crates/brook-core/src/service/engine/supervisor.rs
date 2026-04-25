@@ -291,6 +291,7 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                             pieces_committed as u32,
                             total_pieces,
                             &mut speed_meter,
+                            worker_count as u32,
                         );
                     }
                     WorkerMsg::Failed(err) => {
@@ -335,6 +336,7 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                     pieces_committed as u32,
                     total_pieces,
                     &mut speed_meter,
+                    worker_count as u32,
                 );
             }
             else => {
@@ -460,6 +462,7 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                         total_pieces,
                         total_pieces,
                         &mut speed_meter,
+                        worker_count as u32,
                     );
                     emit_status(&events_tx, id, FileStatus::Done);
                     let _ = events_tx.send(FileLifecycleEvent::Completed { id });
@@ -495,6 +498,7 @@ pub(super) fn emit_status(
     let _ = tx.send(FileLifecycleEvent::StatusChanged { id, status });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_progress(
     tx: &broadcast::Sender<ProgressEvent>,
     id: FileId,
@@ -503,6 +507,7 @@ pub(super) fn emit_progress(
     pieces_done: u32,
     pieces_total: u32,
     meter: &mut SpeedMeter,
+    workers_count: u32,
 ) {
     let done = bytes_done.load(Ordering::Relaxed);
     meter.observe(Instant::now(), done);
@@ -518,6 +523,7 @@ pub(super) fn emit_progress(
         } else {
             None
         },
+        workers_count,
     };
     let _ = tx.send(ProgressEvent::Tick { id, progress });
 }

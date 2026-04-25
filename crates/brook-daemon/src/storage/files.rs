@@ -6,15 +6,20 @@
 //!
 //! ## Раскладка по таблицам
 //!
-//! Одна доменная `File` ложится в три таблицы (миграция — в
+//! Одна доменная `File` ложится в две таблицы (миграция — в
 //! [`super::db::SharedDb`]):
 //!
-//! - `files` — «шапка»: `id`, `url`, `target_dir`, `filename`,
-//!   текущее `status_id`, `created_at`.
-//! - `file_settings` (1:1) — inspect-поля (`total_size`, `piece_size`,
-//!   `etag`, `last_modified`; NULL до stage 6, когда их пишет фабрика).
+//! - `files` — и «шапка» (`id`, `url`, `target_dir`, `filename`,
+//!   `status_id`, `created_at`), и inspect-поля (`total_size`,
+//!   `piece_size`, `etag`, `last_modified`, `effective_url`,
+//!   `accepts_ranges`; все NULL до того, как фабрика вызовет
+//!   `set_inspect_fields()` после первого HTTP-зонда).
 //! - `status_changes` — полный аудит переходов: `reason_code_id` +
 //!   `reason_message` живут только тут; колонки в `files` их не дублируют.
+//!
+//! Маркер «inspect завершён» — `accepts_ranges IS NOT NULL`: эта колонка
+//! заполняется ровно одним местом (`set_inspect_fields_impl`), а до
+//! первого зонда остаётся NULL.
 //!
 //! Собственной миграции у репозитория нет — схема + сиды справочников
 //! приходят из [`SharedDb::finish_open`] (stage 1).
@@ -90,8 +95,8 @@ pub type FilesResult<T> = std::result::Result<T, FilesError>;
 
 /// Inspect-поля одной загрузки — DTO между фабрикой и репозиторием.
 ///
-/// Живёт в адаптерном слое: доменному ядру ни форма таблицы
-/// `file_settings`, ни этот тип не нужны.
+/// Живёт в адаптерном слое: доменному ядру ни форма колонок в `files`,
+/// ни этот тип не нужны.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectFields {
     /// `None`, если сервер не прислал `Content-Length` (streaming-режим).
@@ -121,8 +126,9 @@ impl SqliteFileRepository {
         Self { db }
     }
 
-    /// Записать результат `inspect` в `file_settings` (+ `files.filename`).
-    /// Вызывает фабрика при `resolve()`. 0 строк ⇒ `NotFound`.
+    /// Записать результат `inspect` в inspect-колонки `files`
+    /// (включая `files.filename`). Вызывает фабрика при `resolve()`.
+    /// 0 строк ⇒ `NotFound`.
     ///
     /// `filename` уходит в `files.filename` — это resolved-имя после
     /// `Content-Disposition` / `spec.filename` / URL-tail, которое менеджер
@@ -220,6 +226,9 @@ fn insert_impl(conn: &mut Connection, d: &File) -> FilesResult<()> {
     let created_at = unix_secs(d.created_at);
 
     let tx = conn.transaction()?;
+    // inspect-колонки опускаем — у них нет DEFAULT, поэтому SQLite положит
+    // NULL. Маркером «inspect ещё не заполнен» служит `accepts_ranges IS
+    // NULL`; до `set_inspect_fields_impl` он именно NULL.
     let res = tx.execute(
         "INSERT INTO files
            (id, url, target_dir, filename, status_id, created_at)
@@ -242,13 +251,6 @@ fn insert_impl(conn: &mut Connection, d: &File) -> FilesResult<()> {
         }
         Err(e) => return Err(e.into()),
     }
-
-    tx.execute(
-        "INSERT INTO file_settings
-           (file_id, total_size, piece_size, etag, last_modified, effective_url)
-         VALUES (?, NULL, NULL, NULL, NULL, NULL)",
-        params![d.id.to_string()],
-    )?;
 
     insert_status_change(&tx, d.id, d.status, None, created_at)?;
 
@@ -312,10 +314,26 @@ fn remove_impl(conn: &mut Connection, id: FileId) -> FilesResult<()> {
 }
 
 fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
+    // `avg_speed_bps` и `workers_count` агрегируются on-the-fly из
+    // `piece_attempts` (только для status='done', иначе NULL). Альтернатива —
+    // денормализовать в `files`, но данные уже есть в attempt-таблице, и
+    // CASE ниже отдаёт `None` для всех не-done статусов бесплатно.
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at
+        "SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at,
+                CASE WHEN f.status_id = 'done' THEN (
+                    SELECT CAST(SUM(pa.bytes) AS REAL)
+                           / NULLIF(SUM(pa.finished_at - pa.started_at), 0)
+                    FROM piece_attempts pa
+                    JOIN pieces p ON p.id = pa.piece_id
+                    WHERE p.file_id = f.id AND pa.status_id = 'done'
+                ) END AS avg_speed_bps,
+                CASE WHEN f.status_id = 'done' THEN (
+                    SELECT COUNT(DISTINCT pa.worker_id)
+                    FROM piece_attempts pa
+                    JOIN pieces p ON p.id = pa.piece_id
+                    WHERE p.file_id = f.id AND pa.status_id = 'done'
+                ) END AS workers_count
          FROM files f
-         JOIN file_settings s ON s.file_id = f.id
          ORDER BY f.created_at",
     )?;
     let rows = stmt
@@ -327,6 +345,8 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
                 filename: row.get(3)?,
                 status: row.get(4)?,
                 created_at: row.get::<_, i64>(5)?,
+                avg_speed_bps: row.get::<_, Option<f64>>(6)?,
+                workers_count: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -369,13 +389,11 @@ fn set_inspect_fields_impl(
     accepts_ranges: bool,
     filename: String,
 ) -> FilesResult<()> {
-    let id_str = id.to_string();
-    let tx = conn.transaction()?;
-    let n = tx.execute(
-        "UPDATE file_settings
+    let n = conn.execute(
+        "UPDATE files
            SET total_size = ?, piece_size = ?, etag = ?, last_modified = ?,
-               effective_url = ?, accepts_ranges = ?
-         WHERE file_id = ?",
+               effective_url = ?, accepts_ranges = ?, filename = ?
+         WHERE id = ?",
         params![
             total_size.map(|v| v as i64),
             piece_size.map(|v| v as i64),
@@ -383,17 +401,13 @@ fn set_inspect_fields_impl(
             last_modified,
             effective_url,
             accepts_ranges as i64,
-            id_str,
+            filename,
+            id.to_string(),
         ],
     )?;
     if n == 0 {
         return Err(FilesError::NotFound);
     }
-    tx.execute(
-        "UPDATE files SET filename = ? WHERE id = ?",
-        params![filename, id_str],
-    )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -402,8 +416,8 @@ fn get_inspect_fields_impl(
     id: FileId,
 ) -> FilesResult<Option<InspectFields>> {
     // Разделяем «файла нет» и «inspect ещё не заполнен»:
-    // отсутствие строки в `file_settings` — NotFound; NULL в total_size —
-    // Ok(None).
+    // отсутствие строки в `files` — NotFound; NULL в `accepts_ranges` —
+    // Ok(None) (см. коммент про маркер ниже).
     type InspectRow = (
         Option<i64>,
         Option<i64>,
@@ -415,7 +429,7 @@ fn get_inspect_fields_impl(
     let row: Option<InspectRow> = conn
         .query_row(
             "SELECT total_size, piece_size, etag, last_modified, effective_url, accepts_ranges
-             FROM file_settings WHERE file_id = ?",
+             FROM files WHERE id = ?",
             params![id.to_string()],
             |r| {
                 Ok((
@@ -458,6 +472,10 @@ struct RawRow {
     filename: Option<String>,
     status: String,
     created_at: i64,
+    /// Заполнено только для `done`-файлов (CASE в SELECT).
+    avg_speed_bps: Option<f64>,
+    /// Заполнено только для `done`-файлов (CASE в SELECT).
+    workers_count: Option<u32>,
 }
 
 fn row_to_download(
@@ -490,6 +508,8 @@ fn row_to_download(
         error,
         created_at: from_unix_secs(r.created_at),
         updated_at: from_unix_secs(updated_at),
+        avg_speed_bps: r.avg_speed_bps,
+        workers_count: r.workers_count,
     })
 }
 
@@ -748,21 +768,20 @@ mod tests {
         repo.remove(id).await.unwrap();
 
         let id_str = id.to_string();
-        let (files, settings, changes, pieces): (i64, i64, i64, i64) = db
+        let (files, changes, pieces): (i64, i64, i64) = db
             .with_conn(move |c| {
                 let q = |sql: &str| -> rusqlite::Result<i64> {
                     c.query_row(sql, params![id_str], |r| r.get::<_, i64>(0))
                 };
                 Ok((
                     q("SELECT COUNT(*) FROM files WHERE id = ?")?,
-                    q("SELECT COUNT(*) FROM file_settings WHERE file_id = ?")?,
                     q("SELECT COUNT(*) FROM status_changes WHERE file_id = ?")?,
                     q("SELECT COUNT(*) FROM pieces WHERE file_id = ?")?,
                 ))
             })
             .await
             .unwrap();
-        assert_eq!((files, settings, changes, pieces), (0, 0, 0, 0));
+        assert_eq!((files, changes, pieces), (0, 0, 0));
     }
 
     #[tokio::test]
@@ -849,5 +868,142 @@ mod tests {
         let got = &loaded[0];
         assert_eq!(got.id, id);
         assert_eq!(got.spec.filename.as_deref(), Some("file.bin"));
+    }
+
+    /// Хелпер: вставить одну запись в `workers`, вернуть её id.
+    fn insert_worker(c: &Connection, file_id: &str, slot: i64) -> String {
+        let id = Uuid::new_v4().to_string();
+        c.execute(
+            "INSERT INTO workers (id, file_id, slot_index, status_id, started_at)
+             VALUES (?, ?, ?, 'done', 0)",
+            params![id, file_id, slot],
+        )
+        .unwrap();
+        id
+    }
+
+    /// Хелпер: вставить запись в `pieces`, вернуть её id.
+    fn insert_piece(c: &Connection, file_id: &str, number: i64) -> String {
+        let id = Uuid::new_v4().to_string();
+        c.execute(
+            "INSERT INTO pieces (id, file_id, number, status_id, created_at)
+             VALUES (?, ?, ?, 'done', 0)",
+            params![id, file_id, number],
+        )
+        .unwrap();
+        id
+    }
+
+    /// Хелпер: вставить успешный piece_attempt с заданным временем и байтами.
+    fn insert_attempt(
+        c: &Connection,
+        piece_id: &str,
+        worker_id: &str,
+        started: i64,
+        finished: i64,
+        bytes: i64,
+    ) {
+        c.execute(
+            "INSERT INTO piece_attempts
+                 (id, piece_id, worker_id, status_id, started_at, finished_at, bytes)
+             VALUES (?, ?, ?, 'done', ?, ?, ?)",
+            params![
+                Uuid::new_v4().to_string(),
+                piece_id,
+                worker_id,
+                started,
+                finished,
+                bytes
+            ],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn done_file_aggregates_avg_speed_and_workers() {
+        // Сценарий: 2 воркера качают 3 piece, всего 3500 B за 25 секунд
+        // активного времени → weighted avg = 140 B/s. Distinct воркеров = 2.
+        let (db, repo) = fresh_repo();
+        let d = sample_download();
+        let id = d.id;
+        repo.insert(&d).await.unwrap();
+        repo.update_status(id, FileStatus::Done, None)
+            .await
+            .unwrap();
+
+        let id_str = id.to_string();
+        db.with_conn(move |c| {
+            let w_a = insert_worker(c, &id_str, 0);
+            let w_b = insert_worker(c, &id_str, 1);
+            let p0 = insert_piece(c, &id_str, 0);
+            let p1 = insert_piece(c, &id_str, 1);
+            let p2 = insert_piece(c, &id_str, 2);
+            insert_attempt(c, &p0, &w_a, 0, 10, 1000);
+            insert_attempt(c, &p1, &w_a, 10, 20, 2000);
+            insert_attempt(c, &p2, &w_b, 0, 5, 500);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let loaded = repo.load_all().await.unwrap();
+        let got = loaded.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(got.status, FileStatus::Done);
+        // 3500 / 25 = 140.0
+        let speed = got
+            .avg_speed_bps
+            .expect("avg_speed_bps must be Some for done");
+        assert!((speed - 140.0).abs() < 1e-9, "got {speed}");
+        assert_eq!(got.workers_count, Some(2));
+    }
+
+    #[tokio::test]
+    async fn running_file_has_no_aggregates() {
+        // Для не-done статуса оба поля должны быть None даже при наличии
+        // данных в piece_attempts (CASE WHEN status_id = 'done' отсекает).
+        let (db, repo) = fresh_repo();
+        let d = sample_download();
+        let id = d.id;
+        repo.insert(&d).await.unwrap();
+        repo.update_status(id, FileStatus::Running, None)
+            .await
+            .unwrap();
+
+        let id_str = id.to_string();
+        db.with_conn(move |c| {
+            let w = insert_worker(c, &id_str, 0);
+            let p = insert_piece(c, &id_str, 0);
+            insert_attempt(c, &p, &w, 0, 10, 1000);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let loaded = repo.load_all().await.unwrap();
+        let got = loaded.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(got.status, FileStatus::Running);
+        assert!(got.avg_speed_bps.is_none());
+        assert!(got.workers_count.is_none());
+    }
+
+    #[tokio::test]
+    async fn done_file_without_attempts_has_none() {
+        // Done без piece_attempts — SUM/COUNT отдают NULL/0; делитель 0
+        // съедает NULLIF, получаем NULL → None.
+        let (_db, repo) = fresh_repo();
+        let d = sample_download();
+        let id = d.id;
+        repo.insert(&d).await.unwrap();
+        repo.update_status(id, FileStatus::Done, None)
+            .await
+            .unwrap();
+
+        let loaded = repo.load_all().await.unwrap();
+        let got = loaded.iter().find(|r| r.id == id).unwrap();
+        // avg_speed_bps NULL (NULLIF делителя)
+        assert!(got.avg_speed_bps.is_none());
+        // workers_count = COUNT(DISTINCT) → 0; для done без воркеров это
+        // валидное значение, не None.
+        assert_eq!(got.workers_count, Some(0));
     }
 }
