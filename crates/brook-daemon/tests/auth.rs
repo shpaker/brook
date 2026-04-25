@@ -77,7 +77,7 @@ async fn bearer_interceptor_enforces_token() {
 
     let paths = Paths::in_dir(workdir.path());
     let args = ServerArgs {
-        directory: sandbox.path().to_path_buf(),
+        directory: Some(sandbox.path().to_path_buf()),
         host: None,
         port: None,
         client_pass: Some("s3cr3t".into()),
@@ -137,7 +137,7 @@ async fn non_loopback_without_password_refuses_to_start() {
 
     let paths = Paths::in_dir(workdir.path());
     let args = ServerArgs {
-        directory: sandbox.path().to_path_buf(),
+        directory: Some(sandbox.path().to_path_buf()),
         host: Some(std::net::IpAddr::from([0, 0, 0, 0])),
         port: None,
         client_pass: None,

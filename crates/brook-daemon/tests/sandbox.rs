@@ -93,7 +93,7 @@ async fn add_rejects_target_dir_outside_sandbox() {
     let url = format!("{}/f.bin", mock.uri());
     let paths = Paths::in_dir(workdir.path());
     let args = ServerArgs {
-        directory: sandbox.path().to_path_buf(),
+        directory: Some(sandbox.path().to_path_buf()),
         host: None,
         port: None,
         client_pass: None,

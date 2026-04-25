@@ -46,8 +46,10 @@ pub const DEFAULT_CONFIG_FILENAME: &str = "brook.yaml";
 const DEFAULT_YAML: &str = "\
 # Конфигурация brook server. Перезапустите демон после правок.
 download:
-  # Дефолтный каталог назначения (перекрывается FileSpec.target_dir).
-  default_dir: ~/Downloads
+  # Дефолтный каталог назначения, который демон сообщает TUI как prefill в
+  # модалке Add. Если опустить — берётся `--directory` (если задан) или
+  # системная папка загрузок пользователя. Перекрывается FileSpec.target_dir.
+  # default_dir: ~/Downloads
   # Целевое число piece'ов на файл (перекрывается в FileSpec).
   piece_target_count: 128
   # Нижняя граница размера piece'а, MiB (степень двойки).
@@ -86,8 +88,10 @@ pub struct Settings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DownloadSection {
-    #[serde(default = "d_default_dir")]
-    pub default_dir: String,
+    /// Явное значение из YAML; если опущено — резолвится в `build_runtime`
+    /// по приоритету `--directory` → системная папка загрузок → `$HOME`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_dir: Option<String>,
     #[serde(default = "d_piece_target_count")]
     pub piece_target_count: u32,
     #[serde(default = "d_piece_size_min_mib")]
@@ -101,7 +105,7 @@ pub struct DownloadSection {
 impl Default for DownloadSection {
     fn default() -> Self {
         Self {
-            default_dir: d_default_dir(),
+            default_dir: None,
             piece_target_count: d_piece_target_count(),
             piece_size_min_mib: d_piece_size_min_mib(),
             piece_size_max_mib: d_piece_size_max_mib(),
@@ -162,9 +166,6 @@ pub enum OnDuplicateUrl {
 
 // `serde(default = "...")` требует функций без аргументов, поэтому
 // константы живут внутри функций-геттеров, а не `const`.
-fn d_default_dir() -> String {
-    "~/Downloads".into()
-}
 fn d_piece_target_count() -> u32 {
     128
 }
@@ -295,11 +296,15 @@ fn is_power_of_two_u32(n: u32) -> bool {
 // ─── Проекции в рантайм-конфиг ──────────────────────────────────────────
 
 /// Global-only конфигурация — всё, что не переопределяется в `FileSpec`.
+///
+/// `default_dir` — явное значение из YAML; если пользователь не задал
+/// `download.default_dir`, поле остаётся `None`, и `build_runtime`
+/// выводит эффективный дефолт из `--directory` или `UserDirs`.
 #[derive(Debug, Clone)]
 pub struct DaemonRuntime {
     pub api_bind: IpAddr,
     pub api_port: u16,
-    pub default_dir: PathBuf,
+    pub default_dir: Option<PathBuf>,
     pub on_duplicate_url: OnDuplicateUrl,
     pub log: LogRuntime,
     pub defaults: DownloadDefaults,
@@ -328,10 +333,14 @@ impl DaemonRuntime {
             key: "api.bind",
             reason: format!("not an IP address: {e}"),
         })?;
+        let default_dir = match d.default_dir.as_deref() {
+            Some(raw) => Some(expand_home(raw, "download.default_dir")?),
+            None => None,
+        };
         Ok(Self {
             api_bind,
             api_port: s.api.port,
-            default_dir: expand_home(&d.default_dir, "download.default_dir")?,
+            default_dir,
             on_duplicate_url: d.on_duplicate_url,
             log: LogRuntime {
                 dir: expand_home(&s.log.dir, "log.dir")?,
@@ -479,18 +488,24 @@ mod tests {
     }
 
     #[test]
-    fn runtime_projection_expands_home_and_converts_units() {
+    fn runtime_projection_converts_units_with_no_default_dir() {
         let s = Settings::default();
         let rt = DaemonRuntime::from_settings(&s).unwrap();
         assert_eq!(rt.api_port, 7090);
         assert_eq!(rt.api_bind, IpAddr::from_str("127.0.0.1").unwrap());
-        assert!(
-            !rt.default_dir.to_string_lossy().starts_with('~'),
-            "got {:?}",
-            rt.default_dir
-        );
+        assert!(rt.default_dir.is_none());
         assert_eq!(rt.defaults.piece_size_min, 16 * 1024 * 1024);
         assert_eq!(rt.defaults.piece_size_max, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn runtime_projection_expands_home_in_explicit_default_dir() {
+        let mut s = Settings::default();
+        s.download.default_dir = Some("~/somewhere".into());
+        let rt = DaemonRuntime::from_settings(&s).unwrap();
+        let dir = rt.default_dir.expect("default_dir resolved");
+        assert!(!dir.to_string_lossy().starts_with('~'), "got {dir:?}");
+        assert!(dir.ends_with("somewhere"));
     }
 
     #[test]

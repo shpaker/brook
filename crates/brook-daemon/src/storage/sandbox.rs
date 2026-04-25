@@ -1,24 +1,19 @@
-//! Sandbox: принудительный клэмп `FileSpec.target_dir` под корень,
-//! заданный `--directory`.
+//! Политики пути для входящих `FileSpec.target_dir`.
 //!
-//! Правила:
-//! 1. Относительный путь трактуем относительно `root` (а не CWD демона —
-//!    иначе `target_dir = "."` ссылалось бы не туда, где пользователь
-//!    ожидает).
-//! 2. Канонизируем и корень, и целевой путь. Канонизация разрешает `..`
-//!    и симлинки на каждой позиции цепочки — после неё `starts_with`
-//!    превращается в надёжный prefix-check.
-//! 3. Если целевой путь ещё не существует (типично: подпапка, которую
-//!    клиент хочет, чтобы демон создал), канонизируем самый длинный
-//!    *существующий* префикс и доклеиваем хвост. Этим мы ловим симлинк
-//!    или `..` в существующей части — а несуществующий хвост сам по
-//!    себе ничего плохого сделать не может.
-//! 4. Канонизированный путь обязан `starts_with(root)`. Иначе —
-//!    [`Error::PathEscapesRoot`].
+//! Две реализации [`TPathPolicy`]:
 //!
-//! Корень канонизируется один раз в `build_runtime` и хранится в
-//! [`ClampedPathPolicy`] — `fs::canonicalize` на каждый `prepare()` был
-//! бы лишним syscall.
+//! - [`ClampedPathPolicy`] — sandbox-режим (`brook server --directory <DIR>`).
+//!   Канонизирует и `root`, и целевой путь, ловит `..` / симлинк-escape,
+//!   запрещает выход за пределы корня.
+//! - [`OpenPathPolicy`] — без sandbox. Доступна только при биндинге на
+//!   loopback (см. `build_runtime`). Канонизирует абсолютные пути для
+//!   разрешения симлинков и `..`, относительные — отвергает (CWD демона
+//!   неинтуитивен для пользователя).
+//!
+//! Алгоритм канонизации общий: канонизируем самый длинный существующий
+//! префикс пути и лексически доклеиваем несуществующий хвост. Этим мы
+//! ловим симлинк или `..` в существующей части; несуществующий хвост сам
+//! по себе ничего плохого сделать не может.
 
 use std::path::{
     Path,
@@ -77,6 +72,40 @@ impl TPathPolicy for ClampedPathPolicy {
             });
         }
         Ok(canon)
+    }
+}
+
+/// Политика без sandbox: канонизирует абсолютный путь и возвращает его как
+/// есть. Используется только при биндинге на loopback — в `build_runtime`
+/// её выбор гейтится `host.is_loopback()`.
+///
+/// Относительные пути отвергает: без `root` их пришлось бы резолвить
+/// относительно CWD демона, что для клиента непредсказуемо (демон может
+/// быть auto-spawn'нут TUI из произвольной директории).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OpenPathPolicy;
+
+impl OpenPathPolicy {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl TPathPolicy for OpenPathPolicy {
+    fn check_target_dir(&self, target_dir: &Path) -> Result<PathBuf> {
+        if !target_dir.is_absolute() {
+            return Err(Error::Other(format!(
+                "relative target_dir {} is not allowed without --directory; \
+                 pass an absolute path",
+                target_dir.display()
+            )));
+        }
+        canonicalize_existing_prefix(target_dir).map_err(|e| {
+            Error::Other(format!(
+                "canonicalize {path}: {e}",
+                path = target_dir.display()
+            ))
+        })
     }
 }
 
@@ -219,5 +248,44 @@ mod tests {
         let pol = ClampedPathPolicy::new(root.path()).unwrap();
         let err = pol.check_target_dir(&link).unwrap_err();
         assert!(matches!(err, Error::PathEscapesRoot { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn open_policy_accepts_existing_absolute_path() {
+        let dir = tempdir().unwrap();
+        let pol = OpenPathPolicy::new();
+        let got = pol.check_target_dir(dir.path()).unwrap();
+        assert_eq!(got, fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn open_policy_accepts_nonexistent_subdir() {
+        let dir = tempdir().unwrap();
+        let pol = OpenPathPolicy::new();
+        let future = dir.path().join("not/yet/created");
+        let got = pol.check_target_dir(&future).unwrap();
+        assert!(got.starts_with(fs::canonicalize(dir.path()).unwrap()));
+        assert!(got.ends_with("not/yet/created"));
+    }
+
+    #[test]
+    fn open_policy_rejects_relative_path() {
+        let pol = OpenPathPolicy::new();
+        let err = pol.check_target_dir(Path::new("relative/sub")).unwrap_err();
+        match err {
+            Error::Other(msg) => assert!(msg.contains("relative"), "{msg}"),
+            other => panic!("expected Error::Other for relative path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_policy_resolves_symlinks() {
+        let target = tempdir().unwrap();
+        let host = tempdir().unwrap();
+        let link = host.path().join("link");
+        symlink(target.path(), &link).unwrap();
+        let pol = OpenPathPolicy::new();
+        let got = pol.check_target_dir(&link).unwrap();
+        assert_eq!(got, fs::canonicalize(target.path()).unwrap());
     }
 }
