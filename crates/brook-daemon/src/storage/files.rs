@@ -222,8 +222,8 @@ fn insert_impl(conn: &mut Connection, d: &File) -> FilesResult<()> {
     let tx = conn.transaction()?;
     let res = tx.execute(
         "INSERT INTO files
-           (id, url, target_dir, filename, status_id, created_at, linear)
-         VALUES (?,?,?,?,?,?,?)",
+           (id, url, target_dir, filename, status_id, created_at)
+         VALUES (?,?,?,?,?,?)",
         params![
             d.id.to_string(),
             d.spec.url,
@@ -231,7 +231,6 @@ fn insert_impl(conn: &mut Connection, d: &File) -> FilesResult<()> {
             d.spec.filename,
             d.status.as_str(),
             created_at,
-            d.spec.linear as i64,
         ],
     );
     match res {
@@ -314,7 +313,7 @@ fn remove_impl(conn: &mut Connection, id: FileId) -> FilesResult<()> {
 
 fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at, f.linear
+        "SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at
          FROM files f
          JOIN file_settings s ON s.file_id = f.id
          ORDER BY f.created_at",
@@ -328,7 +327,6 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
                 filename: row.get(3)?,
                 status: row.get(4)?,
                 created_at: row.get::<_, i64>(5)?,
-                linear: row.get::<_, i64>(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -460,7 +458,6 @@ struct RawRow {
     filename: Option<String>,
     status: String,
     created_at: i64,
-    linear: i64,
 }
 
 fn row_to_download(
@@ -479,7 +476,6 @@ fn row_to_download(
         url: r.url,
         target_dir: PathBuf::from(r.target_dir),
         filename: r.filename,
-        linear: r.linear != 0,
     };
     let error = if matches!(status, FileStatus::Failed) {
         last_reason_message
@@ -540,7 +536,6 @@ mod tests {
             url: "https://example.com/file.bin".into(),
             target_dir: PathBuf::from("/tmp/brook"),
             filename: Some("file.bin".into()),
-            linear: false,
         };
         File::new(FileId::new(), spec)
     }
@@ -854,46 +849,5 @@ mod tests {
         let got = &loaded[0];
         assert_eq!(got.id, id);
         assert_eq!(got.spec.filename.as_deref(), Some("file.bin"));
-    }
-
-    #[tokio::test]
-    async fn linear_is_persisted_and_restored() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("brook.db");
-
-        // Записываем один linear=true, один linear=false.
-        let d_linear = File::new(
-            FileId::new(),
-            FileSpec {
-                url: "https://example.com/a".into(),
-                target_dir: PathBuf::from("/tmp"),
-                filename: Some("a".into()),
-                linear: true,
-            },
-        );
-        let d_vdc = File::new(
-            FileId::new(),
-            FileSpec {
-                url: "https://example.com/b".into(),
-                target_dir: PathBuf::from("/tmp"),
-                filename: Some("b".into()),
-                linear: false,
-            },
-        );
-        let (id_linear, id_vdc) = (d_linear.id, d_vdc.id);
-        {
-            let db = SharedDb::open(&path).unwrap();
-            let repo = SqliteFileRepository::new(db);
-            repo.insert(&d_linear).await.unwrap();
-            repo.insert(&d_vdc).await.unwrap();
-        }
-
-        // После reopena флаг должен восстановиться.
-        let db = SharedDb::open(&path).unwrap();
-        let repo = SqliteFileRepository::new(db);
-        let loaded = repo.load_all().await.unwrap();
-        let find = |id: FileId| loaded.iter().find(|d| d.id == id).unwrap().spec.linear;
-        assert!(find(id_linear), "linear=true должен восстановиться");
-        assert!(!find(id_vdc), "linear=false должен восстановиться");
     }
 }

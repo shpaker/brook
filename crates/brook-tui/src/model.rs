@@ -38,10 +38,6 @@ pub struct ProgressSnapshot {
     pub bytes_total: u64,
     pub speed_bps: f64,
     pub eta_secs: Option<u64>,
-    /// Состояние кусков для chunked bar. `None` при линейной загрузке или
-    /// стриминге (нет `Content-Length`). `segments` — ≤ 100 флоатов 0..=1;
-    /// `worker_positions` — индексы активных сегментов.
-    pub bar: Option<proto::BarState>,
 }
 
 impl ProgressSnapshot {
@@ -52,7 +48,6 @@ impl ProgressSnapshot {
             bytes_total: t.bytes_total,
             speed_bps: t.speed_bps,
             eta_secs: t.eta_secs,
-            bar: t.bar.clone(),
         }
     }
 }
@@ -163,8 +158,6 @@ pub enum Mode {
 pub struct AddModal {
     pub url: String,
     pub folder: String,
-    /// `true` — последовательная загрузка; chunked bar скрыт. По умолчанию `false`.
-    pub linear: bool,
     pub field: AddField,
     pub error: Option<String>,
 }
@@ -180,7 +173,6 @@ impl AddModal {
         Self {
             url,
             folder,
-            linear: false,
             field: AddField::Url,
             error: None,
         }

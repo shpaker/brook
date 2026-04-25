@@ -8,10 +8,7 @@
 
 use super::file::File;
 use super::id::FileId;
-use super::progress::{
-    BarState,
-    Progress,
-};
+use super::progress::Progress;
 use super::status::FileStatus;
 
 /// События жизненного цикла файла. Вызывающий делает `match` и компилятор
@@ -40,13 +37,7 @@ pub enum FileLifecycleEvent {
 /// чтобы lifecycle-стрим не смешивался с высокочастотным прогрессом.
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
-    Tick {
-        id: FileId,
-        progress: Progress,
-        /// Чанкованное состояние прогрессбара.
-        /// `None` при `linear=true` или неизвестном размере файла.
-        bar: Option<BarState>,
-    },
+    Tick { id: FileId, progress: Progress },
 }
 
 #[cfg(test)]

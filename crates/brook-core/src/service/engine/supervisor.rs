@@ -4,7 +4,6 @@
 
 use std::collections::{
     HashMap,
-    HashSet,
     VecDeque,
 };
 use std::sync::Arc;
@@ -17,7 +16,6 @@ use std::time::{
     Instant,
 };
 
-use rand::RngExt;
 use tokio::sync::{
     Mutex,
     broadcast,
@@ -38,8 +36,6 @@ use super::{
 };
 use crate::domain::{
     AttemptId,
-    BAR_SEGMENTS,
-    BarState,
     FileCommand,
     FileId,
     FileLifecycleEvent,
@@ -95,103 +91,6 @@ pub(super) enum Outcome {
     Completed,
     Failed(String),
     Cancelled,
-}
-
-/// Упорядочить список незагруженных кусков стратифицированным рандомом + VdC.
-///
-/// Первые `num_workers` элементов результата — «стартовые» куски: по одному
-/// случайному из каждой равной зоны файла. Остальные куски идут в порядке
-/// «наибольший пробел первым» (бинарное деление — эквивалент последовательности
-/// Ван дер Корпута по индексу). В итоге в любой момент скачанные куски
-/// максимально равномерно распределены по файлу, что даёт красивый chunked bar.
-///
-/// **Degenerate cases:**
-/// - `pending.len() < 2` или `num_workers <= 1` → возвращаем как есть.
-/// - `!accepts_ranges` (один воркер без range-поддержки) → сюда не попадаем.
-/// - `linear == true` → вызывающий не вызывает эту функцию.
-fn vdc_queue(pending: Vec<u32>, num_workers: usize) -> VecDeque<u32> {
-    if pending.len() < 2 || num_workers <= 1 {
-        return pending.into();
-    }
-
-    let n = pending.len();
-    let w = num_workers.min(n);
-
-    // ── Шаг 1: стратифицированный рандом ──────────────────────────────────
-    // Делим pending на w равных зон; из каждой берём случайный кусок.
-    let mut rng = rand::rng();
-    let mut seed_indices: Vec<usize> = (0..w)
-        .map(|i| {
-            let zone_start = i * n / w;
-            let zone_end = ((i + 1) * n / w).min(n);
-            // zone_end > zone_start гарантирован: n >= w, зоны ненулевые.
-            rng.random_range(zone_start..zone_end)
-        })
-        .collect();
-    // Дедупликация на случай коллизий при малом n.
-    seed_indices.sort_unstable();
-    seed_indices.dedup();
-
-    let mut result: VecDeque<u32> = seed_indices.iter().map(|&i| pending[i]).collect();
-    let seed_set: HashSet<usize> = seed_indices.into_iter().collect();
-
-    // ── Шаг 2: VdC — «наибольший пробел первым» ───────────────────────────
-    // Heap: (gap_size, boundary_left_exclusive, boundary_right_exclusive).
-    // Виртуальные границы: -1 слева, n справа.
-    use std::collections::BinaryHeap;
-
-    let seeds_sorted: Vec<usize> = {
-        let mut s: Vec<usize> = seed_set.iter().copied().collect();
-        s.sort_unstable();
-        s
-    };
-
-    // Строим начальные пробелы между seeds (и по краям).
-    let mut heap: BinaryHeap<(usize, i64, i64)> = BinaryHeap::new();
-    {
-        let mut boundaries: Vec<i64> = std::iter::once(-1i64)
-            .chain(seeds_sorted.iter().map(|&i| i as i64))
-            .chain(std::iter::once(n as i64))
-            .collect();
-        boundaries.dedup();
-        for w in boundaries.windows(2) {
-            let (left, right) = (w[0], w[1]);
-            let gap = (right - left - 1) as usize;
-            if gap > 0 {
-                heap.push((gap, left, right));
-            }
-        }
-    }
-
-    // Множество незанятых индексов (не-seeds).
-    let mut remaining: Vec<bool> = (0..n).map(|i| !seed_set.contains(&i)).collect();
-
-    while let Some((_, left, right)) = heap.pop() {
-        // Ищем ближайший к центру незанятый индекс в (left, right).
-        let mid = (left + right) / 2;
-        // Сканируем от mid наружу, пока не найдём свободный.
-        let chosen = (0..(right - left) as usize).find_map(|delta| {
-            let candidates = [mid - delta as i64, mid + delta as i64 + 1];
-            candidates
-                .into_iter()
-                .find(|&c| c > left && c < right && remaining[c as usize])
-        });
-        if let Some(c) = chosen {
-            result.push_back(pending[c as usize]);
-            remaining[c as usize] = false;
-            // Добавляем два новых пробела.
-            let left_gap = (c - left - 1) as usize;
-            let right_gap = (right - c - 1) as usize;
-            if left_gap > 0 {
-                heap.push((left_gap, left, c));
-            }
-            if right_gap > 0 {
-                heap.push((right_gap, c, right));
-            }
-        }
-    }
-
-    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -268,28 +167,7 @@ pub(super) async fn run_engine<S, F, WR, AR>(
         1
     };
 
-    // Инициализируем маску done-кусков: бит=1 для кусков, которых нет в
-    // pending (= уже скачаны при resume). Маска позволяет быстро строить
-    // BarState без обращения к storage.
-    let mask_len = (total_pieces as usize).div_ceil(8);
-    let mut done_piece_mask: Vec<u8> = {
-        let mut mask = vec![0u8; mask_len];
-        let pending_set: HashSet<u32> = pending.iter().copied().collect();
-        for idx in 0..total_pieces {
-            if !pending_set.contains(&idx) {
-                mask[idx as usize / 8] |= 1u8 << (idx % 8);
-            }
-        }
-        mask
-    };
-    // Куски, которые воркеры качают прямо сейчас.
-    let mut active_pieces: HashSet<u32> = HashSet::new();
-    let queue = if inputs.spec.linear {
-        pending.into()
-    } else {
-        vdc_queue(pending, worker_count)
-    };
-    let pending_arc: Arc<Mutex<VecDeque<u32>>> = Arc::new(Mutex::new(queue));
+    let pending_arc: Arc<Mutex<VecDeque<u32>>> = Arc::new(Mutex::new(pending.into()));
     let (state_tx, state_rx) = watch::channel(RunState::Running);
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerMsg>();
     // Бейзлайн для прогресса: сколько уже на диске = total - pending.
@@ -404,8 +282,6 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                             let _ = state_tx.send(RunState::Stopping);
                             break;
                         }
-                        done_piece_mask[idx as usize / 8] |= 1u8 << (idx % 8);
-                        active_pieces.remove(&idx);
                         pieces_committed += 1;
                         emit_progress(
                             &progress_tx,
@@ -415,8 +291,6 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                             pieces_committed as u32,
                             total_pieces,
                             &mut speed_meter,
-                            &done_piece_mask,
-                            &active_pieces,
                         );
                     }
                     WorkerMsg::Failed(err) => {
@@ -426,7 +300,6 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                         break;
                     }
                     WorkerMsg::AttemptStarted { worker_id, piece } => {
-                        active_pieces.insert(piece);
                         match attempts_repo.start(id, piece, worker_id).await {
                             Ok(rec) => {
                                 open_attempts.insert((worker_id, piece), rec.id);
@@ -445,7 +318,6 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                         }
                     }
                     WorkerMsg::AttemptFailed { worker_id, piece, error } => {
-                        active_pieces.remove(&piece);
                         if let Some(attempt_id) = open_attempts.remove(&(worker_id, piece))
                             && let Err(e) = attempts_repo.fail(attempt_id, &error).await {
                                 warn!(%id, %attempt_id, error = %e,
@@ -463,8 +335,6 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                     pieces_committed as u32,
                     total_pieces,
                     &mut speed_meter,
-                    &done_piece_mask,
-                    &active_pieces,
                 );
             }
             else => {
@@ -491,13 +361,10 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                 if let Err(e) = storage.commit_done(idx).await {
                     warn!(%id, piece = idx, error = %e, "commit on drain failed");
                 } else {
-                    done_piece_mask[idx as usize / 8] |= 1u8 << (idx % 8);
-                    active_pieces.remove(&idx);
                     pieces_committed += 1;
                 }
             }
             WorkerMsg::AttemptStarted { worker_id, piece } => {
-                active_pieces.insert(piece);
                 match attempts_repo.start(id, piece, worker_id).await {
                     Ok(rec) => {
                         open_attempts.insert((worker_id, piece), rec.id);
@@ -521,7 +388,6 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                 piece,
                 error,
             } => {
-                active_pieces.remove(&piece);
                 if let Some(aid) = open_attempts.remove(&(worker_id, piece))
                     && let Err(e) = attempts_repo.fail(aid, &error).await
                 {
@@ -594,8 +460,6 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                         total_pieces,
                         total_pieces,
                         &mut speed_meter,
-                        &done_piece_mask,
-                        &active_pieces,
                     );
                     emit_status(&events_tx, id, FileStatus::Done);
                     let _ = events_tx.send(FileLifecycleEvent::Completed { id });
@@ -631,7 +495,6 @@ pub(super) fn emit_status(
     let _ = tx.send(FileLifecycleEvent::StatusChanged { id, status });
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_progress(
     tx: &broadcast::Sender<ProgressEvent>,
     id: FileId,
@@ -640,8 +503,6 @@ pub(super) fn emit_progress(
     pieces_done: u32,
     pieces_total: u32,
     meter: &mut SpeedMeter,
-    done_piece_mask: &[u8],
-    active_pieces: &HashSet<u32>,
 ) {
     let done = bytes_done.load(Ordering::Relaxed);
     meter.observe(Instant::now(), done);
@@ -658,62 +519,7 @@ pub(super) fn emit_progress(
             None
         },
     };
-    // Chunked bar имеет смысл только при параллельной загрузке:
-    // linear=true → пользователь выбрал sequential, chunked избыточен;
-    // accepts_ranges=false → один воркер, куски идут строго по порядку,
-    //   TUI покажет обычный filled_bar как фолбек.
-    let bar = if !inputs.spec.linear && inputs.accepts_ranges && pieces_total > 0 {
-        Some(compute_bar_state(
-            done_piece_mask,
-            active_pieces,
-            pieces_total,
-        ))
-    } else {
-        None
-    };
-    let _ = tx.send(ProgressEvent::Tick { id, progress, bar });
-}
-
-/// Агрегирует состояние кусков в `BarState` для передачи клиенту.
-///
-/// Маппинг: `total_pieces` кусков → `N = min(total_pieces, BAR_SEGMENTS)`
-/// сегментов. Каждый сегмент содержит float 0.0..=1.0 (доля done-кусков
-/// в диапазоне) и отметку, если хотя бы один кусок в диапазоне активен.
-fn compute_bar_state(done_mask: &[u8], active: &HashSet<u32>, total_pieces: u32) -> BarState {
-    let n = BAR_SEGMENTS.min(total_pieces as usize);
-    let mut segments = Vec::with_capacity(n);
-    let mut worker_positions = Vec::new();
-
-    for seg in 0..n {
-        let from = (seg * total_pieces as usize / n) as u32;
-        // Гарантируем хотя бы один кусок на сегмент.
-        let to = (((seg + 1) * total_pieces as usize / n).min(total_pieces as usize) as u32)
-            .max(from + 1);
-
-        let range_size = (to - from) as f32;
-        let mut done_count = 0u32;
-        let mut is_active = false;
-
-        for piece in from..to {
-            let byte_idx = piece as usize / 8;
-            if byte_idx < done_mask.len() && done_mask[byte_idx] & (1u8 << (piece % 8)) != 0 {
-                done_count += 1;
-            }
-            if active.contains(&piece) {
-                is_active = true;
-            }
-        }
-
-        segments.push(done_count as f32 / range_size);
-        if is_active {
-            worker_positions.push(seg as u32);
-        }
-    }
-
-    BarState {
-        segments,
-        worker_positions,
-    }
+    let _ = tx.send(ProgressEvent::Tick { id, progress });
 }
 
 /// Сглаженная скорость по экспоненциальному среднему (EMA).

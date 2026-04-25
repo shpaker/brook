@@ -19,10 +19,6 @@ pub struct FileSpec {
     pub target_dir: PathBuf,
     /// Явно заданное имя файла (None → определить на этапе probe).
     pub filename: Option<String>,
-    /// Загружать piece'ы последовательно (слева направо), без VdC-порядка.
-    /// `false` (по умолчанию) — стратифицированный рандом + VdC; chunked bar.
-    /// `true`  — классический порядок; обычный filled bar.
-    pub linear: bool,
 }
 
 impl FileSpec {
@@ -37,7 +33,6 @@ impl FileSpec {
             url: url.into(),
             target_dir: target_dir.into(),
             filename: None,
-            linear: false,
         }
     }
 }

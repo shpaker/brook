@@ -77,6 +77,4 @@ pub enum CmdOutcome {
 pub struct AddForm {
     pub url: String,
     pub folder: String,
-    /// `true` — последовательная (chunked-bar не рисуется). По умолчанию `false`.
-    pub linear: bool,
 }

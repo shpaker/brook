@@ -295,9 +295,5 @@ fn emit_progress_streaming(
         // ETA непредставима без total_size — TUI покажет «unknown».
         eta_secs: None,
     };
-    let _ = tx.send(ProgressEvent::Tick {
-        id,
-        progress,
-        bar: None,
-    });
+    let _ = tx.send(ProgressEvent::Tick { id, progress });
 }

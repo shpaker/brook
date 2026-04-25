@@ -415,7 +415,6 @@ mod tests {
             url: "https://example.com/x".into(),
             target_dir: target_dir.to_path_buf(),
             filename: Some(filename.into()),
-            linear: false,
         }
     }
 
