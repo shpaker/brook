@@ -43,6 +43,7 @@ use brook_api::{
 use brook_core::{
     DownloadManager,
     ManagerConfig,
+    TPathPolicy,
     TPieceAttemptRepo,
     TWorkerRepo,
 };
@@ -75,7 +76,10 @@ use crate::storage::factory::LocalPieceStorageFactory;
 use crate::storage::files::SqliteFileRepository;
 use crate::storage::piece_attempts::SqlitePieceAttemptRepository;
 use crate::storage::pieces::SqlitePieceRepository;
-use crate::storage::sandbox::ClampedPathPolicy;
+use crate::storage::sandbox::{
+    ClampedPathPolicy,
+    OpenPathPolicy,
+};
 use crate::storage::workers::SqliteWorkerRepository;
 
 /// Имя lock-файла (гарантирует single-instance демона на пользователя).
@@ -87,7 +91,11 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Конкретные типы адаптеров, с которыми параметризуется менеджер в
 /// проде и интеграционных тестах.
-pub type ProdFactory = LocalPieceStorageFactory<HttpInspectClient, ClampedPathPolicy>;
+///
+/// Политика путей — `dyn TPathPolicy`: на старте выбираем между
+/// `ClampedPathPolicy` (sandbox) и `OpenPathPolicy` (без sandbox), но в
+/// `Runtime` хранится единый dyn-вид, чтобы не плодить две параметризации.
+pub type ProdFactory = LocalPieceStorageFactory<HttpInspectClient, dyn TPathPolicy>;
 pub type ProdQueue = SqliteFileRepository;
 pub type ProdFetch = RangeFetchClient;
 pub type ProdWorkerRepo = SqliteWorkerRepository;
@@ -154,18 +162,6 @@ pub struct Runtime {
 }
 
 pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> {
-    // Песочница: канонизируем корень один раз тут, на старте. Если
-    // директории нет — создаём; это типичный сценарий первого запуска
-    // (`brook server --directory ~/Downloads/brook`, а такой папки нет).
-    if !args.directory.exists() {
-        std::fs::create_dir_all(&args.directory)
-            .with_context(|| format!("create sandbox root {}", args.directory.display()))?;
-    }
-    let policy = Arc::new(
-        ClampedPathPolicy::new(&args.directory)
-            .with_context(|| format!("canonicalize sandbox root {}", args.directory.display()))?,
-    );
-
     // 1. Lock (блокирует второй запуск). Каталоги могут отсутствовать при
     // первом старте — создаём лениво перед `open`.
     ensure_parent(&paths.lock)?;
@@ -195,6 +191,39 @@ pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> 
     let settings = Settings::load_or_init(&paths.config)
         .with_context(|| format!("load config {}", paths.config.display()))?;
     let daemon = DaemonRuntime::from_settings(&settings).context("derive daemon runtime")?;
+
+    // 2a. Sandbox policy + non-loopback guards. Делаем до подъёма
+    // тяжёлых зависимостей: ошибка конфигурации должна падать как можно
+    // раньше. CLI host побеждает YAML — `0.0.0.0` с дефолтным `api.bind:
+    // 127.0.0.1` всё равно требует sandbox + пароль, потому что фактический
+    // биндинг будет non-loopback.
+    let effective_host = args.host.unwrap_or(daemon.api_bind);
+    let policy: Arc<dyn TPathPolicy> = match (&args.directory, effective_host.is_loopback()) {
+        (Some(dir), _) => {
+            // Канонизируем корень один раз тут, на старте. Если директории нет
+            // — создаём; типичный сценарий первого запуска.
+            if !dir.exists() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("create sandbox root {}", dir.display()))?;
+            }
+            Arc::new(
+                ClampedPathPolicy::new(dir)
+                    .with_context(|| format!("canonicalize sandbox root {}", dir.display()))?,
+            )
+        }
+        (None, true) => Arc::new(OpenPathPolicy::new()),
+        (None, false) => {
+            return Err(anyhow!(
+                "refusing to bind to {effective_host} without --directory \
+                 (sandbox is required for non-loopback hosts)"
+            ));
+        }
+    };
+
+    // 2b. Эффективная папка-prefill для TUI. Приоритет: явный
+    // `download.default_dir` из YAML → `--directory` → системная папка
+    // загрузок пользователя → `$HOME` → `/`.
+    let effective_default_dir = resolve_default_dir(daemon.default_dir.as_deref(), &args.directory);
 
     // 3. Repositories (поверх общего `brook.db`).
     ensure_parent(&paths.db)?;
@@ -245,7 +274,7 @@ pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> 
     manager.bootstrap().await.context("manager bootstrap")?;
 
     // CLI host/port побеждают YAML. `0` — легальный ephemeral.
-    let host = args.host.unwrap_or(daemon.api_bind);
+    let host = effective_host;
     let port = args.port.unwrap_or(daemon.api_port);
 
     // Non-loopback без пароля — боевая ошибка: тривиальный recipe
@@ -283,7 +312,9 @@ pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> 
     let (rpc_shutdown_tx, rpc_shutdown_rx) = broadcast::channel(1);
     let svc = BrookService::new(
         Arc::clone(&manager),
-        api_settings(&daemon),
+        ApiSettings {
+            default_dir: effective_default_dir.to_string_lossy().into_owned(),
+        },
         policy,
         rpc_shutdown_tx,
     );
@@ -366,11 +397,27 @@ fn ensure_parent(p: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Перевод `DaemonRuntime` в транспортный снимок для `BrookService::GetSettings`.
-fn api_settings(rt: &DaemonRuntime) -> ApiSettings {
-    ApiSettings {
-        default_dir: rt.default_dir.to_string_lossy().into_owned(),
+/// Эффективная папка-prefill для модалки Add в TUI. Резолвится в
+/// порядке: явный YAML → корень sandbox → системная папка загрузок →
+/// `$HOME` → `/`. Последний фолбэк нужен только теоретически (если у
+/// процесса нет ни HOME, ни UserDirs) — для целей prefill это всё равно
+/// лучше, чем пустая строка, которую TUI потом покажет как поле.
+fn resolve_default_dir(yaml: Option<&Path>, sandbox: &Option<PathBuf>) -> PathBuf {
+    if let Some(p) = yaml {
+        return p.to_path_buf();
     }
+    if let Some(p) = sandbox {
+        return p.clone();
+    }
+    if let Some(user) = directories::UserDirs::new()
+        && let Some(p) = user.download_dir()
+    {
+        return p.to_path_buf();
+    }
+    if let Some(base) = directories::BaseDirs::new() {
+        return base.home_dir().to_path_buf();
+    }
+    PathBuf::from("/")
 }
 
 /// Фьюча, которая разрешается по приходу `SIGTERM` или `SIGINT`.
@@ -387,5 +434,34 @@ pub fn shutdown_signal() -> impl Future<Output = ()> + Send {
             _ = sigterm.recv() => info!("received SIGTERM"),
             _ = sigint.recv()  => info!("received SIGINT"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yaml_default_dir_wins_over_sandbox() {
+        let yaml = PathBuf::from("/yaml/path");
+        let sandbox = Some(PathBuf::from("/sandbox"));
+        assert_eq!(resolve_default_dir(Some(&yaml), &sandbox), yaml);
+    }
+
+    #[test]
+    fn sandbox_used_when_yaml_absent() {
+        let sandbox = Some(PathBuf::from("/sandbox"));
+        assert_eq!(
+            resolve_default_dir(None, &sandbox),
+            PathBuf::from("/sandbox")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_user_dirs_when_yaml_and_sandbox_absent() {
+        // Точное значение зависит от ОС/окружения, но результат не должен
+        // быть пустым — это контракт «всегда что-то отдаём в TUI».
+        let got = resolve_default_dir(None, &None);
+        assert!(!got.as_os_str().is_empty(), "got {got:?}");
     }
 }

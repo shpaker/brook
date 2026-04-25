@@ -134,7 +134,7 @@ async fn shutdown_persists_and_restart_resumes() {
     let url = format!("{}/f.bin", server.uri());
     let paths = Paths::in_dir(workdir.path());
     let args = ServerArgs {
-        directory: downloads.path().to_path_buf(),
+        directory: Some(downloads.path().to_path_buf()),
         host: None,
         port: None,
         client_pass: None,
