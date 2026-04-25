@@ -351,11 +351,7 @@ impl ViewModel {
             .values()
             .filter(|r| r.status != proto::FileStatus::Cancelled)
             .collect();
-        ids.sort_by(|a, b| {
-            state_rank(a.status)
-                .cmp(&state_rank(b.status))
-                .then(b.created_at.cmp(&a.created_at))
-        });
+        ids.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         ids.into_iter().map(|r| r.id.clone()).collect()
     }
 
@@ -398,20 +394,5 @@ impl ViewModel {
             .values()
             .find(|r| r.url == url && r.status != proto::FileStatus::Cancelled)
             .map(|r| r.id.clone())
-    }
-}
-
-/// Порядок групп по §6.2: RUNNING → RETRYING → QUEUED → PAUSED → DONE → FAILED.
-/// CANCELLED отфильтрован выше и здесь не появляется.
-fn state_rank(s: proto::FileStatus) -> u8 {
-    use proto::FileStatus as S;
-    match s {
-        S::Running => 0,
-        S::Retrying => 1,
-        S::Pending => 2,
-        S::Paused => 3,
-        S::Done => 4,
-        S::Failed => 5,
-        S::Cancelled | S::Unspecified => 6,
     }
 }
