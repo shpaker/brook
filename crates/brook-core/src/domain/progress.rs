@@ -5,26 +5,6 @@
 //! не полное), но не `Eq`. Поэтому `#[derive(Eq)]` компилятор отвергнет.
 //! Автоматом деривить `Hash` на `Progress` тоже нельзя по той же причине.
 
-/// Максимальное число сегментов в [`BarState`].
-///
-/// Бэкенд агрегирует произвольное количество piece'ов (7…800) в не более чем
-/// `BAR_SEGMENTS` сегментов. Это держит размер proto-payload постоянным
-/// независимо от размера файла.
-pub const BAR_SEGMENTS: usize = 100;
-
-/// Чанкованное состояние прогрессбара.
-///
-/// Передаётся в [`ProgressEvent::Tick`] как опциональный спутник [`Progress`].
-/// Не хранится в `Progress` напрямую, чтобы тот оставался `Copy`.
-#[derive(Debug, Clone)]
-pub struct BarState {
-    /// ≤ [`BAR_SEGMENTS`] флоатов, каждый в `0.0..=1.0`.
-    /// `0.0` = pending, `1.0` = done, промежуточное = resume.
-    pub segments: Vec<f32>,
-    /// Индексы в `segments`, где сейчас работает воркер.
-    pub worker_positions: Vec<u32>,
-}
-
 /// Мгновенное состояние прогресса.
 ///
 /// `Copy` — структура маленькая (несколько полей POD-типов), дешевле копировать,
@@ -44,6 +24,10 @@ pub struct Progress {
     pub speed_bps: f64,
     /// Оценка оставшегося времени, секунды. `None` — неизвестно.
     pub eta_secs: Option<u64>,
+    /// Сколько воркеров работает над файлом в этой engine-сессии.
+    /// Значение фиксируется при старте (`compute_workers`) и не меняется
+    /// до завершения; для no-Range всегда 1.
+    pub workers_count: u32,
 }
 
 impl Progress {
@@ -74,6 +58,7 @@ mod tests {
         assert_eq!(p.pieces_total, 0);
         assert_eq!(p.speed_bps, 0.0);
         assert_eq!(p.eta_secs, None);
+        assert_eq!(p.workers_count, 0);
     }
 
     #[test]

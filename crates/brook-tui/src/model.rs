@@ -38,10 +38,9 @@ pub struct ProgressSnapshot {
     pub bytes_total: u64,
     pub speed_bps: f64,
     pub eta_secs: Option<u64>,
-    /// Состояние кусков для chunked bar. `None` при линейной загрузке или
-    /// стриминге (нет `Content-Length`). `segments` — ≤ 100 флоатов 0..=1;
-    /// `worker_positions` — индексы активных сегментов.
-    pub bar: Option<proto::BarState>,
+    /// Сколько воркеров крутится над файлом сейчас. 0 — значение ещё не
+    /// пришло (пустой Default до первого тика); UI рисует «—» в этом случае.
+    pub workers_count: u32,
 }
 
 impl ProgressSnapshot {
@@ -52,7 +51,7 @@ impl ProgressSnapshot {
             bytes_total: t.bytes_total,
             speed_bps: t.speed_bps,
             eta_secs: t.eta_secs,
-            bar: t.bar.clone(),
+            workers_count: t.workers_count,
         }
     }
 }
@@ -74,6 +73,11 @@ pub struct DownloadRow {
     /// выкидываются (fraction >= 1.0), поэтому размер карты
     /// ограничен числом воркеров.
     pub workers: HashMap<u32, WorkerSegment>,
+    /// Итоговая средняя скорость (байт/сек). Заполняется только для
+    /// `Done`-файлов (демон вычисляет on-the-fly при чтении).
+    pub avg_speed_bps: Option<f64>,
+    /// Кол-во разных воркеров за время загрузки. Только для `Done`.
+    pub workers_count: Option<u32>,
 }
 
 impl DownloadRow {
@@ -92,6 +96,8 @@ impl DownloadRow {
             error: d.error.clone(),
             created_at: d.created_at.as_ref().map(|t| t.seconds).unwrap_or(0),
             workers: HashMap::new(),
+            avg_speed_bps: d.avg_speed_bps,
+            workers_count: d.workers_count,
         }
     }
 
@@ -163,8 +169,6 @@ pub enum Mode {
 pub struct AddModal {
     pub url: String,
     pub folder: String,
-    /// `true` — последовательная загрузка; chunked bar скрыт. По умолчанию `false`.
-    pub linear: bool,
     pub field: AddField,
     pub error: Option<String>,
 }
@@ -180,7 +184,6 @@ impl AddModal {
         Self {
             url,
             folder,
-            linear: false,
             field: AddField::Url,
             error: None,
         }

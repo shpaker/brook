@@ -262,7 +262,6 @@ mod tests {
                 url: "https://x/f".into(),
                 target_dir: PathBuf::from("/tmp"),
                 filename: Some("f".into()),
-                linear: false,
             },
         );
         let file_id = d.id;

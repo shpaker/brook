@@ -96,25 +96,22 @@ CREATE TABLE IF NOT EXISTS reason_codes (
 );
 
 CREATE TABLE IF NOT EXISTS files (
-    id         TEXT    PRIMARY KEY,
-    url        TEXT    NOT NULL,
-    target_dir TEXT    NOT NULL,
-    filename   TEXT,
-    status_id  TEXT    NOT NULL REFERENCES statuses(name)
-                       CHECK (status_id IN
-                           ('pending','running','paused','retrying',
-                            'done','failed','cancelled')),
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS file_settings (
-    file_id            TEXT    PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-    total_size         INTEGER,
-    piece_size         INTEGER,
-    etag               TEXT,
-    last_modified      TEXT,
-    effective_url      TEXT,
-    accepts_ranges     INTEGER
+    id             TEXT    PRIMARY KEY,
+    url            TEXT    NOT NULL,
+    target_dir     TEXT    NOT NULL,
+    filename       TEXT,
+    status_id      TEXT    NOT NULL REFERENCES statuses(name)
+                           CHECK (status_id IN
+                               ('pending','running','paused','retrying',
+                                'done','failed','cancelled')),
+    created_at     INTEGER NOT NULL,
+    -- inspect-поля (заполняются позже фабрикой через set_inspect_fields):
+    total_size     INTEGER,
+    piece_size     INTEGER,
+    etag           TEXT,
+    last_modified  TEXT,
+    effective_url  TEXT,
+    accepts_ranges INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS status_changes (
@@ -228,44 +225,6 @@ fn migrate(conn: &mut Connection) -> DbResult<()> {
         tx.commit()?;
     }
 
-    // V2: колонка `accepts_ranges` в `file_settings`. До V2 её не было,
-    // потому что `prepare()` каждый раз дергал `inspect()` заново; после
-    // перехода на «один HEAD на Add» эта характеристика тоже персистится.
-    // Для новых БД SCHEMA_V1 создаёт колонку сразу — ALTER ниже тихо упадёт
-    // в «duplicate column», это ожидаемо.
-    if current < 2 {
-        let tx = conn.transaction()?;
-        match tx.execute(
-            "ALTER TABLE file_settings ADD COLUMN accepts_ranges INTEGER",
-            [],
-        ) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
-                if msg.contains("duplicate column name") => {}
-            Err(e) => return Err(e.into()),
-        }
-        tx.pragma_update(None, "user_version", 2i64)?;
-        tx.commit()?;
-    }
-
-    // V3: колонка `linear` в `files`. Флаг «последовательная загрузка» —
-    // сохраняется при добавлении и восстанавливается при reopen.
-    // DEFAULT 0 = VdC-режим для старых записей.
-    if current < 3 {
-        let tx = conn.transaction()?;
-        match tx.execute(
-            "ALTER TABLE files ADD COLUMN linear INTEGER NOT NULL DEFAULT 0",
-            [],
-        ) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
-                if msg.contains("duplicate column name") => {}
-            Err(e) => return Err(e.into()),
-        }
-        tx.pragma_update(None, "user_version", 3i64)?;
-        tx.commit()?;
-    }
-
     Ok(())
 }
 
@@ -299,14 +258,13 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 1);
 
         let tables = table_names(&conn);
         for t in [
             "statuses",
             "reason_codes",
             "files",
-            "file_settings",
             "status_changes",
             "pieces",
             "workers",
@@ -314,6 +272,11 @@ mod tests {
         ] {
             assert!(tables.iter().any(|n| n == t), "missing table {t}");
         }
+        // `file_settings` смержена в `files` — отдельной таблицы быть не должно.
+        assert!(
+            !tables.iter().any(|n| n == "file_settings"),
+            "file_settings table must not exist after merge"
+        );
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM statuses"), 7);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 9);
@@ -344,7 +307,7 @@ mod tests {
             let version: i64 = conn
                 .pragma_query_value(None, "user_version", |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 3);
+            assert_eq!(version, 1);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM statuses"), 7);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 9);
         }

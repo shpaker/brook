@@ -91,13 +91,11 @@ fn modal_block<'a>(title: &'a str, bottom: Line<'static>, no_color: bool) -> Blo
 }
 
 fn draw_add(f: &mut Frame, m: &AddModal, no_color: bool) {
-    // Высота 8 = рамка (2) + пустая + url + folder + linear + пустая + err/пустая.
-    let area = centered(f.area(), 62, 8);
+    let area = centered(f.area(), 62, 6);
     f.render_widget(Clear, area);
     let bottom = hint_line(
         &[
             ("Tab", Some("switch")),
-            ("L", Some("linear")),
             ("Enter", Some("add")),
             ("Esc", Some("cancel")),
         ],
@@ -111,8 +109,6 @@ fn draw_add(f: &mut Frame, m: &AddModal, no_color: bool) {
         Line::from(""),
         field_line("url   ", &m.url, m.field == AddField::Url, no_color),
         field_line("folder", &m.folder, m.field == AddField::Folder, no_color),
-        linear_line(m.linear, no_color),
-        Line::from(""),
     ];
     if let Some(err) = &m.error {
         let style = if no_color {
@@ -126,25 +122,6 @@ fn draw_add(f: &mut Frame, m: &AddModal, no_color: bool) {
     }
 
     f.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Строка чекбокса `[ ] linear` / `[x] linear`.
-/// Скобки и символ чека — Cyan при включённом флаге, DarkGray при выключенном.
-fn linear_line(linear: bool, no_color: bool) -> Line<'static> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let check_style = if no_color {
-        dim
-    } else if linear {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let check = if linear { "x" } else { " " };
-    Line::from(vec![
-        Span::styled(" linear  [", dim),
-        Span::styled(check.to_string(), check_style),
-        Span::styled("] sequential download, no chunked bar", dim),
-    ])
 }
 
 fn field_line(label: &'static str, value: &str, focused: bool, no_color: bool) -> Line<'static> {

@@ -25,6 +25,10 @@ use brook_core::{
 };
 
 use super::layout::with_suffix;
+use super::verify::{
+    fd_dev_ino,
+    verify_data_file_present,
+};
 use crate::storage::error::{
     StorageError,
     StorageResult,
@@ -41,6 +45,10 @@ struct StreamInner {
     data: Option<File>,
     finalized: bool,
     aborted: bool,
+    /// `(dev, ino)` файла на момент `open` — для детекта удаления
+    /// `.data.brook` пользователем посреди стрима. См. [`super::verify`].
+    expected_dev: u64,
+    expected_ino: u64,
 }
 
 impl LocalStreamStorage {
@@ -67,11 +75,14 @@ impl LocalStreamStorage {
             Ok(f)
         })
         .await??;
+        let (expected_dev, expected_ino) = fd_dev_ino(&data)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(StreamInner {
                 data: Some(data),
                 finalized: false,
                 aborted: false,
+                expected_dev,
+                expected_ino,
             })),
             data_path,
             target_path,
@@ -97,6 +108,7 @@ impl LocalStreamStorage {
     async fn append_chunk_inner(&self, bytes: &[u8]) -> StorageResult<()> {
         let bytes = bytes.to_vec();
         let inner = Arc::clone(&self.inner);
+        let data_path = self.data_path.clone();
         tokio::task::spawn_blocking(move || -> StorageResult<()> {
             let mut guard = inner.lock().expect("mutex poisoned");
             if guard.finalized {
@@ -105,6 +117,7 @@ impl LocalStreamStorage {
             if guard.aborted {
                 return Err(StorageError::AfterAbort { op: "append" });
             }
+            verify_data_file_present(&data_path, guard.expected_dev, guard.expected_ino)?;
             let file = guard
                 .data
                 .as_mut()
@@ -151,5 +164,31 @@ impl LocalStreamStorage {
             Ok(())
         })
         .await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brook_core::TStreamStorage;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn deleting_data_file_makes_append_fail() {
+        let dir = tempdir().unwrap();
+        let s = LocalStreamStorage::open_streaming(dir.path(), "s.bin")
+            .await
+            .unwrap();
+
+        s.append_chunk(b"hello ").await.unwrap();
+
+        std::fs::remove_file(dir.path().join("s.bin.data.brook")).unwrap();
+
+        let err = s.append_chunk(b"world").await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("data file missing"), "unexpected: {msg}");
+        assert!(msg.contains("s.bin.data.brook"), "missing path: {msg}");
     }
 }

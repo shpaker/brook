@@ -9,7 +9,7 @@
 //! Раньше [`super::index::PieceIndexRepository`] хранил `offset`/`size`
 //! каждого piece'а — это была единственная карта геометрии. Теперь
 //! геометрия восстанавливается арифметикой из `total_size`/`piece_size`
-//! в `file_settings` (stage 5: хелперы `offset_for`/`size_for` в
+//! в `files` (stage 5: хелперы `offset_for`/`size_for` в
 //! `LocalPieceStorage`), а в БД остаётся только то, что нельзя посчитать —
 //! `status` и `finished_at`.
 //!
@@ -230,7 +230,6 @@ mod tests {
             url: "https://example.com/file.bin".into(),
             target_dir: PathBuf::from("/tmp/brook"),
             filename: Some("file.bin".into()),
-            linear: false,
         };
         File::new(FileId::new(), spec)
     }

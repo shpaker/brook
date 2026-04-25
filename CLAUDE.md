@@ -70,7 +70,7 @@ just fix                     # clippy --fix + fmt
 | `.brook.lock`     | `~/Library/Caches/brook/`              | `~/.cache/brook/`       | `%LOCALAPPDATA%\brook\cache\` | Single-instance flock (held by `brook server`) |
 | `.brook.endpoint` | `~/Library/Caches/brook/`              | `~/.cache/brook/`       | `%LOCALAPPDATA%\brook\cache\` | Sidecar with actual `{host, port}` — lets TUI discover ephemeral ports; removed on graceful shutdown |
 
-Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to the target file. The piece index, per-download settings and state history are rows in the shared `brook.db` (tables `files`, `file_settings`, `state_changes`, `pieces`).
+Per-download artefacts: only `<name>.data.brook` (preallocated) lives next to the target file. The piece index, per-download settings and state history are rows in the shared `brook.db` (tables `files`, `status_changes`, `pieces`). Inspect-поля (`total_size`, `piece_size`, `etag`, `last_modified`, `effective_url`, `accepts_ranges`) живут прямо в `files`; маркер «inspect завершён» — `accepts_ranges IS NOT NULL`.
 
 Integration-тесты обходят `AppPaths` и кладут все четыре файла в один tempdir через `brook_daemon::app::Paths::in_dir`.
 

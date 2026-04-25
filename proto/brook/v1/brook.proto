@@ -46,11 +46,6 @@ message FileSpec {
   string target_dir = 2;
   // Явно заданное имя файла (пусто — вывести из Content-Disposition/URL).
   optional string filename = 3;
-  // Линейный (последовательный) порядок загрузки piece'ов.
-  // false (по умолчанию) — стратифицированный рандом + VdC-упорядочивание,
-  // воркеры стартуют в разных зонах файла — chunked progress bar.
-  // true  — классический порядок слева направо; без chunked progress bar.
-  bool linear = 4;
 }
 
 // Статус файла.
@@ -77,6 +72,12 @@ message File {
   optional string error = 5;
   google.protobuf.Timestamp created_at = 6;
   google.protobuf.Timestamp updated_at = 7;
+  // Итоговая средняя скорость загрузки (байт/сек). Заполняется только
+  // для DONE — weighted average по байтам из всех успешных попыток.
+  optional double avg_speed_bps = 8;
+  // Кол-во разных воркеров, реально качавших хотя бы один piece файла.
+  // Заполняется только для DONE.
+  optional uint32 workers_count = 9;
 }
 
 // Смена статуса файла.
@@ -111,17 +112,6 @@ message FileEvent {
   }
 }
 
-// Чанкованное состояние прогрессбара.
-// Бэкенд агрегирует piece'ы в N = min(pieces_total, 100) сегментов и
-// вычисляет состояние каждого. TUI масштабирует N сегментов под ширину бара.
-message BarState {
-  // ≤ 100 флоатов, каждый в [0.0, 1.0]:
-  //   0.0 = pending, 1.0 = done, промежуточный — resume (часть piece'ов готова).
-  repeated float segments = 1;
-  // Индексы сегментов, где сейчас работает воркер.
-  repeated uint32 worker_positions = 2;
-}
-
 // Тик прогресса по одному файлу.
 message ProgressTick {
   FileId file_id = 1;
@@ -133,9 +123,9 @@ message ProgressTick {
   double speed_bps = 5;
   // Отсутствует, если неизвестно.
   optional uint64 eta_secs = 6;
-  // Чанкованное состояние для прогрессбара.
-  // Отсутствует при linear=true или когда размер файла ещё не известен.
-  optional BarState bar = 7;
+  // Сколько воркеров работает над файлом в текущей сессии. Фиксировано
+  // на сессию (compute_workers по total_size); для no-Range всегда 1.
+  uint32 workers_count = 7;
 }
 
 message AddRequest {

@@ -12,7 +12,6 @@ use std::str::FromStr;
 use std::time::SystemTime;
 
 use brook_core::{
-    BarState,
     File,
     FileId,
     FileLifecycleEvent,
@@ -60,7 +59,6 @@ pub fn spec_from_proto(s: proto::FileSpec) -> Result<FileSpec, Status> {
         url: s.url,
         target_dir: PathBuf::from(s.target_dir),
         filename,
-        linear: s.linear,
     })
 }
 
@@ -71,7 +69,6 @@ pub fn spec_to_proto(s: &FileSpec) -> proto::FileSpec {
         // нет — теряем невалидные байты. Для MVP (только macOS) приемлемо.
         target_dir: s.target_dir.to_string_lossy().into_owned(),
         filename: s.filename.clone(),
-        linear: s.linear,
     }
 }
 
@@ -118,6 +115,8 @@ pub fn file_to_proto(d: &File) -> proto::File {
         error: d.error.clone(),
         created_at: Some(systime_to_proto(d.created_at)),
         updated_at: Some(systime_to_proto(d.updated_at)),
+        avg_speed_bps: d.avg_speed_bps,
+        workers_count: d.workers_count,
     }
 }
 
@@ -159,13 +158,11 @@ pub fn snapshot_event(d: &File) -> proto::FileEvent {
 
 pub fn progress_event_to_proto(ev: &ProgressEvent) -> proto::ProgressTick {
     match ev {
-        ProgressEvent::Tick { id, progress, bar } => {
-            progress_tick_from(*id, progress, bar.as_ref())
-        }
+        ProgressEvent::Tick { id, progress } => progress_tick_from(*id, progress),
     }
 }
 
-fn progress_tick_from(id: FileId, p: &Progress, bar: Option<&BarState>) -> proto::ProgressTick {
+fn progress_tick_from(id: FileId, p: &Progress) -> proto::ProgressTick {
     proto::ProgressTick {
         file_id: Some(id_to_proto(id)),
         progress: progress_ratio(p),
@@ -173,14 +170,7 @@ fn progress_tick_from(id: FileId, p: &Progress, bar: Option<&BarState>) -> proto
         bytes_total: p.bytes_total,
         speed_bps: p.speed_bps,
         eta_secs: p.eta_secs,
-        bar: bar.map(bar_state_to_proto),
-    }
-}
-
-fn bar_state_to_proto(b: &BarState) -> proto::BarState {
-    proto::BarState {
-        segments: b.segments.clone(),
-        worker_positions: b.worker_positions.clone(),
+        workers_count: p.workers_count,
     }
 }
 
@@ -263,7 +253,6 @@ mod tests {
         assert_eq!(s.url, "https://example.com/f");
         assert_eq!(s.target_dir, PathBuf::from("/tmp"));
         assert_eq!(s.filename, None);
-        assert!(!s.linear);
     }
 
     #[test]
@@ -284,7 +273,6 @@ mod tests {
             url: "https://x".into(),
             target_dir: "/tmp".into(),
             filename: Some(String::new()),
-            linear: false,
         };
         let s = spec_from_proto(p).unwrap();
         assert_eq!(s.filename, None);
@@ -338,14 +326,15 @@ mod tests {
                 pieces_total: 2,
                 speed_bps: 123.4,
                 eta_secs: Some(42),
+                workers_count: 4,
             },
-            bar: None,
         });
         assert_eq!(tick.file_id.unwrap().value, id.to_string());
         assert!((tick.progress - 0.5).abs() < 1e-9);
         assert_eq!(tick.bytes_done, 50);
         assert_eq!(tick.bytes_total, 100);
         assert_eq!(tick.eta_secs, Some(42));
+        assert_eq!(tick.workers_count, 4);
     }
 
     #[test]

@@ -118,7 +118,6 @@ async fn add_rejects_target_dir_outside_sandbox() {
                 url: url.clone(),
                 target_dir: outside.path().to_string_lossy().into(),
                 filename: Some("f.bin".into()),
-                linear: false,
             }),
         })
         .await
@@ -137,7 +136,6 @@ async fn add_rejects_target_dir_outside_sandbox() {
                 url: url.clone(),
                 target_dir: escape.to_string_lossy().into(),
                 filename: Some("f.bin".into()),
-                linear: false,
             }),
         })
         .await
@@ -155,7 +153,6 @@ async fn add_rejects_target_dir_outside_sandbox() {
                 url: url.clone(),
                 target_dir: sandbox.path().to_string_lossy().into(),
                 filename: Some("ok.bin".into()),
-                linear: false,
             }),
         })
         .await

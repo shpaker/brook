@@ -48,7 +48,6 @@ pub fn add(
             url: form.url.clone(),
             target_dir: form.folder.clone(),
             filename: filename.clone(),
-            linear: form.linear,
         };
         match client.add(AddRequest { spec: Some(spec) }).await {
             Ok(_) => {

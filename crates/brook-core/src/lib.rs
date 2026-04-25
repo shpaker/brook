@@ -26,8 +26,6 @@ pub mod testing;
 pub use domain::{
     AttemptId,
     AttemptStatus,
-    BAR_SEGMENTS,
-    BarState,
     FailureReason,
     File,
     FileCommand,

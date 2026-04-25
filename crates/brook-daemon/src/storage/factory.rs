@@ -158,9 +158,9 @@ where
         async move {
             let target_dir = policy.check_target_dir(&spec.target_dir)?;
 
-            // Штатный путь: inspect-поля уже уехали в `file_settings`
-            // из `resolve()` при `Add`. Ключевой инвариант — никакого
-            // HEAD'а здесь больше нет.
+            // Штатный путь: inspect-поля уже уехали в inspect-колонки
+            // `files` из `resolve()` при `Add`. Ключевой инвариант —
+            // никакого HEAD'а здесь больше нет.
             let fields = files_repo
                 .get_inspect_fields(id)
                 .await?
@@ -377,7 +377,6 @@ mod tests {
             url: "https://host/path/server.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: Some("explicit.bin".into()),
-            linear: false,
         };
         let (_db, _files, _pieces, id, factory) = build(
             inspect_with(Some(1024 * 1024), Some("from-header.bin")),
@@ -409,7 +408,6 @@ mod tests {
             url: "https://host/path/server.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: None,
-            linear: false,
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(2048), Some("from-header.bin")), &spec).await;
@@ -425,7 +423,6 @@ mod tests {
             url: "https://host/path/server.bin?x=1".into(),
             target_dir: dir.path().to_path_buf(),
             filename: None,
-            linear: false,
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(2048), None), &spec).await;
@@ -458,7 +455,6 @@ mod tests {
             url: "https://host/f.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: Some("f.bin".into()),
-            linear: false,
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(64 * 1024 * 1024), Some("f.bin")), &spec).await;
@@ -477,7 +473,6 @@ mod tests {
             url: "https://host/f.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: Some("f.bin".into()),
-            linear: false,
         };
         let (_db, files, _pieces, id, factory) =
             build(inspect_with(Some(64 * 1024 * 1024), Some("f.bin")), &spec).await;
@@ -522,7 +517,6 @@ mod tests {
             url: "https://host/f.bin".into(),
             target_dir: dir.to_path_buf(),
             filename: Some(filename.into()),
-            linear: false,
         }
     }
 
@@ -565,7 +559,6 @@ mod tests {
             url: "https://host/f.bin".into(),
             target_dir: dir.path().to_path_buf(),
             filename: Some("f.bin".into()),
-            linear: false,
         };
         let (_db, _files, _pieces, id, factory) =
             build(inspect_with(Some(1024), Some("f.bin")), &spec).await;

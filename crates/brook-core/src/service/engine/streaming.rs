@@ -294,10 +294,8 @@ fn emit_progress_streaming(
         speed_bps: meter.speed_bps(),
         // ETA непредставима без total_size — TUI покажет «unknown».
         eta_secs: None,
+        // Streaming-движок всегда однопоточный (no-Range).
+        workers_count: 1,
     };
-    let _ = tx.send(ProgressEvent::Tick {
-        id,
-        progress,
-        bar: None,
-    });
+    let _ = tx.send(ProgressEvent::Tick { id, progress });
 }

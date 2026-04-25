@@ -19,6 +19,7 @@ mod layout;
 mod piece;
 mod preallocate;
 mod stream;
+mod verify;
 
 pub use piece::LocalPieceStorage;
 pub use stream::LocalStreamStorage;
