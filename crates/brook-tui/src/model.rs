@@ -351,7 +351,7 @@ impl ViewModel {
             .values()
             .filter(|r| r.status != proto::FileStatus::Cancelled)
             .collect();
-        ids.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        ids.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         ids.into_iter().map(|r| r.id.clone()).collect()
     }
 
