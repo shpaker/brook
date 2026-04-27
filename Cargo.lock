@@ -399,6 +399,7 @@ dependencies = [
  "directories",
  "futures-util",
  "indexmap",
+ "prost-types",
  "ratatui",
  "rpassword",
  "tokio",

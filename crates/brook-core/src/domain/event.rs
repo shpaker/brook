@@ -1,36 +1,49 @@
-//! События от движка к подписчикам (gRPC-стримы `WatchFile`/`WatchProgress`, TUI).
+//! События от движка к подписчикам (gRPC-стримы `WatchStatus`/`WatchProgress`, TUI).
 //!
 //! События логически делятся на два потока:
-//! - **lifecycle** (`FileLifecycleEvent`) — смена статусов, завершение,
-//!   падения, полные снапшоты. Это то, что рендерит стрим `WatchFile`.
+//! - **lifecycle** (`FileLifecycleEvent`) — статусные переходы. Едут по
+//!   стриму `WatchStatus`. Initial-sync не делается — стартовое состояние
+//!   клиент получает через RPC `GetRecently`/`GetFiles`. Создание новых
+//!   записей и физическое удаление через стрим **не** уведомляются:
+//!   создающая сторона видит результат через ответ `Add`, удалившая —
+//!   через `Remove`. Призраки у наблюдателей лечит ghost-режим TUI.
 //! - **progress** (`ProgressEvent`) — высокочастотные тики прогресса.
 //!   Едут по стриму `WatchProgress`.
 
-use super::file::File;
 use super::id::FileId;
 use super::progress::Progress;
 use super::status::FileStatus;
 
-/// События жизненного цикла файла. Вызывающий делает `match` и компилятор
-/// гарантирует, что ни один вариант не забыт.
+/// Статусный переход одного файла. Плоская структура: `id` нужного
+/// файла, новый `status`, и опциональный текст-причина.
+///
+/// `description` заполняется только при `status == Failed` (несёт
+/// сообщение об ошибке). На остальных переходах — `None`.
 #[derive(Debug, Clone)]
-pub enum FileLifecycleEvent {
-    /// Смена статуса (`Pending → Running`, `Running → Paused`, …).
-    StatusChanged { id: FileId, status: FileStatus },
+pub struct FileLifecycleEvent {
+    pub id: FileId,
+    pub status: FileStatus,
+    pub description: Option<String>,
+}
 
-    /// Файл успешно скачан.
-    Completed { id: FileId },
+impl FileLifecycleEvent {
+    /// Стандартный переход без description.
+    pub fn status(id: FileId, status: FileStatus) -> Self {
+        Self {
+            id,
+            status,
+            description: None,
+        }
+    }
 
-    /// Файл упал окончательно.
-    Failed { id: FileId, error: String },
-
-    /// Полный снимок — например, при подключении нового клиента к `WatchFile`.
-    ///
-    /// `Box<File>` (а не просто `File`): `File` — самая крупная по размеру
-    /// структура из всех вариантов enum'а. Без `Box` enum бы «раздулся» до
-    /// её размера на стеке даже для мелких вариантов вроде `Completed`.
-    /// Индирекция через `Box` держит enum компактным.
-    Snapshot { file: Box<File> },
+    /// Переход в `Failed` с текстом ошибки.
+    pub fn failed(id: FileId, error: impl Into<String>) -> Self {
+        Self {
+            id,
+            status: FileStatus::Failed,
+            description: Some(error.into()),
+        }
+    }
 }
 
 /// Тик прогресса. Отдельный enum (а не вариант `FileLifecycleEvent`) —
@@ -38,38 +51,4 @@ pub enum FileLifecycleEvent {
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
     Tick { id: FileId, progress: Progress },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::spec::FileSpec;
-    use super::*;
-
-    #[test]
-    fn match_exhaustive_compiles() {
-        let id = FileId::new();
-        let ev = FileLifecycleEvent::Completed { id };
-        let _text: &'static str = match ev {
-            FileLifecycleEvent::StatusChanged { .. } => "status",
-            FileLifecycleEvent::Completed { .. } => "done",
-            FileLifecycleEvent::Failed { .. } => "failed",
-            FileLifecycleEvent::Snapshot { .. } => "snapshot",
-        };
-    }
-
-    #[test]
-    fn snapshot_carries_full_file() {
-        let d = File::new(
-            FileId::new(),
-            FileSpec::new("https://example.com/f", "/tmp"),
-        );
-        let ev = FileLifecycleEvent::Snapshot {
-            file: Box::new(d.clone()),
-        };
-        if let FileLifecycleEvent::Snapshot { file } = ev {
-            assert_eq!(file.id, d.id);
-        } else {
-            panic!("expected Snapshot");
-        }
-    }
 }

@@ -132,8 +132,15 @@ where
             .add(spec)
             .await
             .map_err(mapper::core_err_to_status)?;
+        // Достаём свежий File сразу из in-memory кэша менеджера, чтобы
+        // ответ Add сразу нёс полное состояние записи. Клиент вставит её
+        // в свой view-model, не дожидаясь дельта-событий из WatchFile.
+        let file = self
+            .manager
+            .get_file(&id)
+            .ok_or_else(|| Status::internal("manager: just-inserted file vanished"))?;
         Ok(Response::new(proto::AddResponse {
-            id: Some(mapper::id_to_proto(id)),
+            file: Some(mapper::file_to_proto(&file)),
         }))
     }
 
@@ -185,6 +192,46 @@ where
         Ok(ok_status())
     }
 
+    async fn get_recently(
+        &self,
+        req: Request<proto::GetRecentlyRequest>,
+    ) -> Result<Response<proto::GetRecentlyResponse>, Status> {
+        let since = mapper::proto_ts_to_systime(req.into_inner().since.as_ref())
+            .ok_or_else(|| Status::invalid_argument("since is required"))?;
+        let files = self
+            .manager
+            .list_recently(since)
+            .await
+            .map_err(mapper::core_err_to_status)?;
+        Ok(Response::new(proto::GetRecentlyResponse {
+            files: files.iter().map(mapper::file_to_proto).collect(),
+        }))
+    }
+
+    async fn get_files(
+        &self,
+        req: Request<proto::GetFilesRequest>,
+    ) -> Result<Response<proto::GetFilesResponse>, Status> {
+        const DEFAULT_LIMIT: u32 = 50;
+        const MAX_LIMIT: u32 = 200;
+        let r = req.into_inner();
+        let effective_limit = if r.limit == 0 {
+            DEFAULT_LIMIT
+        } else {
+            r.limit.min(MAX_LIMIT)
+        };
+        let files = self
+            .manager
+            .list_files(r.offset, effective_limit)
+            .await
+            .map_err(mapper::core_err_to_status)?;
+        let returned = files.len() as u32;
+        Ok(Response::new(proto::GetFilesResponse {
+            files: files.iter().map(mapper::file_to_proto).collect(),
+            has_more: returned == effective_limit,
+        }))
+    }
+
     async fn get_settings(
         &self,
         _req: Request<proto::GetSettingsRequest>,
@@ -205,25 +252,21 @@ where
         Ok(ok_status())
     }
 
-    type WatchFileStream = Pin<Box<dyn Stream<Item = Result<proto::FileEvent, Status>> + Send>>;
+    type WatchStatusStream = Pin<Box<dyn Stream<Item = Result<proto::StatusEvent, Status>> + Send>>;
 
-    async fn watch_file(
+    async fn watch_status(
         &self,
-        _req: Request<proto::WatchFileRequest>,
-    ) -> Result<Response<Self::WatchFileStream>, Status> {
-        // Важно: сначала подписываемся, потом снимаем initial-snapshot.
-        // Обратный порядок мог бы потерять событие, прилетевшее между
-        // snapshot'ом и subscribe: сам broadcast не буферизует события
-        // до создания ресивера.
+        _req: Request<proto::WatchStatusRequest>,
+    ) -> Result<Response<Self::WatchStatusStream>, Status> {
+        // Initial-sync нет: стартовое состояние клиент берёт через
+        // GetRecently/GetFiles. Здесь мы сразу подписываемся и форвардим
+        // статусные переходы. Создание новых записей и физическое
+        // удаление через стрим не уведомляются — соответствующие
+        // клиенты узнают результат через ответы Add/Remove (или через
+        // следующий GetRecently после reconnect).
         let rx = self.manager.subscribe_lifecycle();
-        let initial = self.manager.snapshot();
-        let manager = Arc::clone(&self.manager);
 
         let stream = async_stream::try_stream! {
-            for d in &initial {
-                yield mapper::snapshot_event(d);
-            }
-
             let mut broadcast = BroadcastStream::new(rx);
             // Используем BroadcastStream, чтобы получить `Lagged(n)` как
             // Err-элемент стрима, а не тихий пропуск.
@@ -234,16 +277,9 @@ where
                         yield mapper::lifecycle_event_to_proto(&ev);
                     }
                     Err(BroadcastStreamRecvError::Lagged(n)) => {
-                        warn!(lagged = n, "watch_file stream lagged; reconciling");
-                        // Реконсиляция: шлём свежий snapshot по активным
-                        // файлам — терминальные клиент и так не обновляет.
-                        for d in manager
-                            .snapshot()
-                            .iter()
-                            .filter(|d| !d.status.is_terminal())
-                        {
-                            yield mapper::snapshot_event(d);
-                        }
+                        warn!(lagged = n, "watch_status stream lagged; closing with DataLoss");
+                        Err(Status::data_loss("watch_status lagged"))?;
+                        unreachable!()
                     }
                 }
             }

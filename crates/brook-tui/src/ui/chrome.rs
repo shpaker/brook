@@ -1,14 +1,17 @@
 //! Титулы внешней rounded-рамки.
 //!
-//! Верх рамки — один центрированный brand-титул
-//! `[ brook | 127.0.0.1:<port> ]` (при reconnect/offline вместо адреса
-//! показывается причина).
+//! Верх рамки — три сегмента через ` · `:
+//! `[  brook  ·  127.0.0.1:<port>  ·  <screen>  ]`. `<screen>` —
+//! `recently` для главного, `history` для экрана истории. При
+//! reconnect/offline вместо адреса показывается причина (`reconnecting
+//! #N` / `offline …`). Разделитель внутри статуса убран, чтобы не
+//! сталкиваться с разделителем top-bar'а.
 //!
-//! Низ рамки — хинт-бар со всеми действиями нормального режима,
-//! сгруппированными по центру через `|`: `[ add | <primary> | delete |
-//! quit ]`. `<primary>` зависит от строки под курсором
-//! (pause/resume/retry/reveal); для пустого списка или Unspecified-строки
-//! primary и delete пропускаются — остаётся `[ add | quit ]`. Тост
+//! Низ рамки — хинт-бар со всеми действиями нормального режима. На
+//! главном экране: `[ add | <primary> | delete | history | quit ]`,
+//! `<primary>` зависит от строки под курсором (pause/resume/retry/reveal);
+//! для пустого списка primary и delete пропускаются — `[ add | history |
+//! quit ]`. На экране истории: `[ Esc · back | delete | quit ]`. Тост
 //! (`toast_line`, align Left) при активном `vm.toast` рисуется на той
 //! же нижней линии слева — ratatui поддерживает несколько titles на
 //! одной рамке.
@@ -32,6 +35,7 @@ use ratatui::text::{
 
 use crate::model::{
     ConnectionState,
+    Screen,
     ViewModel,
 };
 
@@ -67,46 +71,71 @@ pub fn word_with_key(word: &str, no_color: bool) -> [Span<'static>; 2] {
     ]
 }
 
-/// Верхний brand-титул: `[  brook | 127.0.0.1:<port>  ]` по центру. При
+/// Верхний brand-титул: `[  brook  ·  127.0.0.1:<port>  ·  <screen>  ]`
+/// по центру. Третий сегмент — текущий экран (`recently` для главного,
+/// `history` для истории) — рисуется accent (Cyan), как `brook`. При
 /// reconnect/offline во втором сегменте показывается причина вместо
-/// адреса.
+/// адреса (без внутренних ` · `, чтобы не сталкивать с разделителем
+/// top-bar'а).
 pub fn top_brand(vm: &ViewModel) -> Line<'static> {
-    let (tail, tail_style): (String, Style) = match &vm.connection {
+    let (middle, middle_style): (String, Style) = match &vm.connection {
         ConnectionState::Connected => (
             format!("127.0.0.1:{}", vm.port),
             Style::default().fg(Color::DarkGray),
         ),
         ConnectionState::Reconnecting { attempt } => (
-            format!("reconnecting · #{attempt}"),
+            format!("reconnecting #{attempt}"),
             Style::default().fg(Color::Yellow),
         ),
         ConnectionState::Disconnected { reason } => (
-            format!("offline · {}", short_reason(reason)),
+            format!("offline {}", short_reason(reason)),
             Style::default().fg(Color::Red),
         ),
+    };
+
+    let screen_label = match vm.screen {
+        Screen::Main => "recently",
+        Screen::History => "history",
     };
 
     Line::from(vec![
         dim("[  "),
         accent("brook"),
-        dim(" | "),
-        Span::styled(tail, tail_style),
+        dim("  ·  "),
+        Span::styled(middle, middle_style),
+        dim("  ·  "),
+        accent(screen_label),
         dim("  ]"),
     ])
     .alignment(Alignment::Center)
 }
 
-/// Нижний хинт-бар: `[ add | <primary> | delete | quit ]` по центру.
+/// Нижний хинт-бар: набор зависит от активного экрана.
 ///
-/// `add` и `quit` показываются всегда — это глобальные клавиши нормального
-/// режима. `<primary>` выбирается по статусу строки под курсором
-/// (pause/resume/retry/reveal); если её нет или Unspecified, primary и
-/// delete пропускаются и остаётся `[ add | quit ]`. Разделитель — ` | `
-/// (dim); первая буква каждого слова accent (клавиша), остаток dim; в
-/// `no_color` оба получают `Modifier::DIM`.
+/// **Main:** `[ add | <primary> | delete | history | quit ]`. `add`,
+/// `history` и `quit` — глобальные клавиши нормального режима, всегда
+/// видимы. `<primary>` выбирается по статусу строки под курсором
+/// (pause/resume/retry/reveal); если её нет или Unspecified — primary
+/// и delete пропускаются.
+///
+/// **History:** `[ Esc · back | delete | quit ]`. `Esc · back` — мульти-
+/// символьная клавиша, рендерится через раздельные key + " · " + label
+/// (см. CLAUDE.md, §TUI hint bars). `add` тут нет — добавление логично
+/// делать на главной.
+///
+/// Разделитель сегментов — `  |  ` (dim). Первая буква каждого слова
+/// accent (клавиша), остаток dim; в `no_color` оба получают
+/// `Modifier::DIM`.
 pub fn hints_bar(vm: &ViewModel, no_color: bool) -> Line<'static> {
+    match vm.screen {
+        Screen::Main => main_hints_bar(vm, no_color),
+        Screen::History => history_hints_bar(no_color),
+    }
+}
+
+fn main_hints_bar(vm: &ViewModel, no_color: bool) -> Line<'static> {
     let (primary, secondary) = cursor_actions(vm);
-    let words: Vec<&'static str> = ["add", primary, secondary, "quit"]
+    let words: Vec<&'static str> = ["add", primary, secondary, "history", "quit"]
         .into_iter()
         .filter(|w| !w.is_empty())
         .collect();
@@ -121,6 +150,37 @@ pub fn hints_bar(vm: &ViewModel, no_color: bool) -> Line<'static> {
         spans.push(key);
         spans.push(tail);
     }
+    spans.push(dim("  ]"));
+    Line::from(spans).alignment(Alignment::Center)
+}
+
+fn history_hints_bar(no_color: bool) -> Line<'static> {
+    let (key_style, label_style) = if no_color {
+        let d = Style::default().add_modifier(Modifier::DIM);
+        (d, d)
+    } else {
+        (
+            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(12);
+    spans.push(dim("[  "));
+    // `Esc · back` — раздельные spans (мульти-символьная клавиша).
+    spans.push(Span::styled("Esc", key_style));
+    spans.push(Span::styled(" · ", label_style));
+    spans.push(Span::styled("back", label_style));
+
+    spans.push(dim("  |  "));
+    let [k_d, t_d] = word_with_key("delete", no_color);
+    spans.push(k_d);
+    spans.push(t_d);
+
+    spans.push(dim("  |  "));
+    let [k_q, t_q] = word_with_key("quit", no_color);
+    spans.push(k_q);
+    spans.push(t_q);
+
     spans.push(dim("  ]"));
     Line::from(spans).alignment(Alignment::Center)
 }

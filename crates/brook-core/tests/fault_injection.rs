@@ -30,6 +30,7 @@ use brook_core::{
     EngineConfig,
     FileLifecycleEvent,
     FileSpec,
+    FileStatus,
     ManagerConfig,
     RangeGuard,
     RetryPolicy,
@@ -93,12 +94,10 @@ async fn await_terminal(
             Err(_) => panic!("no terminal event within {timeout:?}"),
             Ok(Err(broadcast::error::RecvError::Closed)) => panic!("event channel closed"),
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Ok(ev)) => match &ev {
-                FileLifecycleEvent::Completed { .. } | FileLifecycleEvent::Failed { .. } => {
-                    return ev;
-                }
-                _ => continue,
-            },
+            Ok(Ok(ev)) if matches!(ev.status, FileStatus::Done | FileStatus::Failed) => {
+                return ev;
+            }
+            Ok(Ok(_)) => continue,
         }
     }
 }
@@ -174,7 +173,7 @@ async fn midstream_abort_retries_and_completes() {
 
     let ev = await_terminal(&mut events, Duration::from_secs(5)).await;
     assert!(
-        matches!(ev, FileLifecycleEvent::Completed { .. }),
+        ev.status == FileStatus::Done,
         "expected Completed, got {ev:?}"
     );
 }
@@ -209,7 +208,7 @@ async fn server_500_retries_then_completes() {
 
     let ev = await_terminal(&mut events, Duration::from_secs(5)).await;
     assert!(
-        matches!(ev, FileLifecycleEvent::Completed { .. }),
+        ev.status == FileStatus::Done,
         "expected Completed, got {ev:?}"
     );
 }
@@ -242,7 +241,7 @@ async fn etag_change_fails_download() {
 
     let ev = await_terminal(&mut events, Duration::from_secs(5)).await;
     assert!(
-        matches!(ev, FileLifecycleEvent::Failed { .. }),
+        ev.status == FileStatus::Failed,
         "expected Failed, got {ev:?}"
     );
 }
@@ -275,7 +274,7 @@ async fn no_content_length_uses_full_stream_fallback() {
 
     let ev = await_terminal(&mut events, Duration::from_secs(5)).await;
     assert!(
-        matches!(ev, FileLifecycleEvent::Completed { .. }),
+        ev.status == FileStatus::Done,
         "expected Completed, got {ev:?}"
     );
 }
@@ -350,9 +349,10 @@ async fn peak_rss_under_150mb_10_parallel_engines() {
             panic!("perf test: only {completed}/10 finished before timeout");
         }
         match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Ok(FileLifecycleEvent::Completed { .. })) => completed += 1,
-            Ok(Ok(FileLifecycleEvent::Failed { error, .. })) => {
-                panic!("perf test failure: {error}")
+            Ok(Ok(ev)) if ev.status == FileStatus::Done => completed += 1,
+            Ok(Ok(ev)) if ev.status == FileStatus::Failed => {
+                let err = ev.description.unwrap_or_default();
+                panic!("perf test failure: {err}")
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) => panic!("events channel closed"),

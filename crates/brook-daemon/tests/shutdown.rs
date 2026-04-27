@@ -163,7 +163,8 @@ async fn shutdown_persists_and_restart_resumes() {
         .await
         .expect("add")
         .into_inner()
-        .id
+        .file
+        .and_then(|f| f.id)
         .expect("id");
 
     // Дать engine стартовать. Нам не важно, завершилась ли загрузка —

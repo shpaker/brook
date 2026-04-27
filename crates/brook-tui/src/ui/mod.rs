@@ -1,8 +1,9 @@
 //! Рендер TUI. Одна внешняя rounded-рамка: сверху по центру —
-//! `[ brook | addr ]`; внутри — плоский список карточек; снизу —
-//! `hints_bar` со всеми действиями нормального режима
-//! (`[ add | <primary> | delete | quit ]`) по центру, плюс тост слева,
-//! когда активен. Модалки и overlay'и идут поверх.
+//! `[ brook · addr · <screen> ]`; внутри — плоский список карточек,
+//! содержимое зависит от `vm.screen` (`Main` → recently / `History` →
+//! пагинированный список); снизу — `hints_bar` со всеми действиями
+//! текущего экрана плюс тост слева, когда активен. Модалки и overlay'и
+//! идут поверх.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -16,7 +17,10 @@ use ratatui::widgets::{
     Paragraph,
 };
 
-use crate::model::ViewModel;
+use crate::model::{
+    Screen,
+    ViewModel,
+};
 
 mod card;
 mod chrome;
@@ -64,7 +68,10 @@ pub fn draw(f: &mut Frame, vm: &ViewModel) {
         width: inner.width.saturating_sub(2),
         height: inner.height.saturating_sub(2),
     };
-    list::draw(f, list_area, vm, no_color);
+    match vm.screen {
+        Screen::Main => list::draw_main(f, list_area, vm, no_color),
+        Screen::History => list::draw_history(f, list_area, vm, no_color),
+    }
 
     modal::draw_overlay(f, vm, no_color);
 }

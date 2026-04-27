@@ -3,15 +3,22 @@
 //! Крайний правый столбец области отведён под всегда видимый
 //! скроллбар: даже когда весь список помещается во viewport или
 //! пуст — трек рисуется, чтобы фрейм оставался визуально стабильным.
+//!
+//! `draw_main` / `draw_history` отличаются только источником id'ов и
+//! строкой empty-state. Сама карточка не меняется.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{
+    Alignment,
+    Rect,
+};
 use ratatui::style::{
     Color,
     Modifier,
     Style,
 };
 use ratatui::widgets::{
+    Paragraph,
     Scrollbar,
     ScrollbarOrientation,
     ScrollbarState,
@@ -32,7 +39,51 @@ const SCROLLBAR_GAP: u16 = 2;
 /// сам скроллбар + зазор перед ним.
 const RIGHT_RESERVED: u16 = SCROLLBAR_WIDTH + SCROLLBAR_GAP;
 
-pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
+/// Главный экран — список «recently» (фильтр на сервере). Empty-state
+/// `"No activity in the last 24 hours."` показывается только после
+/// первого ответа `GetRecently`.
+pub fn draw_main(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
+    let ids = vm.visible_ids();
+    let cursor = vm.cursor;
+    let empty_msg = if vm.recently_loaded {
+        Some("No activity in the last 24 hours.")
+    } else {
+        None
+    };
+    draw_list(f, area, vm, &ids, cursor, empty_msg, None, no_color);
+}
+
+/// Экран истории — рендер по `vm.history.ids` (порядок от сервера, без
+/// клиентской пере-сортировки). Empty-state `"History is empty."`. Пока
+/// идёт фоновая подгрузка следующей страницы — внизу `cards_area`
+/// рисуется `loading next page…` тонкой dim-строкой.
+pub fn draw_history(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
+    let ids = vm.history.ids.clone();
+    let cursor = vm.history.cursor;
+    let empty_msg = if vm.history.loading && ids.is_empty() {
+        None
+    } else {
+        Some("History is empty.")
+    };
+    let footer = if vm.history.loading && !ids.is_empty() {
+        Some("loading next page…")
+    } else {
+        None
+    };
+    draw_list(f, area, vm, &ids, cursor, empty_msg, footer, no_color);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_list(
+    f: &mut Frame,
+    area: Rect,
+    vm: &ViewModel,
+    ids: &[String],
+    cursor: usize,
+    empty_msg: Option<&'static str>,
+    footer: Option<&'static str>,
+    no_color: bool,
+) {
     if area.width <= RIGHT_RESERVED {
         return;
     }
@@ -49,18 +100,33 @@ pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
         height: area.height,
     };
 
-    let ids = vm.visible_ids();
-    let viewport_cards = (cards_area.height / CARD_HEIGHT) as usize;
+    // Под `loading next page…` забираем нижнюю строку cards_area, чтобы
+    // не накладываться на последнюю карточку. Если высоты не хватает —
+    // пропускаем footer.
+    let footer_h: u16 = if footer.is_some() && cards_area.height > CARD_HEIGHT {
+        1
+    } else {
+        0
+    };
+    let cards_inner = Rect {
+        height: cards_area.height.saturating_sub(footer_h),
+        ..cards_area
+    };
+
+    let viewport_cards = (cards_inner.height / CARD_HEIGHT) as usize;
 
     let (scroll, total) = if ids.is_empty() || viewport_cards == 0 {
         (0usize, ids.len())
     } else {
-        let cursor = vm.cursor.min(ids.len() - 1);
-        (compute_scroll(cursor, viewport_cards, ids.len()), ids.len())
+        let cursor_clamped = cursor.min(ids.len() - 1);
+        (
+            compute_scroll(cursor_clamped, viewport_cards, ids.len()),
+            ids.len(),
+        )
     };
 
-    if cards_area.height >= CARD_HEIGHT && !ids.is_empty() && viewport_cards > 0 {
-        let cursor = vm.cursor.min(ids.len() - 1);
+    if cards_inner.height >= CARD_HEIGHT && !ids.is_empty() && viewport_cards > 0 {
+        let cursor_clamped = cursor.min(ids.len() - 1);
         for slot in 0..viewport_cards {
             let idx = scroll + slot;
             if idx >= ids.len() {
@@ -70,13 +136,50 @@ pub fn draw(f: &mut Frame, area: Rect, vm: &ViewModel, no_color: bool) {
                 continue;
             };
             let card_area = Rect {
-                x: cards_area.x,
-                y: cards_area.y + slot as u16 * CARD_HEIGHT,
-                width: cards_area.width,
+                x: cards_inner.x,
+                y: cards_inner.y + slot as u16 * CARD_HEIGHT,
+                width: cards_inner.width,
                 height: CARD_HEIGHT,
             };
-            card::draw(f, card_area, row, idx == cursor, no_color);
+            card::draw(f, card_area, row, idx == cursor_clamped, no_color);
         }
+    } else if let Some(msg) = empty_msg
+        && cards_inner.height >= 1
+    {
+        let style = if no_color {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let para = Paragraph::new(msg)
+            .alignment(Alignment::Center)
+            .style(style);
+        let line_y = cards_inner.y + cards_inner.height / 2;
+        let line_area = Rect {
+            x: cards_inner.x,
+            y: line_y,
+            width: cards_inner.width,
+            height: 1,
+        };
+        f.render_widget(para, line_area);
+    }
+
+    if footer_h > 0
+        && let Some(msg) = footer
+    {
+        let style = if no_color {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let para = Paragraph::new(msg).alignment(Alignment::Left).style(style);
+        let footer_area = Rect {
+            x: cards_area.x,
+            y: cards_area.y + cards_area.height - 1,
+            width: cards_area.width,
+            height: 1,
+        };
+        f.render_widget(para, footer_area);
     }
 
     draw_scrollbar(f, scrollbar_area, scroll, viewport_cards, total, no_color);

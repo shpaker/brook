@@ -96,23 +96,32 @@ CREATE TABLE IF NOT EXISTS reason_codes (
 );
 
 CREATE TABLE IF NOT EXISTS files (
-    id             TEXT    PRIMARY KEY,
-    url            TEXT    NOT NULL,
-    target_dir     TEXT    NOT NULL,
-    filename       TEXT,
-    status_id      TEXT    NOT NULL REFERENCES statuses(name)
-                           CHECK (status_id IN
-                               ('pending','running','paused','retrying',
-                                'done','failed','cancelled')),
-    created_at     INTEGER NOT NULL,
+    id               TEXT    PRIMARY KEY,
+    url              TEXT    NOT NULL,
+    target_dir       TEXT    NOT NULL,
+    filename         TEXT,
+    status_id        TEXT    NOT NULL REFERENCES statuses(name)
+                             CHECK (status_id IN
+                                 ('pending','running','paused','retrying',
+                                  'done','failed','cancelled')),
+    created_at       INTEGER NOT NULL,
+    -- High-watermark последней активности по файлу: max(created_at,
+    -- status_changes.created_at, pieces.created_at|finished_at,
+    -- piece_attempts.started_at|finished_at). Поддерживается триггерами
+    -- ниже (trg_bump_activity_*). Используется для GetRecently
+    -- (фильтрация главного экрана TUI по «recently»).
+    last_activity_at INTEGER NOT NULL,
     -- inspect-поля (заполняются позже фабрикой через set_inspect_fields):
-    total_size     INTEGER,
-    piece_size     INTEGER,
-    etag           TEXT,
-    last_modified  TEXT,
-    effective_url  TEXT,
-    accepts_ranges INTEGER
+    total_size       INTEGER,
+    piece_size       INTEGER,
+    etag             TEXT,
+    last_modified    TEXT,
+    effective_url    TEXT,
+    accepts_ranges   INTEGER
 );
+
+CREATE INDEX IF NOT EXISTS idx_files_last_activity
+    ON files (last_activity_at DESC);
 
 CREATE TABLE IF NOT EXISTS status_changes (
     id             TEXT    PRIMARY KEY,
@@ -172,6 +181,46 @@ CREATE INDEX IF NOT EXISTS idx_piece_attempts_piece_time
 
 CREATE INDEX IF NOT EXISTS idx_piece_attempts_worker_time
     ON piece_attempts (worker_id, started_at);
+
+-- Триггеры на bump `files.last_activity_at`. `AND last_activity_at <
+-- NEW.<ts>` гарантирует монотонность watermark'а (не двигаемся назад,
+-- если событие пришло из прошлого).
+CREATE TRIGGER IF NOT EXISTS trg_bump_activity_status_changes
+AFTER INSERT ON status_changes
+BEGIN
+    UPDATE files SET last_activity_at = NEW.created_at
+    WHERE id = NEW.file_id AND last_activity_at < NEW.created_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_bump_activity_piece_insert
+AFTER INSERT ON pieces
+BEGIN
+    UPDATE files SET last_activity_at = NEW.created_at
+    WHERE id = NEW.file_id AND last_activity_at < NEW.created_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_bump_activity_piece_finish
+AFTER UPDATE OF finished_at ON pieces WHEN NEW.finished_at IS NOT NULL
+BEGIN
+    UPDATE files SET last_activity_at = NEW.finished_at
+    WHERE id = NEW.file_id AND last_activity_at < NEW.finished_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_bump_activity_attempt_insert
+AFTER INSERT ON piece_attempts
+BEGIN
+    UPDATE files SET last_activity_at = NEW.started_at
+    WHERE id = (SELECT file_id FROM pieces WHERE id = NEW.piece_id)
+      AND last_activity_at < NEW.started_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_bump_activity_attempt_finish
+AFTER UPDATE OF finished_at ON piece_attempts WHEN NEW.finished_at IS NOT NULL
+BEGIN
+    UPDATE files SET last_activity_at = NEW.finished_at
+    WHERE id = (SELECT file_id FROM pieces WHERE id = NEW.piece_id)
+      AND last_activity_at < NEW.finished_at;
+END;
 ";
 
 /// Единый словарь статусов (natural key). Семь значений — `pending`,
@@ -319,8 +368,9 @@ mod tests {
         let conn = db.inner.lock().unwrap();
 
         conn.execute(
-            "INSERT INTO files (id, url, target_dir, filename, status_id, created_at)
-             VALUES ('f1', 'http://x', '/tmp', 'x.bin', 'pending', 0)",
+            "INSERT INTO files
+                 (id, url, target_dir, filename, status_id, created_at, last_activity_at)
+             VALUES ('f1', 'http://x', '/tmp', 'x.bin', 'pending', 0, 0)",
             [],
         )
         .unwrap();

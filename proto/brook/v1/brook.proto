@@ -17,12 +17,25 @@ service BrookService {
   // Перезапустить упавшую загрузку (Failed → Pending).
   rpc Retry(IdRequest) returns (StatusResponse);
 
-  // Server-streaming: события жизненного цикла по всем файлам (status,
-  // snapshot, completed, failed).
-  rpc WatchFile(WatchFileRequest) returns (stream FileEvent);
+  // Server-streaming: статусные переходы известных файлов. Стартовое
+  // состояние клиент получает через GetRecently/GetFiles, стрим отдаёт
+  // только последующие изменения статуса. На переполнении broadcast-
+  // канала сервер закрывает стрим с Status::DataLoss; клиент по
+  // reconnect-ветке сам переснимает состояние через GetRecently.
+  rpc WatchStatus(WatchStatusRequest) returns (stream StatusEvent);
 
   // Server-streaming: тики прогресса по всем файлам.
   rpc WatchProgress(WatchProgressRequest) returns (stream ProgressTick);
+
+  // Записи с активностью за интервал [since, now]: любые изменения в
+  // самой записи File или в её кусках/попытках. Сортировка по
+  // last_activity_at DESC. Используется главным экраном TUI ("recently").
+  rpc GetRecently(GetRecentlyRequest) returns (GetRecentlyResponse);
+
+  // Пагинированный список всех загрузок (без фильтра по времени).
+  // ORDER BY created_at DESC. Используется экраном "history" с
+  // infinite-scroll.
+  rpc GetFiles(GetFilesRequest) returns (GetFilesResponse);
 
   // Настройки демона — дефолты и политики — для префилла модалок клиента.
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
@@ -78,38 +91,19 @@ message File {
   // Кол-во разных воркеров, реально качавших хотя бы один piece файла.
   // Заполняется только для DONE.
   optional uint32 workers_count = 9;
+  // Итоговый размер в байтах (из inspect). Пусто до завершения
+  // inspect-зонда и в streaming-режиме без Content-Length.
+  optional uint64 total_size = 10;
 }
 
-// Смена статуса файла.
-message StatusChangedEvent {
+// Статусное событие в стриме `WatchStatus`. Несёт переход одного
+// файла в новый статус. `description` — свободный текст; заполняется
+// только при `status = FAILED` (туда уезжает сообщение об ошибке),
+// на остальных переходах пуст.
+message StatusEvent {
   FileId id = 1;
   FileStatus status = 2;
-}
-
-// Файл успешно скачан.
-message CompletedEvent {
-  FileId id = 1;
-}
-
-// Файл окончательно упал.
-message FailedEvent {
-  FileId id = 1;
-  string error = 2;
-}
-
-// Полный снимок — initial-sync для WatchFile и реконсиляция после Lagged.
-message SnapshotEvent {
-  File file = 1;
-}
-
-// Событие жизненного цикла файла. Формы варьируются в `kind`.
-message FileEvent {
-  oneof kind {
-    SnapshotEvent snapshot = 1;
-    StatusChangedEvent status_changed = 2;
-    CompletedEvent completed = 3;
-    FailedEvent failed = 4;
-  }
+  optional string description = 3;
 }
 
 // Тик прогресса по одному файлу.
@@ -133,7 +127,9 @@ message AddRequest {
 }
 
 message AddResponse {
-  FileId id = 1;
+  // Полный снимок созданной записи. Клиент может сразу вставить её в
+  // свой view-model, не дожидаясь дельта-событий из WatchFile.
+  File file = 1;
 }
 
 message RemoveRequest {
@@ -155,12 +151,41 @@ message StatusResponse {
   string message = 2;
 }
 
-// Параметры подписки на события жизненного цикла файлов.
-message WatchFileRequest {
+// Параметры подписки на статусные события.
+message WatchStatusRequest {
 }
 
 // Параметры подписки на прогресс-тики.
 message WatchProgressRequest {
+}
+
+// Запросить записи с активностью за интервал [since, now].
+message GetRecentlyRequest {
+  // Нижняя граница активности (включительно). Клиент обычно выставляет
+  // now - 24h. Поле обязательно.
+  google.protobuf.Timestamp since = 1;
+}
+
+message GetRecentlyResponse {
+  // Сортировка по last_activity_at DESC.
+  repeated File files = 1;
+}
+
+// Пагинированный запрос всех загрузок.
+message GetFilesRequest {
+  // Сколько строк пропустить с начала отсортированного списка.
+  uint32 offset = 1;
+  // Размер страницы. 0 → серверный дефолт (50). Сервер кэпит сверху
+  // (cap 200), чтобы не возвращать произвольно большой ответ.
+  uint32 limit = 2;
+}
+
+message GetFilesResponse {
+  // Сортировка по created_at DESC.
+  repeated File files = 1;
+  // true, если за этой страницей есть ещё записи (сервер вернул ровно
+  // effective_limit). Клиент использует для инфинит-скролла.
+  bool has_more = 2;
 }
 
 message GetSettingsRequest {
@@ -172,8 +197,4 @@ message ShutdownRequest {
 message GetSettingsResponse {
   // Дефолт для префилла Add-модалки.
   string default_dir = 1;
-  reserved 2, 3, 4, 5, 6, 7, 8;
-  reserved "default_workers", "max_workers", "max_concurrent",
-           "piece_target_count", "piece_size_min", "piece_size_max",
-           "on_duplicate_url";
 }

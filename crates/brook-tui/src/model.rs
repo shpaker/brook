@@ -78,6 +78,9 @@ pub struct DownloadRow {
     pub avg_speed_bps: Option<f64>,
     /// Кол-во разных воркеров за время загрузки. Только для `Done`.
     pub workers_count: Option<u32>,
+    /// Итоговый размер файла в байтах (из inspect-полей демона).
+    /// `None` до завершения inspect-зонда и в streaming-режиме.
+    pub total_size: Option<u64>,
 }
 
 impl DownloadRow {
@@ -98,6 +101,7 @@ impl DownloadRow {
             workers: HashMap::new(),
             avg_speed_bps: d.avg_speed_bps,
             workers_count: d.workers_count,
+            total_size: d.total_size,
         }
     }
 
@@ -120,6 +124,31 @@ pub enum ConnectionState {
     Connected,
     Reconnecting { attempt: u32 },
     Disconnected { reason: String },
+}
+
+/// Какой экран сейчас активен. `Mode` (модалки) поверх любого `Screen`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// Главный экран — recently (активность за 24ч).
+    Main,
+    /// Экран «история» — пагинированный список всех загрузок.
+    History,
+}
+
+/// Состояние экрана истории. Порядок строк строго от сервера, никакой
+/// клиентской пере-сортировки. `ids` ссылаются на `vm.downloads` по
+/// строковому id.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryState {
+    pub ids: Vec<String>,
+    pub cursor: usize,
+    pub has_more: bool,
+    /// Идёт ли сейчас фоновый запрос следующей страницы — UI рисует
+    /// `loading next page…` и блокирует повторный запрос.
+    pub loading: bool,
+    /// Сколько записей уже загружено — следующий `GetFiles` идёт с этим
+    /// offset'ом.
+    pub next_offset: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +303,15 @@ pub struct ViewModel {
     pub port: u16,
     pub settings: proto::GetSettingsResponse,
     pub mode: Mode,
+    /// Активный экран. По умолчанию — `Main`.
+    pub screen: Screen,
+    /// Состояние экрана истории.
+    pub history: HistoryState,
+    /// `true` — после первого успешного `GetRecently`. Empty-state
+    /// `"No activity in the last 24 hours."` показывается только когда
+    /// этот флаг `true` и `visible_ids().is_empty()` — иначе мог бы
+    /// мигать в момент между connect'ом и приходом ответа.
+    pub recently_loaded: bool,
     /// Можем ли мы предложить «остановить демон» в `QuitConfirm`.
     /// `true` — только если TUI сам запустил локального демона; для
     /// remote-сессий и случаев, когда демон уже крутился — `false`.
@@ -290,21 +328,37 @@ impl ViewModel {
             port,
             settings,
             mode: Mode::Normal,
+            screen: Screen::Main,
+            history: HistoryState::default(),
+            recently_loaded: false,
             can_stop_daemon,
         }
     }
 
-    /// Применить стримовое событие к модели. Снимки добавляют или
-    /// перезаписывают запись; частные события обновляют подмножество
-    /// полей. Если события приходят для незнакомого id (например,
-    /// Progress до Snapshot), запись молча создаётся из пустого —
-    /// последующий Snapshot её перезальёт.
+    /// Применить стримовое событие к модели.
+    ///
+    /// `Status`-event обновляет статус (и, при FAILED, текст ошибки)
+    /// уже известной записи. Незнакомый id молча игнорируется — стрим
+    /// не создаёт новых строк (это делают только ответы `Add` через
+    /// `CmdOutcome::AddAccepted`); записи от других клиентов появятся
+    /// при следующем `GetRecently`/reconnect.
     pub fn apply_stream(&mut self, ev: crate::events::StreamEvent) {
         use crate::events::StreamEvent as E;
         match ev {
-            E::Snapshot(d) => {
-                let row = DownloadRow::from_snapshot(&d);
-                self.downloads.insert(row.id.clone(), row);
+            E::Status(s) => {
+                let Some(id) = s.id.as_ref() else { return };
+                let Some(row) = self.downloads.get_mut(&id.value) else {
+                    return;
+                };
+                let status =
+                    proto::FileStatus::try_from(s.status).unwrap_or(proto::FileStatus::Unspecified);
+                row.status = status;
+                if matches!(status, proto::FileStatus::Failed) {
+                    row.error = s.description.clone();
+                }
+                if matches!(status, proto::FileStatus::Done | proto::FileStatus::Failed) {
+                    row.workers.clear();
+                }
             }
             E::Progress(tick) => {
                 if let Some(id) = tick.file_id.as_ref()
@@ -313,31 +367,15 @@ impl ViewModel {
                     row.progress = ProgressSnapshot::from_tick(&tick);
                 }
             }
-            E::StatusChanged(id, st) => {
-                if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status =
-                        proto::FileStatus::try_from(st).unwrap_or(proto::FileStatus::Unspecified);
-                }
-            }
-            E::Completed(id) => {
-                if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status = proto::FileStatus::Done;
-                    row.workers.clear();
-                }
-            }
-            E::Failed(id, err) => {
-                if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status = proto::FileStatus::Failed;
-                    row.error = Some(err);
-                    row.workers.clear();
-                }
-            }
         }
     }
 
     pub fn reset(&mut self) {
         self.downloads.clear();
         self.cursor = 0;
+        self.history = HistoryState::default();
+        self.recently_loaded = false;
+        self.screen = Screen::Main;
     }
 
     /// Идентификаторы в отображаемом порядке с учётом сортировки и

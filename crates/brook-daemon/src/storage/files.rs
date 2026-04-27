@@ -177,6 +177,31 @@ impl TQueueStore for SqliteFileRepository {
         async move { run(&db, load_all_impl).await }
     }
 
+    fn get(
+        &self,
+        id: FileId,
+    ) -> impl std::future::Future<Output = CoreResult<Option<File>>> + Send {
+        let db = self.db.clone();
+        async move { run(&db, move |c| get_impl(c, id)).await }
+    }
+
+    fn list_recently(
+        &self,
+        since: SystemTime,
+    ) -> impl std::future::Future<Output = CoreResult<Vec<File>>> + Send {
+        let db = self.db.clone();
+        async move { run(&db, move |c| list_recently_impl(c, since)).await }
+    }
+
+    fn list_paginated(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> impl std::future::Future<Output = CoreResult<Vec<File>>> + Send {
+        let db = self.db.clone();
+        async move { run(&db, move |c| list_paginated_impl(c, offset, limit)).await }
+    }
+
     fn insert(&self, download: &File) -> impl std::future::Future<Output = CoreResult<()>> + Send {
         let db = self.db.clone();
         let d = download.clone();
@@ -229,16 +254,22 @@ fn insert_impl(conn: &mut Connection, d: &File) -> FilesResult<()> {
     // inspect-колонки опускаем — у них нет DEFAULT, поэтому SQLite положит
     // NULL. Маркером «inspect ещё не заполнен» служит `accepts_ranges IS
     // NULL`; до `set_inspect_fields_impl` он именно NULL.
+    //
+    // last_activity_at явно ставим в created_at, чтобы новая строка сразу
+    // была видна в GetRecently без ожидания первого триггер-bump'а от
+    // status_changes (тот тоже сработает в этой же транзакции, но явная
+    // запись надёжнее).
     let res = tx.execute(
         "INSERT INTO files
-           (id, url, target_dir, filename, status_id, created_at)
-         VALUES (?,?,?,?,?,?)",
+           (id, url, target_dir, filename, status_id, created_at, last_activity_at)
+         VALUES (?,?,?,?,?,?,?)",
         params![
             d.id.to_string(),
             d.spec.url,
             target_dir,
             d.spec.filename,
             d.status.as_str(),
+            created_at,
             created_at,
         ],
     );
@@ -313,31 +344,36 @@ fn remove_impl(conn: &mut Connection, id: FileId) -> FilesResult<()> {
     Ok(())
 }
 
-fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
-    // `avg_speed_bps` и `workers_count` агрегируются on-the-fly из
-    // `piece_attempts` (только для status='done', иначе NULL). Альтернатива —
-    // денормализовать в `files`, но данные уже есть в attempt-таблице, и
-    // CASE ниже отдаёт `None` для всех не-done статусов бесплатно.
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at,
-                CASE WHEN f.status_id = 'done' THEN (
-                    SELECT CAST(SUM(pa.bytes) AS REAL)
-                           / NULLIF(SUM(pa.finished_at - pa.started_at), 0)
-                    FROM piece_attempts pa
-                    JOIN pieces p ON p.id = pa.piece_id
-                    WHERE p.file_id = f.id AND pa.status_id = 'done'
-                ) END AS avg_speed_bps,
-                CASE WHEN f.status_id = 'done' THEN (
-                    SELECT COUNT(DISTINCT pa.worker_id)
-                    FROM piece_attempts pa
-                    JOIN pieces p ON p.id = pa.piece_id
-                    WHERE p.file_id = f.id AND pa.status_id = 'done'
-                ) END AS workers_count
-         FROM files f
-         ORDER BY f.created_at",
-    )?;
+/// Базовая часть SELECT'а: колонки `files` + агрегаты для `done`.
+/// `avg_speed_bps` и `workers_count` агрегируются on-the-fly из
+/// `piece_attempts` (только для status='done', иначе NULL). Альтернатива —
+/// денормализовать в `files`, но данные уже есть в attempt-таблице, и
+/// CASE ниже отдаёт `None` для всех не-done статусов бесплатно.
+const FILES_SELECT_BODY: &str = "
+    SELECT f.id, f.url, f.target_dir, f.filename, f.status_id, f.created_at,
+            CASE WHEN f.status_id = 'done' THEN (
+                SELECT CAST(SUM(pa.bytes) AS REAL)
+                       / NULLIF(SUM(pa.finished_at - pa.started_at), 0)
+                FROM piece_attempts pa
+                JOIN pieces p ON p.id = pa.piece_id
+                WHERE p.file_id = f.id AND pa.status_id = 'done'
+            ) END AS avg_speed_bps,
+            CASE WHEN f.status_id = 'done' THEN (
+                SELECT COUNT(DISTINCT pa.worker_id)
+                FROM piece_attempts pa
+                JOIN pieces p ON p.id = pa.piece_id
+                WHERE p.file_id = f.id AND pa.status_id = 'done'
+            ) END AS workers_count,
+            f.total_size
+     FROM files f
+";
+
+fn collect_raw_rows<P: rusqlite::Params>(
+    stmt: &mut rusqlite::Statement<'_>,
+    p: P,
+) -> FilesResult<Vec<RawRow>> {
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(p, |row| {
             Ok(RawRow {
                 id: row.get(0)?,
                 url: row.get(1)?,
@@ -347,14 +383,17 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
                 created_at: row.get::<_, i64>(5)?,
                 avg_speed_bps: row.get::<_, Option<f64>>(6)?,
                 workers_count: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+                total_size: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
 
-    // Второй запрос — последняя строка `status_changes` по каждому файлу.
-    // Нужен, чтобы восстановить `updated_at` и (для failed) `error`.
-    // Для небольшой очереди (единицы-сотни строк) отдельный проход дешевле
-    // жонглирования сложным JOIN'ом с оконной функцией.
+/// Догружает `updated_at` и `error` из `status_changes` для каждого RawRow.
+/// Отдельный проход дешевле, чем сложный JOIN с оконной функцией для
+/// небольшой очереди.
+fn enrich_with_status_changes(conn: &Connection, rows: Vec<RawRow>) -> FilesResult<Vec<File>> {
     let mut last_stmt = conn.prepare(
         "SELECT created_at, reason_message
          FROM status_changes
@@ -375,6 +414,44 @@ fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
         out.push(row_to_download(r, updated_at, last_reason)?);
     }
     Ok(out)
+}
+
+fn load_all_impl(conn: &mut Connection) -> FilesResult<Vec<File>> {
+    let sql = format!("{FILES_SELECT_BODY} ORDER BY f.created_at");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = collect_raw_rows(&mut stmt, [])?;
+    drop(stmt);
+    enrich_with_status_changes(conn, rows)
+}
+
+fn list_recently_impl(conn: &mut Connection, since: SystemTime) -> FilesResult<Vec<File>> {
+    let since_secs = unix_secs(since);
+    let sql = format!(
+        "{FILES_SELECT_BODY} WHERE f.last_activity_at >= ? ORDER BY f.last_activity_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = collect_raw_rows(&mut stmt, params![since_secs])?;
+    drop(stmt);
+    enrich_with_status_changes(conn, rows)
+}
+
+fn list_paginated_impl(conn: &mut Connection, offset: u32, limit: u32) -> FilesResult<Vec<File>> {
+    let limit_i64 = limit as i64;
+    let offset_i64 = offset as i64;
+    let sql = format!("{FILES_SELECT_BODY} ORDER BY f.created_at DESC LIMIT ? OFFSET ?");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = collect_raw_rows(&mut stmt, params![limit_i64, offset_i64])?;
+    drop(stmt);
+    enrich_with_status_changes(conn, rows)
+}
+
+fn get_impl(conn: &mut Connection, id: FileId) -> FilesResult<Option<File>> {
+    let sql = format!("{FILES_SELECT_BODY} WHERE f.id = ?");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = collect_raw_rows(&mut stmt, params![id.to_string()])?;
+    drop(stmt);
+    let mut files = enrich_with_status_changes(conn, rows)?;
+    Ok(files.pop())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -476,6 +553,8 @@ struct RawRow {
     avg_speed_bps: Option<f64>,
     /// Заполнено только для `done`-файлов (CASE в SELECT).
     workers_count: Option<u32>,
+    /// Из inspect-полей `files.total_size`. До inspect — `None`.
+    total_size: Option<u64>,
 }
 
 fn row_to_download(
@@ -510,6 +589,7 @@ fn row_to_download(
         updated_at: from_unix_secs(updated_at),
         avg_speed_bps: r.avg_speed_bps,
         workers_count: r.workers_count,
+        total_size: r.total_size,
     })
 }
 

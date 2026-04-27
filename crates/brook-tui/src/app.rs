@@ -32,8 +32,10 @@ use crate::events::{
 use crate::model::{
     AddModal,
     ConnectionState,
+    HistoryState,
     Mode,
     RenameModal,
+    Screen,
     ViewModel,
 };
 use crate::{
@@ -141,6 +143,9 @@ fn handle_event(
         UiEvent::StreamConnected => {
             vm.connection = ConnectionState::Connected;
             vm.reset();
+            // Стрим больше не делает initial-sync — стартовое состояние
+            // главного экрана берём через `GetRecently` (последние 24ч).
+            command::refresh_recently(channel.clone(), tx.clone());
         }
         UiEvent::StreamDisconnected(reason) => {
             let next_attempt = match vm.connection {
@@ -156,6 +161,39 @@ fn handle_event(
             };
         }
         UiEvent::CmdResult(o) => handle_cmd_result(vm, o),
+        UiEvent::RecentlyLoaded(rows) => {
+            for row in rows {
+                vm.downloads.insert(row.id.clone(), row);
+            }
+            vm.recently_loaded = true;
+            let visible_len = vm.visible_ids().len();
+            vm.clamp_cursor(visible_len);
+        }
+        UiEvent::HistoryPage {
+            rows,
+            has_more,
+            append,
+        } => {
+            if !append {
+                vm.history.ids.clear();
+                vm.history.cursor = 0;
+                vm.history.next_offset = 0;
+            }
+            let mut added: u32 = 0;
+            for row in rows {
+                let id = row.id.clone();
+                vm.downloads.insert(id.clone(), row);
+                vm.history.ids.push(id);
+                added += 1;
+            }
+            vm.history.has_more = has_more;
+            vm.history.next_offset = vm.history.next_offset.saturating_add(added);
+            vm.history.loading = false;
+            let history_len = vm.history.ids.len();
+            if vm.history.cursor >= history_len {
+                vm.history.cursor = history_len.saturating_sub(1);
+            }
+        }
         UiEvent::Tick => {}
         UiEvent::Quit => return true,
     }
@@ -170,10 +208,15 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
                 vm.mode = Mode::Normal;
             }
         }
-        CmdOutcome::AddAccepted { renamed_to } => {
+        CmdOutcome::AddAccepted { row, renamed_to } => {
             if matches!(vm.mode, Mode::Add(_) | Mode::RenameOnConflict { .. }) {
                 vm.mode = Mode::Normal;
             }
+            // Вставляем row сразу — клиент видит карточку без задержки
+            // на дельту из стрима. Created-event прилетит следом и
+            // повторит вставку (idempotent upsert).
+            let id = row.id.clone();
+            vm.downloads.insert(id, *row);
             if let Some(name) = renamed_to {
                 vm.set_toast(format!("saved as {name}"));
             }
@@ -227,6 +270,12 @@ fn handle_key(
         return true;
     }
 
+    // Сначала роутим по экрану (History ловит свои клавиши целиком,
+    // если поверх него нет модалки), потом — по модалке.
+    if matches!(vm.mode, Mode::Normal) && matches!(vm.screen, Screen::History) {
+        return handle_key_history(vm, k, channel, tx);
+    }
+
     match &vm.mode {
         Mode::Normal => handle_key_normal(vm, k, channel, tx),
         Mode::Add(_) => {
@@ -269,10 +318,11 @@ fn handle_key_normal(
             vm.mode = Mode::QuitConfirm;
             return false;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        // WASD-движение курсора. Стрелки тоже работают как универсальные.
+        KeyCode::Up | KeyCode::Char('w') => {
             vm.cursor = vm.cursor.saturating_sub(1);
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('s') => {
             vm.cursor = vm.cursor.saturating_add(1);
             vm.clamp_cursor(visible_len);
         }
@@ -293,6 +343,63 @@ fn handle_key_normal(
             let ids = vm.action_targets();
             if !ids.is_empty() {
                 vm.mode = Mode::ConfirmDelete { ids };
+            }
+        }
+        // Перейти на экран «история». Сбрасываем существующее состояние
+        // истории и сразу запрашиваем первую страницу.
+        KeyCode::Char('h') => {
+            vm.screen = Screen::History;
+            vm.history = HistoryState::default();
+            vm.history.loading = true;
+            command::history_load(channel.clone(), tx.clone(), 0);
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Клавиатура экрана истории. Esc — назад на главный, w/s — движение
+/// курсора, q — quit, d — delete (открывает Mode::ConfirmDelete для
+/// записи под курсором). При скролле к концу страницы запускается
+/// фоновая подгрузка следующей.
+fn handle_key_history(
+    vm: &mut ViewModel,
+    k: KeyEvent,
+    channel: &AuthedChannel,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) -> bool {
+    match k.code {
+        KeyCode::Esc => {
+            vm.screen = Screen::Main;
+            return false;
+        }
+        KeyCode::Char('q') => {
+            vm.mode = Mode::QuitConfirm;
+            return false;
+        }
+        KeyCode::Up | KeyCode::Char('w') => {
+            vm.history.cursor = vm.history.cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('s') => {
+            let len = vm.history.ids.len();
+            vm.history.cursor = vm.history.cursor.saturating_add(1);
+            if vm.history.cursor >= len {
+                vm.history.cursor = len.saturating_sub(1);
+            }
+            // Подгружаем следующую страницу, если курсор подошёл к концу
+            // и сервер сказал, что есть ещё.
+            const PREFETCH_TAIL: usize = 5;
+            if vm.history.has_more
+                && !vm.history.loading
+                && vm.history.cursor + PREFETCH_TAIL >= len
+            {
+                vm.history.loading = true;
+                command::history_load(channel.clone(), tx.clone(), vm.history.next_offset);
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(id) = vm.history.ids.get(vm.history.cursor).cloned() {
+                vm.mode = Mode::ConfirmDelete { ids: vec![id] };
             }
         }
         _ => {}

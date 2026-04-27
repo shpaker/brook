@@ -87,7 +87,8 @@ async fn add_pause_remove_roundtrip() {
         .await
         .unwrap()
         .into_inner()
-        .id
+        .file
+        .and_then(|f| f.id)
         .expect("id present");
     let id_str = id.value.clone();
     assert_eq!(h.manager.snapshot().len(), 1);
@@ -125,7 +126,8 @@ async fn pause_and_resume_roundtrip() {
         .await
         .unwrap()
         .into_inner()
-        .id
+        .file
+        .and_then(|f| f.id)
         .unwrap();
     let id_str = id.value.clone();
 
@@ -157,7 +159,8 @@ async fn download_runs_to_completion() {
         .await
         .unwrap()
         .into_inner()
-        .id
+        .file
+        .and_then(|f| f.id)
         .unwrap();
     let final_state = wait_until_terminal(&h, &id.value, Duration::from_secs(5)).await;
     assert_eq!(final_state, FileStatus::Done);
@@ -177,7 +180,8 @@ async fn remove_on_active_cancels_and_succeeds() {
         .await
         .unwrap()
         .into_inner()
-        .id
+        .file
+        .and_then(|f| f.id)
         .unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -212,7 +216,8 @@ async fn retry_requires_failed_state() {
         .await
         .unwrap()
         .into_inner()
-        .id
+        .file
+        .and_then(|f| f.id)
         .unwrap();
     // В Pending retry — ошибка precondition.
     let err = h

@@ -120,7 +120,7 @@ async fn bearer_interceptor_enforces_token() {
     //    отрабатывает в момент открытия стрима, до первого tick'а.
     let mut bare = BrookServiceClient::new(channel.clone());
     let err = bare
-        .watch_file(proto::WatchFileRequest {})
+        .watch_status(proto::WatchStatusRequest {})
         .await
         .expect_err("stream must fail without token");
     assert_eq!(err.code(), Code::Unauthenticated);

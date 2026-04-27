@@ -119,31 +119,22 @@ pub(super) async fn run_engine<S, F, WR, AR>(
         Ok(p) => p,
         Err(e) => {
             warn!(%id, error = %e, "failed to read pending pieces");
-            emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(FileLifecycleEvent::Failed {
-                id,
-                error: format!("pending_pieces: {e}"),
-            });
+            emit_failed(&events_tx, id, format!("pending_pieces: {e}"));
             return;
         }
     };
 
-    // Быстрый выход, если качать нечего — сразу финализируем и Completed.
+    // Быстрый выход, если качать нечего — сразу финализируем и Done.
     if pending.is_empty() {
         info!(%id, "no pending pieces — finalizing immediately");
         emit_status(&events_tx, id, FileStatus::Running);
         match storage.finalize().await {
             Ok(()) => {
                 emit_status(&events_tx, id, FileStatus::Done);
-                let _ = events_tx.send(FileLifecycleEvent::Completed { id });
             }
             Err(e) => {
                 warn!(%id, error = %e, "finalize failed");
-                emit_status(&events_tx, id, FileStatus::Failed);
-                let _ = events_tx.send(FileLifecycleEvent::Failed {
-                    id,
-                    error: format!("finalize: {e}"),
-                });
+                emit_failed(&events_tx, id, format!("finalize: {e}"));
             }
         }
         return;
@@ -183,11 +174,7 @@ pub(super) async fn run_engine<S, F, WR, AR>(
         Ok(r) => r,
         Err(e) => {
             warn!(%id, error = %e, "ensure_slots failed");
-            emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(FileLifecycleEvent::Failed {
-                id,
-                error: format!("ensure_slots: {e}"),
-            });
+            emit_failed(&events_tx, id, format!("ensure_slots: {e}"));
             return;
         }
     };
@@ -465,22 +452,16 @@ pub(super) async fn run_engine<S, F, WR, AR>(
                         worker_count as u32,
                     );
                     emit_status(&events_tx, id, FileStatus::Done);
-                    let _ = events_tx.send(FileLifecycleEvent::Completed { id });
                 }
                 Err(e) => {
                     warn!(%id, error = %e, "finalize failed");
-                    emit_status(&events_tx, id, FileStatus::Failed);
-                    let _ = events_tx.send(FileLifecycleEvent::Failed {
-                        id,
-                        error: format!("finalize: {e}"),
-                    });
+                    emit_failed(&events_tx, id, format!("finalize: {e}"));
                 }
             }
         }
         Outcome::Failed(err) => {
             warn!(%id, error = %err, "download failed");
-            emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(FileLifecycleEvent::Failed { id, error: err });
+            emit_failed(&events_tx, id, err);
         }
         Outcome::Cancelled => {
             info!(%id, "download cancelled — aborting storage");
@@ -495,7 +476,15 @@ pub(super) fn emit_status(
     id: FileId,
     status: FileStatus,
 ) {
-    let _ = tx.send(FileLifecycleEvent::StatusChanged { id, status });
+    let _ = tx.send(FileLifecycleEvent::status(id, status));
+}
+
+pub(super) fn emit_failed(
+    tx: &broadcast::Sender<FileLifecycleEvent>,
+    id: FileId,
+    error: impl Into<String>,
+) {
+    let _ = tx.send(FileLifecycleEvent::failed(id, error));
 }
 
 #[allow(clippy::too_many_arguments)]

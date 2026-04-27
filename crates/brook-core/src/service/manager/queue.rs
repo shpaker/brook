@@ -84,10 +84,10 @@ where
                     .queue
                     .update_status(id, FileStatus::Failed, Some(reason))
                     .await;
-                let _ = self.shared.lifecycle_tx.send(FileLifecycleEvent::Failed {
-                    id,
-                    error: e.to_string(),
-                });
+                let _ = self
+                    .shared
+                    .lifecycle_tx
+                    .send(FileLifecycleEvent::failed(id, e.to_string()));
             }
         }
     }

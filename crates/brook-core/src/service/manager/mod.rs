@@ -253,11 +253,30 @@ where
         self.shared.progress_tx.subscribe()
     }
 
-    /// Срез всех известных менеджеру загрузок — для Snapshot-реконсиляции
-    /// в `Watch`.
+    /// Срез всех известных менеджеру загрузок (read-only).
     pub fn snapshot(&self) -> Vec<File> {
         let inner = self.shared.inner.lock().expect("mutex poisoned");
         inner.records.values().cloned().collect()
+    }
+
+    /// Одна запись по id из in-memory кэша. Нужно API-handler'у `Add`,
+    /// чтобы вернуть свежий `File` сразу после persist'а — без лишнего
+    /// похода в БД.
+    pub fn get_file(&self, id: &FileId) -> Option<File> {
+        let inner = self.shared.inner.lock().expect("mutex poisoned");
+        inner.records.get(id).cloned()
+    }
+
+    /// Файлы с активностью >= `since`. Источник — репо
+    /// (`TQueueStore::list_recently`), потому что `last_activity_at`
+    /// поддерживается триггерами в БД и in-memory не дублируется.
+    pub async fn list_recently(&self, since: SystemTime) -> Result<Vec<File>> {
+        self.shared.queue.list_recently(since).await
+    }
+
+    /// Пагинированный список всех файлов (`TQueueStore::list_paginated`).
+    pub async fn list_files(&self, offset: u32, limit: u32) -> Result<Vec<File>> {
+        self.shared.queue.list_paginated(offset, limit).await
     }
 
     /// Загрузить очередь из `TQueueStore` и запустить продвижение.
@@ -321,18 +340,22 @@ where
             }
         };
         file.spec.filename = Some(filename);
+        // После inspect демон уже знает `total_size`. Перечитываем
+        // одну строку из БД, чтобы AddResponse сразу нёс полный размер
+        // (иначе клиент рисует «—» до первого progress-tick).
+        if let Ok(Some(persisted)) = self.shared.queue.get(id).await {
+            file.total_size = persisted.total_size;
+        }
 
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-            inner.records.insert(id, file.clone());
+            inner.records.insert(id, file);
             inner.waiting.push_back(id);
         }
-        // Уведомляем подписчиков WatchFile о новой записи до того, как
-        // движок начнёт слать `StatusChanged`: у клиента этого id ещё
-        // нет, и событие без предшествующего `Snapshot` было бы выброшено.
-        let _ = self.shared.lifecycle_tx.send(FileLifecycleEvent::Snapshot {
-            file: Box::new(file),
-        });
+        // WatchStatus отдаёт только статусные переходы. Создающая
+        // сторона видит новую запись через `AddResponse.file`; других
+        // клиентов о новой записи в стриме не уведомляем — они узнают
+        // о ней через следующий `GetRecently`/reconnect.
         self.try_spawn_next().await;
         Ok(id)
     }
@@ -372,6 +395,10 @@ where
         };
         match self.shared.queue.remove(id).await {
             Ok(()) => Ok(()),
+            // Запись могла быть только в памяти (рассинхрон с БД) или
+            // вообще не существовать — оба случая считаем успехом
+            // (Remove идемпотентен; призраков у наблюдателей лечит
+            // ghost-режим TUI на следующей команде).
             Err(Error::NotFound) if !was_known => Ok(()),
             Err(e) => Err(e),
         }
@@ -403,10 +430,7 @@ where
                 let _ = self
                     .shared
                     .lifecycle_tx
-                    .send(FileLifecycleEvent::StatusChanged {
-                        id,
-                        status: FileStatus::Paused,
-                    });
+                    .send(FileLifecycleEvent::status(id, FileStatus::Paused));
             }
         }
         if let Some(status) = persist {
@@ -438,10 +462,7 @@ where
                 let _ = self
                     .shared
                     .lifecycle_tx
-                    .send(FileLifecycleEvent::StatusChanged {
-                        id,
-                        status: FileStatus::Pending,
-                    });
+                    .send(FileLifecycleEvent::status(id, FileStatus::Pending));
             }
             if !inner.waiting.iter().any(|x| *x == id) {
                 inner.waiting.push_back(id);
@@ -472,10 +493,7 @@ where
             let _ = self
                 .shared
                 .lifecycle_tx
-                .send(FileLifecycleEvent::StatusChanged {
-                    id,
-                    status: FileStatus::Cancelled,
-                });
+                .send(FileLifecycleEvent::status(id, FileStatus::Cancelled));
             true
         };
         if should_persist {
@@ -569,10 +587,7 @@ where
             let _ = self
                 .shared
                 .lifecycle_tx
-                .send(FileLifecycleEvent::StatusChanged {
-                    id,
-                    status: FileStatus::Pending,
-                });
+                .send(FileLifecycleEvent::status(id, FileStatus::Pending));
         }
         self.shared
             .queue

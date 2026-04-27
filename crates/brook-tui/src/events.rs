@@ -12,16 +12,22 @@ use crossterm::event::{
     MouseEvent,
 };
 
-/// Обёртки над proto-событиями из `WatchFile` / `WatchProgress`-стримов.
+use crate::model::DownloadRow;
+
+/// Обёртки над proto-событиями из `WatchStatus` / `WatchProgress`-стримов.
 /// Держим сырой proto, потому что §6.2 целиком живёт на нём, а свой
 /// доменный тип породил бы лишний слой перевода без пользы.
+///
+/// `WatchStatus` — это flat-стрим статусных переходов. Стартовое
+/// состояние клиент берёт через RPC `GetRecently`/`GetFiles`.
+/// Создание новых записей и физическое удаление через стрим не
+/// приходят: создающая сторона видит результат через `AddResponse.file`,
+/// удалившая — через ответ `Remove`. Призраки у наблюдателей лечит
+/// ghost-режим TUI.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    Snapshot(proto::File),
+    Status(proto::StatusEvent),
     Progress(proto::ProgressTick),
-    StatusChanged(proto::FileId, i32),
-    Completed(proto::FileId),
-    Failed(proto::FileId, String),
 }
 
 #[derive(Debug)]
@@ -40,6 +46,16 @@ pub enum UiEvent {
     Tick,
     /// Результат команды, запущенной с UI. Передаёт ok/err-контекст.
     CmdResult(CmdOutcome),
+    /// Ответ на `GetRecently` для главного экрана.
+    RecentlyLoaded(Vec<DownloadRow>),
+    /// Очередная страница `GetFiles` для экрана истории. `append=true` —
+    /// дописать к концу `history.ids` (infinite-scroll), `false` — заменить
+    /// (первый запрос).
+    HistoryPage {
+        rows: Vec<DownloadRow>,
+        has_more: bool,
+        append: bool,
+    },
     /// Внешний сигнал (SIGTERM/SIGINT из `tokio::signal`): чисто
     /// завершаем цикл.
     Quit,
@@ -52,10 +68,15 @@ pub enum CmdOutcome {
     Ok,
     /// Ошибка — показываем toast'ом.
     Error(String),
-    /// Сервер успешно принял `Add`. Если клиент переименовал файл
-    /// после конфликта (`AlreadyExists`), в `renamed_to` — финальное имя
-    /// для toast'а «Saved as …».
-    AddAccepted { renamed_to: Option<String> },
+    /// Сервер успешно принял `Add`. `row` — свежий снимок созданной
+    /// записи (из ответа `AddResponse`); UI вставляет его в model сразу,
+    /// не дожидаясь `Created`-события из стрима. Если клиент переименовал
+    /// файл после конфликта (`AlreadyExists`), в `renamed_to` — финальное
+    /// имя для toast'а «Saved as …».
+    AddAccepted {
+        row: Box<DownloadRow>,
+        renamed_to: Option<String>,
+    },
     /// Демон вернул `AlreadyExists`: в `target_dir` уже лежит файл
     /// `base_name`. UI открывает rename-модалку с префиллом
     /// `<base_name> (1)` (по конвенции Windows/Finder — перед последней

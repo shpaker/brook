@@ -2,11 +2,15 @@
 //! Каждая команда крутится в `tokio::spawn`, результат возвращается в UI
 //! как `UiEvent::CmdResult` — ошибки показываются toast'ом.
 
+use std::time::SystemTime;
+
 use brook_proto::brook::v1::brook_service_client::BrookServiceClient;
 use brook_proto::brook::v1::{
     AddRequest,
     FileId,
     FileSpec,
+    GetFilesRequest,
+    GetRecentlyRequest,
     IdRequest,
     RemoveRequest,
     ShutdownRequest,
@@ -23,6 +27,7 @@ use crate::events::{
     CmdOutcome,
     UiEvent,
 };
+use crate::model::DownloadRow;
 
 fn send(tx: &UnboundedSender<UiEvent>, outcome: CmdOutcome) {
     let _ = tx.send(UiEvent::CmdResult(outcome));
@@ -50,10 +55,20 @@ pub fn add(
             filename: filename.clone(),
         };
         match client.add(AddRequest { spec: Some(spec) }).await {
-            Ok(_) => {
+            Ok(resp) => {
+                let inner = resp.into_inner();
+                let Some(file) = inner.file else {
+                    send(
+                        &tx,
+                        CmdOutcome::Error("daemon returned empty AddResponse.file".into()),
+                    );
+                    return;
+                };
+                let row = Box::new(DownloadRow::from_snapshot(&file));
                 send(
                     &tx,
                     CmdOutcome::AddAccepted {
+                        row,
                         renamed_to: filename,
                     },
                 );
@@ -246,6 +261,82 @@ fn run_bulk(
 
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+/// Загрузить «recently»-список (главный экран). Спавнит unary-RPC
+/// `GetRecently` с `since = now - 24h` и шлёт результат как
+/// `UiEvent::RecentlyLoaded`. На ошибке — toast.
+pub fn refresh_recently(ch: AuthedChannel, tx: UnboundedSender<UiEvent>) {
+    tokio::spawn(async move {
+        let mut client = BrookServiceClient::new(ch);
+        let since = SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
+        let since_proto = systime_to_proto_ts(since);
+        let req = GetRecentlyRequest {
+            since: Some(since_proto),
+        };
+        match client.get_recently(req).await {
+            Ok(resp) => {
+                let rows = resp
+                    .into_inner()
+                    .files
+                    .iter()
+                    .map(DownloadRow::from_snapshot)
+                    .collect();
+                let _ = tx.send(UiEvent::RecentlyLoaded(rows));
+            }
+            Err(st) => {
+                send(
+                    &tx,
+                    CmdOutcome::Error(format!("get_recently failed: {}", st.message())),
+                );
+            }
+        }
+    });
+}
+
+/// Загрузить страницу истории (`GetFiles { offset, limit: 50 }`). Шлёт
+/// `UiEvent::HistoryPage { append: offset > 0 }`. На ошибке — toast.
+pub fn history_load(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, offset: u32) {
+    const PAGE: u32 = 50;
+    tokio::spawn(async move {
+        let mut client = BrookServiceClient::new(ch);
+        let req = GetFilesRequest {
+            offset,
+            limit: PAGE,
+        };
+        match client.get_files(req).await {
+            Ok(resp) => {
+                let inner = resp.into_inner();
+                let has_more = inner.has_more;
+                let rows: Vec<DownloadRow> =
+                    inner.files.iter().map(DownloadRow::from_snapshot).collect();
+                let _ = tx.send(UiEvent::HistoryPage {
+                    rows,
+                    has_more,
+                    append: offset > 0,
+                });
+            }
+            Err(st) => {
+                send(
+                    &tx,
+                    CmdOutcome::Error(format!("get_files failed: {}", st.message())),
+                );
+            }
+        }
+    });
+}
+
+fn systime_to_proto_ts(t: SystemTime) -> prost_types::Timestamp {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => prost_types::Timestamp {
+            seconds: d.as_secs() as i64,
+            nanos: d.subsec_nanos() as i32,
+        },
+        Err(_) => prost_types::Timestamp {
+            seconds: 0,
+            nanos: 0,
+        },
+    }
 }
 
 /// Послать `Shutdown` RPC и по завершении (успех или ошибка) отправить

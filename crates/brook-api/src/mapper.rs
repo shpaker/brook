@@ -104,6 +104,16 @@ pub fn systime_to_proto(t: SystemTime) -> prost_types::Timestamp {
     }
 }
 
+/// `prost_types::Timestamp` → `SystemTime`. `None` → `None`. Отрицательные
+/// `seconds` (timestamp до UNIX-эпохи) клэмпятся до `UNIX_EPOCH`, потому
+/// что `Duration` — unsigned.
+pub fn proto_ts_to_systime(t: Option<&prost_types::Timestamp>) -> Option<SystemTime> {
+    let t = t?;
+    let secs = t.seconds.max(0) as u64;
+    let nanos = t.nanos.max(0) as u32;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
 // ─── File ────────────────────────────────────────────────────────────────
 
 pub fn file_to_proto(d: &File) -> proto::File {
@@ -117,42 +127,17 @@ pub fn file_to_proto(d: &File) -> proto::File {
         updated_at: Some(systime_to_proto(d.updated_at)),
         avg_speed_bps: d.avg_speed_bps,
         workers_count: d.workers_count,
+        total_size: d.total_size,
     }
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────
 
-pub fn lifecycle_event_to_proto(ev: &FileLifecycleEvent) -> proto::FileEvent {
-    use proto::file_event::Kind;
-    let kind = match ev {
-        FileLifecycleEvent::StatusChanged { id, status } => {
-            Kind::StatusChanged(proto::StatusChangedEvent {
-                id: Some(id_to_proto(*id)),
-                status: status_to_proto(*status) as i32,
-            })
-        }
-        FileLifecycleEvent::Completed { id } => Kind::Completed(proto::CompletedEvent {
-            id: Some(id_to_proto(*id)),
-        }),
-        FileLifecycleEvent::Failed { id, error } => Kind::Failed(proto::FailedEvent {
-            id: Some(id_to_proto(*id)),
-            error: error.clone(),
-        }),
-        FileLifecycleEvent::Snapshot { file } => Kind::Snapshot(proto::SnapshotEvent {
-            file: Some(file_to_proto(file)),
-        }),
-    };
-    proto::FileEvent { kind: Some(kind) }
-}
-
-/// Обёртка: синтетический `Snapshot` поверх уже имеющегося `File`.
-/// Используется для initial-stream в `WatchFile` и для реконсиляции при
-/// `broadcast::RecvError::Lagged`.
-pub fn snapshot_event(d: &File) -> proto::FileEvent {
-    proto::FileEvent {
-        kind: Some(proto::file_event::Kind::Snapshot(proto::SnapshotEvent {
-            file: Some(file_to_proto(d)),
-        })),
+pub fn lifecycle_event_to_proto(ev: &FileLifecycleEvent) -> proto::StatusEvent {
+    proto::StatusEvent {
+        id: Some(id_to_proto(ev.id)),
+        status: status_to_proto(ev.status) as i32,
+        description: ev.description.clone(),
     }
 }
 
@@ -293,25 +278,18 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_event_mapper_covers_all_variants() {
+    fn lifecycle_event_maps_status_and_description() {
         let id = FileId::new();
-        let d = File::new(id, CoreSpec::new("https://x", "/tmp"));
-        let variants = [
-            FileLifecycleEvent::StatusChanged {
-                id,
-                status: FileStatus::Paused,
-            },
-            FileLifecycleEvent::Completed { id },
-            FileLifecycleEvent::Failed {
-                id,
-                error: "e".into(),
-            },
-            FileLifecycleEvent::Snapshot { file: Box::new(d) },
-        ];
-        for ev in &variants {
-            let p = lifecycle_event_to_proto(ev);
-            assert!(p.kind.is_some(), "kind must be set for {ev:?}");
-        }
+        // Обычный переход — description пуст.
+        let p = lifecycle_event_to_proto(&FileLifecycleEvent::status(id, FileStatus::Paused));
+        assert_eq!(p.id.as_ref().unwrap().value, id.to_string());
+        assert_eq!(p.status, proto::FileStatus::Paused as i32);
+        assert!(p.description.is_none());
+
+        // Failed несёт текст ошибки в description.
+        let p = lifecycle_event_to_proto(&FileLifecycleEvent::failed(id, "boom"));
+        assert_eq!(p.status, proto::FileStatus::Failed as i32);
+        assert_eq!(p.description.as_deref(), Some("boom"));
     }
 
     #[test]
