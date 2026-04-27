@@ -123,16 +123,13 @@ message RemovedEvent {
 }
 
 // Событие жизненного цикла файла. Формы варьируются в `kind`.
-// Поле 1 (`SnapshotEvent`) удалено — initial-sync больше не делается.
 message FileEvent {
-  reserved 1;
-  reserved "snapshot";
   oneof kind {
+    CreatedEvent created = 1;
     StatusChangedEvent status_changed = 2;
     CompletedEvent completed = 3;
     FailedEvent failed = 4;
-    CreatedEvent created = 5;
-    RemovedEvent removed = 6;
+    RemovedEvent removed = 5;
   }
 }
 
@@ -227,8 +224,4 @@ message ShutdownRequest {
 message GetSettingsResponse {
   // Дефолт для префилла Add-модалки.
   string default_dir = 1;
-  reserved 2, 3, 4, 5, 6, 7, 8;
-  reserved "default_workers", "max_workers", "max_concurrent",
-           "piece_target_count", "piece_size_min", "piece_size_max",
-           "on_duplicate_url";
 }
