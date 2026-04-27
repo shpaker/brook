@@ -24,6 +24,12 @@ pub trait TQueueStore: Send + Sync {
     /// Все файлы из хранилища (при старте демона).
     fn load_all(&self) -> impl Future<Output = Result<Vec<File>>> + Send;
 
+    /// Точечная выборка одного файла по `id`. `Ok(None)` — записи нет;
+    /// `Ok(Some(_))` — запись и сопутствующие производные поля
+    /// (`avg_speed_bps`, `workers_count`, `total_size`, `updated_at`,
+    /// `error`) подняты в read-path репозитория.
+    fn get(&self, id: FileId) -> impl Future<Output = Result<Option<File>>> + Send;
+
     /// Файлы с активностью >= `since` — последний по времени timestamp
     /// любой модификации в самой записи или в её кусках/попытках. Сортировка
     /// `last_activity_at DESC`. Используется для главного экрана TUI

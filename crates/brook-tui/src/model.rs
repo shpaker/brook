@@ -78,6 +78,9 @@ pub struct DownloadRow {
     pub avg_speed_bps: Option<f64>,
     /// Кол-во разных воркеров за время загрузки. Только для `Done`.
     pub workers_count: Option<u32>,
+    /// Итоговый размер файла в байтах (из inspect-полей демона).
+    /// `None` до завершения inspect-зонда и в streaming-режиме.
+    pub total_size: Option<u64>,
 }
 
 impl DownloadRow {
@@ -98,6 +101,7 @@ impl DownloadRow {
             workers: HashMap::new(),
             avg_speed_bps: d.avg_speed_bps,
             workers_count: d.workers_count,
+            total_size: d.total_size,
         }
     }
 

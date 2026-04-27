@@ -91,6 +91,9 @@ message File {
   // Кол-во разных воркеров, реально качавших хотя бы один piece файла.
   // Заполняется только для DONE.
   optional uint32 workers_count = 9;
+  // Итоговый размер в байтах (из inspect). Пусто до завершения
+  // inspect-зонда и в streaming-режиме без Content-Length.
+  optional uint64 total_size = 10;
 }
 
 // Статусное событие в стриме `WatchStatus`. Несёт переход одного

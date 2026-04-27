@@ -34,6 +34,10 @@ pub struct File {
     /// Кол-во разных воркеров, реально качавших хотя бы один piece этого
     /// файла. Заполняется тем же способом и тоже только для `Done`.
     pub workers_count: Option<u32>,
+    /// Итоговый размер файла в байтах. Заполняется демоном после
+    /// inspect-зонда (HEAD к источнику); до inspect — `None`. Для
+    /// streaming-режима без `Content-Length` остаётся `None` навсегда.
+    pub total_size: Option<u64>,
 }
 
 impl File {
@@ -50,6 +54,7 @@ impl File {
             updated_at: now,
             avg_speed_bps: None,
             workers_count: None,
+            total_size: None,
         }
     }
 }
@@ -67,6 +72,7 @@ mod tests {
         assert_eq!(d.status, FileStatus::Pending);
         assert_eq!(d.attempt, 0);
         assert!(d.error.is_none());
+        assert!(d.total_size.is_none());
         assert_eq!(d.created_at, d.updated_at);
     }
 }

@@ -177,6 +177,14 @@ impl TQueueStore for SqliteFileRepository {
         async move { run(&db, load_all_impl).await }
     }
 
+    fn get(
+        &self,
+        id: FileId,
+    ) -> impl std::future::Future<Output = CoreResult<Option<File>>> + Send {
+        let db = self.db.clone();
+        async move { run(&db, move |c| get_impl(c, id)).await }
+    }
+
     fn list_recently(
         &self,
         since: SystemTime,
@@ -355,7 +363,8 @@ const FILES_SELECT_BODY: &str = "
                 FROM piece_attempts pa
                 JOIN pieces p ON p.id = pa.piece_id
                 WHERE p.file_id = f.id AND pa.status_id = 'done'
-            ) END AS workers_count
+            ) END AS workers_count,
+            f.total_size
      FROM files f
 ";
 
@@ -374,6 +383,7 @@ fn collect_raw_rows<P: rusqlite::Params>(
                 created_at: row.get::<_, i64>(5)?,
                 avg_speed_bps: row.get::<_, Option<f64>>(6)?,
                 workers_count: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+                total_size: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -433,6 +443,15 @@ fn list_paginated_impl(conn: &mut Connection, offset: u32, limit: u32) -> FilesR
     let rows = collect_raw_rows(&mut stmt, params![limit_i64, offset_i64])?;
     drop(stmt);
     enrich_with_status_changes(conn, rows)
+}
+
+fn get_impl(conn: &mut Connection, id: FileId) -> FilesResult<Option<File>> {
+    let sql = format!("{FILES_SELECT_BODY} WHERE f.id = ?");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = collect_raw_rows(&mut stmt, params![id.to_string()])?;
+    drop(stmt);
+    let mut files = enrich_with_status_changes(conn, rows)?;
+    Ok(files.pop())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -534,6 +553,8 @@ struct RawRow {
     avg_speed_bps: Option<f64>,
     /// Заполнено только для `done`-файлов (CASE в SELECT).
     workers_count: Option<u32>,
+    /// Из inspect-полей `files.total_size`. До inspect — `None`.
+    total_size: Option<u64>,
 }
 
 fn row_to_download(
@@ -568,6 +589,7 @@ fn row_to_download(
         updated_at: from_unix_secs(updated_at),
         avg_speed_bps: r.avg_speed_bps,
         workers_count: r.workers_count,
+        total_size: r.total_size,
     })
 }
 

@@ -340,6 +340,12 @@ where
             }
         };
         file.spec.filename = Some(filename);
+        // После inspect демон уже знает `total_size`. Перечитываем
+        // одну строку из БД, чтобы AddResponse сразу нёс полный размер
+        // (иначе клиент рисует «—» до первого progress-tick).
+        if let Ok(Some(persisted)) = self.shared.queue.get(id).await {
+            file.total_size = persisted.total_size;
+        }
 
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");

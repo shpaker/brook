@@ -127,6 +127,7 @@ pub fn file_to_proto(d: &File) -> proto::File {
         updated_at: Some(systime_to_proto(d.updated_at)),
         avg_speed_bps: d.avg_speed_bps,
         workers_count: d.workers_count,
+        total_size: d.total_size,
     }
 }
 

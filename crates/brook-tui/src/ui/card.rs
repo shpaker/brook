@@ -98,7 +98,13 @@ fn title_line(
     };
 
     let available = width.saturating_sub(GUTTER) as usize;
-    let show_percent = row.progress.bytes_total > 0 && width >= GUTTER + PERCENT_WIDTH + GAP_MIN;
+    // Для Done процент не показываем — `done` в meta-строке уже значит
+    // 100%, дублировать в имени тавтологично. Это и устраняет визуальное
+    // расхождение с Done-карточками, у которых не было живых progress-
+    // тиков (они и так не показывали процент по `bytes_total > 0`).
+    let show_percent = row.progress.bytes_total > 0
+        && width >= GUTTER + PERCENT_WIDTH + GAP_MIN
+        && row.status != FileStatus::Done;
 
     if !show_percent {
         // Размер неизвестен (streaming без Content-Length, свежий
@@ -228,27 +234,29 @@ fn meta_text(row: &DownloadRow) -> (String, bool) {
         }
         FileStatus::Pending => (format!("queued  ·  {}", url_host(&row.url)), false),
         FileStatus::Done => {
-            // Для стриминга bytes_total = 0 — общий размер известен
-            // только по факту скачивания, берём bytes_done как итог.
-            let final_size = if p.bytes_total > 0 {
-                p.bytes_total
-            } else {
-                p.bytes_done
-            };
-            let size = if final_size > 0 {
-                format::bytes(final_size)
-            } else {
-                "—".into()
-            };
+            // Размер берём из inspect-полей (`row.total_size`) — это
+            // авторитетное значение из БД и оно есть всегда после
+            // inspect-зонда. Если отсутствует (стриминг без
+            // Content-Length) — fallback на progress.bytes_total и
+            // bytes_done на случай если живые тики ещё в памяти.
+            let final_size = row
+                .total_size
+                .filter(|n| *n > 0)
+                .or_else(|| Some(p.bytes_total).filter(|n| *n > 0))
+                .or_else(|| Some(p.bytes_done).filter(|n| *n > 0));
+            let size = final_size.map(format::bytes).unwrap_or_else(|| "—".into());
             // Скорость и кол-во воркеров демон считает on-the-fly из
             // piece_attempts при чтении файла; для свежих/частично
-            // неполных done-файлов могут быть None — рисуем «—».
+            // неполных done-файлов могут быть None или Some(0) — оба
+            // случая трактуем как «нет данных» и рисуем «—», чтобы
+            // карточки Done выглядели одинаково.
             let speed = row
                 .avg_speed_bps
                 .map(format::speed)
                 .unwrap_or_else(|| "—".into());
             let workers = row
                 .workers_count
+                .filter(|n| *n > 0)
                 .map(|n| format!("{n}w"))
                 .unwrap_or_else(|| "—".into());
             (

@@ -55,6 +55,11 @@ impl TQueueStore for MemoryTQueueStore {
         Ok(all)
     }
 
+    async fn get(&self, id: FileId) -> Result<Option<File>> {
+        let inner = self.inner.lock().expect("mutex poisoned");
+        Ok(inner.get(&id).cloned())
+    }
+
     async fn list_recently(&self, since: SystemTime) -> Result<Vec<File>> {
         // В памяти нет колонки `last_activity_at` — приближаем её через
         // `updated_at` (триггеры на pieces/piece_attempts тут не моделируем,
