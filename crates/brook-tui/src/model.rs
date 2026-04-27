@@ -331,24 +331,29 @@ impl ViewModel {
         }
     }
 
-    /// Применить стримовое событие к модели. Дельта-события обновляют
-    /// подмножество полей; для незнакомого id частные события молча
-    /// игнорируются (без `Created` запись считается невалидной).
+    /// Применить стримовое событие к модели.
+    ///
+    /// `Status`-event обновляет статус (и, при FAILED, текст ошибки)
+    /// уже известной записи. Незнакомый id молча игнорируется — стрим
+    /// не создаёт новых строк (это делают только ответы `Add` через
+    /// `CmdOutcome::AddAccepted`); записи от других клиентов появятся
+    /// при следующем `GetRecently`/reconnect.
     pub fn apply_stream(&mut self, ev: crate::events::StreamEvent) {
         use crate::events::StreamEvent as E;
         match ev {
-            E::Created(d) => {
-                let row = DownloadRow::from_snapshot(&d);
-                self.downloads.insert(row.id.clone(), row);
-            }
-            E::Removed(id) => {
-                self.downloads.shift_remove(&id.value);
-                self.history.ids.retain(|x| x != &id.value);
-                let visible_len = self.visible_ids().len();
-                self.clamp_cursor(visible_len);
-                let history_len = self.history.ids.len();
-                if self.history.cursor >= history_len {
-                    self.history.cursor = history_len.saturating_sub(1);
+            E::Status(s) => {
+                let Some(id) = s.id.as_ref() else { return };
+                let Some(row) = self.downloads.get_mut(&id.value) else {
+                    return;
+                };
+                let status =
+                    proto::FileStatus::try_from(s.status).unwrap_or(proto::FileStatus::Unspecified);
+                row.status = status;
+                if matches!(status, proto::FileStatus::Failed) {
+                    row.error = s.description.clone();
+                }
+                if matches!(status, proto::FileStatus::Done | proto::FileStatus::Failed) {
+                    row.workers.clear();
                 }
             }
             E::Progress(tick) => {
@@ -356,25 +361,6 @@ impl ViewModel {
                     && let Some(row) = self.downloads.get_mut(&id.value)
                 {
                     row.progress = ProgressSnapshot::from_tick(&tick);
-                }
-            }
-            E::StatusChanged(id, st) => {
-                if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status =
-                        proto::FileStatus::try_from(st).unwrap_or(proto::FileStatus::Unspecified);
-                }
-            }
-            E::Completed(id) => {
-                if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status = proto::FileStatus::Done;
-                    row.workers.clear();
-                }
-            }
-            E::Failed(id, err) => {
-                if let Some(row) = self.downloads.get_mut(&id.value) {
-                    row.status = proto::FileStatus::Failed;
-                    row.error = Some(err);
-                    row.workers.clear();
                 }
             }
         }

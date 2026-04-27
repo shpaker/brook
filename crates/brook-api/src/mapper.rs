@@ -132,30 +132,12 @@ pub fn file_to_proto(d: &File) -> proto::File {
 
 // ─── Events ──────────────────────────────────────────────────────────────
 
-pub fn lifecycle_event_to_proto(ev: &FileLifecycleEvent) -> proto::FileEvent {
-    use proto::file_event::Kind;
-    let kind = match ev {
-        FileLifecycleEvent::Created { file } => Kind::Created(proto::CreatedEvent {
-            file: Some(file_to_proto(file)),
-        }),
-        FileLifecycleEvent::StatusChanged { id, status } => {
-            Kind::StatusChanged(proto::StatusChangedEvent {
-                id: Some(id_to_proto(*id)),
-                status: status_to_proto(*status) as i32,
-            })
-        }
-        FileLifecycleEvent::Completed { id } => Kind::Completed(proto::CompletedEvent {
-            id: Some(id_to_proto(*id)),
-        }),
-        FileLifecycleEvent::Failed { id, error } => Kind::Failed(proto::FailedEvent {
-            id: Some(id_to_proto(*id)),
-            error: error.clone(),
-        }),
-        FileLifecycleEvent::Removed { id } => Kind::Removed(proto::RemovedEvent {
-            id: Some(id_to_proto(*id)),
-        }),
-    };
-    proto::FileEvent { kind: Some(kind) }
+pub fn lifecycle_event_to_proto(ev: &FileLifecycleEvent) -> proto::StatusEvent {
+    proto::StatusEvent {
+        id: Some(id_to_proto(ev.id)),
+        status: status_to_proto(ev.status) as i32,
+        description: ev.description.clone(),
+    }
 }
 
 pub fn progress_event_to_proto(ev: &ProgressEvent) -> proto::ProgressTick {
@@ -295,28 +277,18 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_event_mapper_covers_all_variants() {
+    fn lifecycle_event_maps_status_and_description() {
         let id = FileId::new();
-        let d = File::new(id, CoreSpec::new("https://x", "/tmp"));
-        let variants = [
-            FileLifecycleEvent::Created {
-                file: Box::new(d.clone()),
-            },
-            FileLifecycleEvent::StatusChanged {
-                id,
-                status: FileStatus::Paused,
-            },
-            FileLifecycleEvent::Completed { id },
-            FileLifecycleEvent::Failed {
-                id,
-                error: "e".into(),
-            },
-            FileLifecycleEvent::Removed { id },
-        ];
-        for ev in &variants {
-            let p = lifecycle_event_to_proto(ev);
-            assert!(p.kind.is_some(), "kind must be set for {ev:?}");
-        }
+        // Обычный переход — description пуст.
+        let p = lifecycle_event_to_proto(&FileLifecycleEvent::status(id, FileStatus::Paused));
+        assert_eq!(p.id.as_ref().unwrap().value, id.to_string());
+        assert_eq!(p.status, proto::FileStatus::Paused as i32);
+        assert!(p.description.is_none());
+
+        // Failed несёт текст ошибки в description.
+        let p = lifecycle_event_to_proto(&FileLifecycleEvent::failed(id, "boom"));
+        assert_eq!(p.status, proto::FileStatus::Failed as i32);
+        assert_eq!(p.description.as_deref(), Some("boom"));
     }
 
     #[test]

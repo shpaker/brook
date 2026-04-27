@@ -36,6 +36,7 @@ use super::supervisor::{
     Outcome,
     RunState,
     SpeedMeter,
+    emit_failed,
     emit_status,
 };
 use crate::domain::{
@@ -83,11 +84,7 @@ pub(super) async fn run_streaming_engine<SS, F, WR, AR>(
         Ok(r) => r,
         Err(e) => {
             warn!(%id, error = %e, "ensure_slots failed");
-            emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(FileLifecycleEvent::Failed {
-                id,
-                error: format!("ensure_slots: {e}"),
-            });
+            let _ = events_tx.send(FileLifecycleEvent::failed(id, format!("ensure_slots: {e}")));
             return;
         }
     };
@@ -253,21 +250,15 @@ pub(super) async fn run_streaming_engine<SS, F, WR, AR>(
                 info!(%id, "streaming download completed");
                 emit_progress_streaming(&progress_tx, id, &bytes_done, &mut speed_meter);
                 emit_status(&events_tx, id, FileStatus::Done);
-                let _ = events_tx.send(FileLifecycleEvent::Completed { id });
             }
             Err(e) => {
                 warn!(%id, error = %e, "streaming finalize failed");
-                emit_status(&events_tx, id, FileStatus::Failed);
-                let _ = events_tx.send(FileLifecycleEvent::Failed {
-                    id,
-                    error: format!("finalize: {e}"),
-                });
+                emit_failed(&events_tx, id, format!("finalize: {e}"));
             }
         },
         Outcome::Failed(err) => {
             warn!(%id, error = %err, "streaming download failed");
-            emit_status(&events_tx, id, FileStatus::Failed);
-            let _ = events_tx.send(FileLifecycleEvent::Failed { id, error: err });
+            emit_failed(&events_tx, id, err);
         }
         Outcome::Cancelled => {
             info!(%id, "streaming download cancelled");

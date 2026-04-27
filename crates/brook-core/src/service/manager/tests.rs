@@ -7,7 +7,6 @@ use super::*;
 use crate::domain::{
     File,
     FileId,
-    FileLifecycleEvent,
     FileSpec,
     FileStatus,
 };
@@ -271,7 +270,7 @@ async fn events_fan_in_delivers_completed() {
     let mut saw_completed = false;
     for _ in 0..400 {
         match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
-            Ok(Ok(FileLifecycleEvent::Completed { id: eid })) if eid == id => {
+            Ok(Ok(ev)) if ev.id == id && matches!(ev.status, FileStatus::Done) => {
                 saw_completed = true;
                 break;
             }

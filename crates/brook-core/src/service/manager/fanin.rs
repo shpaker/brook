@@ -63,39 +63,20 @@ pub(super) async fn fan_in_lifecycle<PF, QS, F, WR, AR>(
         {
             let mut inner = shared.inner.lock().expect("mutex poisoned");
             if let Some(record) = inner.records.get_mut(&id) {
-                match &ev {
-                    FileLifecycleEvent::StatusChanged { status, .. } => {
-                        if record.status != *status {
-                            record.status = *status;
-                            record.updated_at = SystemTime::now();
-                            status_to_persist = Some(*status);
-                        }
-                    }
-                    FileLifecycleEvent::Completed { .. } => {
-                        if record.status != FileStatus::Done {
-                            record.status = FileStatus::Done;
-                            record.updated_at = SystemTime::now();
-                            status_to_persist = Some(FileStatus::Done);
-                        }
-                    }
-                    FileLifecycleEvent::Failed { error, .. } => {
-                        record.status = FileStatus::Failed;
-                        record.error = Some(error.clone());
-                        record.updated_at = SystemTime::now();
-                        status_to_persist = Some(FileStatus::Failed);
-                        // У engine нет типизированного Error — только строка.
-                        // Stage 3+ поднимет ReasonCode в FileLifecycleEvent::Failed;
-                        // пока маппим свободный текст в Unknown и сохраняем его
-                        // в сообщении, чтобы причина не терялась.
-                        reason_to_persist = Some(FailureReason::with_message(
-                            ReasonCode::Unknown,
-                            error.clone(),
-                        ));
-                    }
-                    FileLifecycleEvent::Created { .. } | FileLifecycleEvent::Removed { .. } => {
-                        // Persistence уже выполнена в `add`/`remove` —
-                        // fanin'у тут делать нечего.
-                    }
+                if record.status != ev.status {
+                    record.status = ev.status;
+                    record.updated_at = SystemTime::now();
+                    status_to_persist = Some(ev.status);
+                }
+                if matches!(ev.status, FileStatus::Failed) {
+                    // У engine нет типизированного Error — только строка.
+                    // Stage 3+ поднимет ReasonCode в FileLifecycleEvent;
+                    // пока маппим свободный текст в Unknown и сохраняем его
+                    // в сообщении, чтобы причина не терялась.
+                    let msg = ev.description.clone().unwrap_or_default();
+                    record.error = Some(msg.clone());
+                    status_to_persist = Some(FileStatus::Failed);
+                    reason_to_persist = Some(FailureReason::with_message(ReasonCode::Unknown, msg));
                 }
             }
         }

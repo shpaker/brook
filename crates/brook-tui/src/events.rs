@@ -14,20 +14,20 @@ use crossterm::event::{
 
 use crate::model::DownloadRow;
 
-/// Обёртки над proto-событиями из `WatchFile` / `WatchProgress`-стримов.
+/// Обёртки над proto-событиями из `WatchStatus` / `WatchProgress`-стримов.
 /// Держим сырой proto, потому что §6.2 целиком живёт на нём, а свой
 /// доменный тип породил бы лишний слой перевода без пользы.
 ///
-/// `Snapshot` убран: серверный `WatchFile` теперь чисто дельта-стрим.
-/// Стартовое состояние клиент берёт через RPC `GetRecently`/`GetFiles`.
+/// `WatchStatus` — это flat-стрим статусных переходов. Стартовое
+/// состояние клиент берёт через RPC `GetRecently`/`GetFiles`.
+/// Создание новых записей и физическое удаление через стрим не
+/// приходят: создающая сторона видит результат через `AddResponse.file`,
+/// удалившая — через ответ `Remove`. Призраки у наблюдателей лечит
+/// ghost-режим TUI.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    Created(proto::File),
-    Removed(proto::FileId),
+    Status(proto::StatusEvent),
     Progress(proto::ProgressTick),
-    StatusChanged(proto::FileId, i32),
-    Completed(proto::FileId),
-    Failed(proto::FileId, String),
 }
 
 #[derive(Debug)]

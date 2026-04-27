@@ -343,15 +343,13 @@ where
 
         {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-            inner.records.insert(id, file.clone());
+            inner.records.insert(id, file);
             inner.waiting.push_back(id);
         }
-        // Уведомляем подписчиков WatchFile о новой записи до того, как
-        // движок начнёт слать `StatusChanged`: у клиента этого id ещё
-        // нет, и событие без предшествующего `Created` было бы выброшено.
-        let _ = self.shared.lifecycle_tx.send(FileLifecycleEvent::Created {
-            file: Box::new(file),
-        });
+        // WatchStatus отдаёт только статусные переходы. Создающая
+        // сторона видит новую запись через `AddResponse.file`; других
+        // клиентов о новой записи в стриме не уведомляем — они узнают
+        // о ней через следующий `GetRecently`/reconnect.
         self.try_spawn_next().await;
         Ok(id)
     }
@@ -390,23 +388,12 @@ where
             had_record
         };
         match self.shared.queue.remove(id).await {
-            Ok(()) => {
-                let _ = self
-                    .shared
-                    .lifecycle_tx
-                    .send(FileLifecycleEvent::Removed { id });
-                Ok(())
-            }
-            Err(Error::NotFound) if !was_known => {
-                // Запись была только в памяти (рассинхрон с БД) — всё равно
-                // сообщим клиентам об удалении, чтобы их view-model не
-                // расходился с нашим.
-                let _ = self
-                    .shared
-                    .lifecycle_tx
-                    .send(FileLifecycleEvent::Removed { id });
-                Ok(())
-            }
+            Ok(()) => Ok(()),
+            // Запись могла быть только в памяти (рассинхрон с БД) или
+            // вообще не существовать — оба случая считаем успехом
+            // (Remove идемпотентен; призраков у наблюдателей лечит
+            // ghost-режим TUI на следующей команде).
+            Err(Error::NotFound) if !was_known => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -437,10 +424,7 @@ where
                 let _ = self
                     .shared
                     .lifecycle_tx
-                    .send(FileLifecycleEvent::StatusChanged {
-                        id,
-                        status: FileStatus::Paused,
-                    });
+                    .send(FileLifecycleEvent::status(id, FileStatus::Paused));
             }
         }
         if let Some(status) = persist {
@@ -472,10 +456,7 @@ where
                 let _ = self
                     .shared
                     .lifecycle_tx
-                    .send(FileLifecycleEvent::StatusChanged {
-                        id,
-                        status: FileStatus::Pending,
-                    });
+                    .send(FileLifecycleEvent::status(id, FileStatus::Pending));
             }
             if !inner.waiting.iter().any(|x| *x == id) {
                 inner.waiting.push_back(id);
@@ -506,10 +487,7 @@ where
             let _ = self
                 .shared
                 .lifecycle_tx
-                .send(FileLifecycleEvent::StatusChanged {
-                    id,
-                    status: FileStatus::Cancelled,
-                });
+                .send(FileLifecycleEvent::status(id, FileStatus::Cancelled));
             true
         };
         if should_persist {
@@ -603,10 +581,7 @@ where
             let _ = self
                 .shared
                 .lifecycle_tx
-                .send(FileLifecycleEvent::StatusChanged {
-                    id,
-                    status: FileStatus::Pending,
-                });
+                .send(FileLifecycleEvent::status(id, FileStatus::Pending));
         }
         self.shared
             .queue

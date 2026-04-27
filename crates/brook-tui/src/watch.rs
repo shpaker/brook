@@ -1,20 +1,19 @@
-//! Watch-tasks: две параллельные подписки на `BrookService::WatchFile`
+//! Watch-tasks: две параллельные подписки на `BrookService::WatchStatus`
 //! и `BrookService::WatchProgress`, которые шлют события в UI-mpsc.
 //!
 //! Реконнект — backoff 1s → 2s → 4s → … → 60s. При успешном
-//! подключении `WatchFile`-стрима шлём `UiEvent::StreamConnected` (UI
-//! чистит модель и тут же запрашивает `GetRecently` — стрим больше не
-//! делает initial-sync, отдаёт только дельты). `WatchProgress`
+//! подключении `WatchStatus`-стрима шлём `UiEvent::StreamConnected` (UI
+//! чистит модель и тут же запрашивает `GetRecently` — стрим не делает
+//! initial-sync, отдаёт только статусные переходы). `WatchProgress`
 //! подписывается отдельно, без initial-sync, и молча переподключается
-//! по той же схеме — коннект статус-бара отражает именно `WatchFile`.
+//! по той же схеме — коннект статус-бара отражает именно `WatchStatus`.
 
 use std::time::Duration;
 
 use brook_proto::brook::v1::brook_service_client::BrookServiceClient;
-use brook_proto::brook::v1::file_event::Kind as FileEventKind;
 use brook_proto::brook::v1::{
-    WatchFileRequest,
     WatchProgressRequest,
+    WatchStatusRequest,
 };
 use tokio::sync::mpsc;
 
@@ -32,20 +31,20 @@ pub fn spawn(
     channel: AuthedChannel,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    let file_tx = tx.clone();
-    let file_channel = channel.clone();
-    let file = tokio::spawn(async move { run_file(file_channel, file_tx).await });
+    let status_tx = tx.clone();
+    let status_channel = channel.clone();
+    let status = tokio::spawn(async move { run_status(status_channel, status_tx).await });
     let progress = tokio::spawn(async move { run_progress(channel, tx).await });
-    (file, progress)
+    (status, progress)
 }
 
-async fn run_file(channel: AuthedChannel, tx: mpsc::UnboundedSender<UiEvent>) {
+async fn run_status(channel: AuthedChannel, tx: mpsc::UnboundedSender<UiEvent>) {
     let mut backoff = Duration::from_secs(1);
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
         let mut client = BrookServiceClient::new(channel.clone());
-        match client.watch_file(WatchFileRequest {}).await {
+        match client.watch_status(WatchStatusRequest {}).await {
             Ok(resp) => {
                 attempt = 0;
                 backoff = Duration::from_secs(1);
@@ -56,9 +55,9 @@ async fn run_file(channel: AuthedChannel, tx: mpsc::UnboundedSender<UiEvent>) {
                 loop {
                     match stream.message().await {
                         Ok(Some(ev)) => {
-                            if let Some(kind) = ev.kind
-                                && let Some(ue) = file_event_to_stream(kind)
-                                && tx.send(UiEvent::Stream(Box::new(ue))).is_err()
+                            if tx
+                                .send(UiEvent::Stream(Box::new(StreamEvent::Status(ev))))
+                                .is_err()
                             {
                                 return;
                             }
@@ -105,15 +104,5 @@ async fn run_progress(channel: AuthedChannel, tx: mpsc::UnboundedSender<UiEvent>
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
-    }
-}
-
-fn file_event_to_stream(kind: FileEventKind) -> Option<StreamEvent> {
-    match kind {
-        FileEventKind::Created(ev) => ev.file.map(StreamEvent::Created),
-        FileEventKind::Removed(ev) => ev.id.map(StreamEvent::Removed),
-        FileEventKind::StatusChanged(ev) => Some(StreamEvent::StatusChanged(ev.id?, ev.status)),
-        FileEventKind::Completed(ev) => Some(StreamEvent::Completed(ev.id?)),
-        FileEventKind::Failed(ev) => Some(StreamEvent::Failed(ev.id?, ev.error)),
     }
 }

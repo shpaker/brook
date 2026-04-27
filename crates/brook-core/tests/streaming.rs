@@ -33,13 +33,8 @@ async fn drain_lifecycle(
     let mut out = Vec::new();
     while let Ok(ev) = rx.recv().await {
         let terminal = matches!(
-            ev,
-            FileLifecycleEvent::Completed { .. }
-                | FileLifecycleEvent::Failed { .. }
-                | FileLifecycleEvent::StatusChanged {
-                    status: FileStatus::Cancelled,
-                    ..
-                }
+            ev.status,
+            FileStatus::Done | FileStatus::Failed | FileStatus::Cancelled
         );
         out.push(ev);
         if terminal {
@@ -95,9 +90,7 @@ async fn streaming_happy_path_completes_and_finalizes() {
     assert!(stream.is_finalized());
 
     // В lifecycle-стриме — Completed.
-    let has_completed = events
-        .iter()
-        .any(|e| matches!(e, FileLifecycleEvent::Completed { .. }));
+    let has_completed = events.iter().any(|e| e.status == FileStatus::Done);
     assert!(has_completed, "expected Completed, got {events:?}");
     // В прогресс-тиках — bytes_total = 0 (indeterminate).
     let any_progress_unknown_size = progress_events.iter().any(|e| {

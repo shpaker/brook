@@ -231,13 +231,8 @@ async fn collect_events(
     let mut out = Vec::new();
     while let Ok(ev) = rx.recv().await {
         let terminal = matches!(
-            ev,
-            FileLifecycleEvent::Completed { .. }
-                | FileLifecycleEvent::Failed { .. }
-                | FileLifecycleEvent::StatusChanged {
-                    status: FileStatus::Cancelled,
-                    ..
-                }
+            ev.status,
+            FileStatus::Done | FileStatus::Failed | FileStatus::Cancelled
         );
         out.push(ev);
         if terminal {
@@ -272,11 +267,7 @@ async fn happy_path_range_completes() {
     );
     let events = collect_events(rx).await;
     handle.join.await.unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, FileLifecycleEvent::Completed { .. }))
-    );
+    assert!(events.iter().any(|e| e.status == FileStatus::Done));
     let snap = storage.snapshot();
     assert!(snap.finalized);
     assert_eq!(snap.committed, vec![0, 1, 2]);
@@ -311,11 +302,7 @@ async fn transient_500_is_retried_and_succeeds() {
     );
     let events = collect_events(rx).await;
     handle.join.await.unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, FileLifecycleEvent::Completed { .. }))
-    );
+    assert!(events.iter().any(|e| e.status == FileStatus::Done));
     assert!(storage.snapshot().finalized);
 }
 
@@ -382,14 +369,11 @@ async fn pause_then_resume_emits_states_and_completes() {
     let mut saw_paused = false;
     let mut saw_completed = false;
     while let Ok(ev) = rx.recv().await {
-        match ev {
-            FileLifecycleEvent::StatusChanged {
-                status: FileStatus::Paused,
-                ..
-            } => {
+        match ev.status {
+            FileStatus::Paused => {
                 saw_paused = true;
             }
-            FileLifecycleEvent::Completed { .. } => {
+            FileStatus::Done => {
                 saw_completed = true;
                 break;
             }
@@ -428,13 +412,7 @@ async fn cancel_aborts_storage() {
     assert!(handle.cancel());
     // Dren events.
     while let Ok(ev) = rx.recv().await {
-        if matches!(
-            ev,
-            FileLifecycleEvent::StatusChanged {
-                status: FileStatus::Cancelled,
-                ..
-            }
-        ) {
+        if ev.status == FileStatus::Cancelled {
             break;
         }
     }
@@ -479,8 +457,9 @@ async fn progress_events_throttled_to_interval() {
             }
             l = rx.recv() => {
                 match l {
-                    Ok(FileLifecycleEvent::Completed { .. }) => break,
-                    Ok(FileLifecycleEvent::Failed { .. }) => break,
+                    Ok(ev) if matches!(ev.status, FileStatus::Done | FileStatus::Failed) => {
+                        break;
+                    }
                     Err(_) => break,
                     _ => {}
                 }
@@ -524,11 +503,7 @@ async fn no_range_mode_uses_single_worker_and_completes() {
     );
     let events = collect_events(rx).await;
     handle.join.await.unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, FileLifecycleEvent::Completed { .. }))
-    );
+    assert!(events.iter().any(|e| e.status == FileStatus::Done));
     // Всего один fetch_full вызов (без ретраев).
     assert_eq!(fetch.calls.load(Ordering::Relaxed), 1);
     assert!(storage.snapshot().finalized);
@@ -786,13 +761,7 @@ async fn cancel_marks_workers_cancelled() {
     tokio::time::sleep(Duration::from_millis(15)).await;
     assert!(handle.cancel());
     while let Ok(ev) = rx.recv().await {
-        if matches!(
-            ev,
-            FileLifecycleEvent::StatusChanged {
-                status: FileStatus::Cancelled,
-                ..
-            }
-        ) {
+        if ev.status == FileStatus::Cancelled {
             break;
         }
     }

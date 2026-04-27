@@ -1,9 +1,9 @@
-//! Интеграционный тест: дельта-WatchFile стрим (без initial-sync).
+//! Интеграционный тест: дельта-WatchStatus стрим.
 //!
 //! Стартовое состояние клиент берёт через `GetRecently`/`GetFiles`;
-//! `WatchFile` отдаёт только дельты (`Created`/`StatusChanged`/…) с
-//! момента подписки. На переполнении broadcast-канала сервер закрывает
-//! стрим с `Status::DataLoss`.
+//! `WatchStatus` отдаёт только статусные переходы с момента подписки.
+//! На переполнении broadcast-канала сервер закрывает стрим с
+//! `Status::DataLoss`.
 
 mod common;
 
@@ -22,62 +22,7 @@ fn spec(url: &str) -> proto::FileSpec {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn created_events_delivered_for_new_files() {
-    let mut h = HarnessBuilder::default()
-        .fetch_delay(Duration::from_millis(500))
-        .build()
-        .await;
-
-    // Подписываемся ДО Add, чтобы поймать `Created`-event'ы.
-    let mut stream = h
-        .client
-        .watch_file(proto::WatchFileRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-
-    let id_a = h
-        .client
-        .add(proto::AddRequest {
-            spec: Some(spec("https://t/a")),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .file
-        .and_then(|f| f.id)
-        .unwrap();
-    let id_b = h
-        .client
-        .add(proto::AddRequest {
-            spec: Some(spec("https://t/b")),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .file
-        .and_then(|f| f.id)
-        .unwrap();
-
-    let mut seen = std::collections::HashSet::new();
-    while seen.len() < 2 {
-        let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
-            .await
-            .expect("timeout waiting for Created event")
-            .expect("stream ended")
-            .expect("event ok");
-        if let Some(proto::file_event::Kind::Created(c)) = ev.kind
-            && let Some(id) = c.file.as_ref().and_then(|d| d.id.clone())
-        {
-            seen.insert(id.value);
-        }
-    }
-    assert!(seen.contains(&id_a.value));
-    assert!(seen.contains(&id_b.value));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn watch_forwards_state_changes() {
+async fn watch_status_forwards_pause_event() {
     let mut h = HarnessBuilder::default()
         .fetch_delay(Duration::from_millis(500))
         .build()
@@ -85,7 +30,7 @@ async fn watch_forwards_state_changes() {
 
     let mut stream = h
         .client
-        .watch_file(proto::WatchFileRequest {})
+        .watch_status(proto::WatchStatusRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -109,6 +54,8 @@ async fn watch_forwards_state_changes() {
         .await
         .unwrap();
 
+    // Ожидаем StatusEvent с status=Paused для нашего id. Промежуточные
+    // переходы (Pending/Running) тоже могут прилететь — пропускаем.
     let mut saw_paused = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline && !saw_paused {
@@ -117,14 +64,13 @@ async fn watch_forwards_state_changes() {
             .expect("timeout")
             .expect("stream ended")
             .expect("event ok");
-        if let Some(proto::file_event::Kind::StatusChanged(sc)) = ev.kind
-            && sc.id.as_ref().map(|i| i.value.clone()) == Some(id.value.clone())
-            && sc.status == proto::FileStatus::Paused as i32
+        if ev.id.as_ref().map(|i| i.value.clone()) == Some(id.value.clone())
+            && ev.status == proto::FileStatus::Paused as i32
         {
             saw_paused = true;
         }
     }
-    assert!(saw_paused, "StatusChanged(Paused) not delivered");
+    assert!(saw_paused, "Paused StatusEvent not delivered");
 }
 
 // Lagged-поведение (broadcast переполнился → сервер шлёт `Status::DataLoss`)

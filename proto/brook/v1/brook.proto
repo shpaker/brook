@@ -17,14 +17,12 @@ service BrookService {
   // Перезапустить упавшую загрузку (Failed → Pending).
   rpc Retry(IdRequest) returns (StatusResponse);
 
-  // Server-streaming: дельта-события жизненного цикла по всем файлам
-  // (created, status_changed, completed, failed, removed). Initial-sync
-  // больше не делается — клиент получает starting state через
-  // GetRecently/GetFiles, стрим отдаёт только последующие изменения.
-  // На переполнении broadcast-канала сервер закрывает стрим с
-  // Status::DataLoss; клиент по reconnect-ветке сам переснимает
-  // состояние через GetRecently.
-  rpc WatchFile(WatchFileRequest) returns (stream FileEvent);
+  // Server-streaming: статусные переходы известных файлов. Стартовое
+  // состояние клиент получает через GetRecently/GetFiles, стрим отдаёт
+  // только последующие изменения статуса. На переполнении broadcast-
+  // канала сервер закрывает стрим с Status::DataLoss; клиент по
+  // reconnect-ветке сам переснимает состояние через GetRecently.
+  rpc WatchStatus(WatchStatusRequest) returns (stream StatusEvent);
 
   // Server-streaming: тики прогресса по всем файлам.
   rpc WatchProgress(WatchProgressRequest) returns (stream ProgressTick);
@@ -95,42 +93,14 @@ message File {
   optional uint32 workers_count = 9;
 }
 
-// Смена статуса файла.
-message StatusChangedEvent {
+// Статусное событие в стриме `WatchStatus`. Несёт переход одного
+// файла в новый статус. `description` — свободный текст; заполняется
+// только при `status = FAILED` (туда уезжает сообщение об ошибке),
+// на остальных переходах пуст.
+message StatusEvent {
   FileId id = 1;
   FileStatus status = 2;
-}
-
-// Файл успешно скачан.
-message CompletedEvent {
-  FileId id = 1;
-}
-
-// Файл окончательно упал.
-message FailedEvent {
-  FileId id = 1;
-  string error = 2;
-}
-
-// Запись добавлена.
-message CreatedEvent {
-  File file = 1;
-}
-
-// Запись удалена.
-message RemovedEvent {
-  FileId id = 1;
-}
-
-// Событие жизненного цикла файла. Формы варьируются в `kind`.
-message FileEvent {
-  oneof kind {
-    CreatedEvent created = 1;
-    StatusChangedEvent status_changed = 2;
-    CompletedEvent completed = 3;
-    FailedEvent failed = 4;
-    RemovedEvent removed = 5;
-  }
+  optional string description = 3;
 }
 
 // Тик прогресса по одному файлу.
@@ -178,8 +148,8 @@ message StatusResponse {
   string message = 2;
 }
 
-// Параметры подписки на события жизненного цикла файлов.
-message WatchFileRequest {
+// Параметры подписки на статусные события.
+message WatchStatusRequest {
 }
 
 // Параметры подписки на прогресс-тики.

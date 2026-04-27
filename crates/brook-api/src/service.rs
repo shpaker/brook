@@ -252,16 +252,18 @@ where
         Ok(ok_status())
     }
 
-    type WatchFileStream = Pin<Box<dyn Stream<Item = Result<proto::FileEvent, Status>> + Send>>;
+    type WatchStatusStream = Pin<Box<dyn Stream<Item = Result<proto::StatusEvent, Status>> + Send>>;
 
-    async fn watch_file(
+    async fn watch_status(
         &self,
-        _req: Request<proto::WatchFileRequest>,
-    ) -> Result<Response<Self::WatchFileStream>, Status> {
-        // Initial-sync убран: стартовое состояние клиент берёт через
+        _req: Request<proto::WatchStatusRequest>,
+    ) -> Result<Response<Self::WatchStatusStream>, Status> {
+        // Initial-sync нет: стартовое состояние клиент берёт через
         // GetRecently/GetFiles. Здесь мы сразу подписываемся и форвардим
-        // только дельта-события (Created/StatusChanged/Completed/Failed/
-        // Removed).
+        // статусные переходы. Создание новых записей и физическое
+        // удаление через стрим не уведомляются — соответствующие
+        // клиенты узнают результат через ответы Add/Remove (или через
+        // следующий GetRecently после reconnect).
         let rx = self.manager.subscribe_lifecycle();
 
         let stream = async_stream::try_stream! {
@@ -275,12 +277,8 @@ where
                         yield mapper::lifecycle_event_to_proto(&ev);
                     }
                     Err(BroadcastStreamRecvError::Lagged(n)) => {
-                        // Реконсиляция через стрим (рассылка снапшотов)
-                        // больше не делается — клиент увидит DataLoss и
-                        // перезапросит состояние через GetRecently при
-                        // переподключении WatchFile.
-                        warn!(lagged = n, "watch_file stream lagged; closing with DataLoss");
-                        Err(Status::data_loss("watch_file lagged"))?;
+                        warn!(lagged = n, "watch_status stream lagged; closing with DataLoss");
+                        Err(Status::data_loss("watch_status lagged"))?;
                         unreachable!()
                     }
                 }
