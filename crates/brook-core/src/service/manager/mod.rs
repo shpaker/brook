@@ -253,11 +253,30 @@ where
         self.shared.progress_tx.subscribe()
     }
 
-    /// Срез всех известных менеджеру загрузок — для Snapshot-реконсиляции
-    /// в `Watch`.
+    /// Срез всех известных менеджеру загрузок (read-only).
     pub fn snapshot(&self) -> Vec<File> {
         let inner = self.shared.inner.lock().expect("mutex poisoned");
         inner.records.values().cloned().collect()
+    }
+
+    /// Одна запись по id из in-memory кэша. Нужно API-handler'у `Add`,
+    /// чтобы вернуть свежий `File` сразу после persist'а — без лишнего
+    /// похода в БД.
+    pub fn get_file(&self, id: &FileId) -> Option<File> {
+        let inner = self.shared.inner.lock().expect("mutex poisoned");
+        inner.records.get(id).cloned()
+    }
+
+    /// Файлы с активностью >= `since`. Источник — репо
+    /// (`TQueueStore::list_recently`), потому что `last_activity_at`
+    /// поддерживается триггерами в БД и in-memory не дублируется.
+    pub async fn list_recently(&self, since: SystemTime) -> Result<Vec<File>> {
+        self.shared.queue.list_recently(since).await
+    }
+
+    /// Пагинированный список всех файлов (`TQueueStore::list_paginated`).
+    pub async fn list_files(&self, offset: u32, limit: u32) -> Result<Vec<File>> {
+        self.shared.queue.list_paginated(offset, limit).await
     }
 
     /// Загрузить очередь из `TQueueStore` и запустить продвижение.
@@ -329,8 +348,8 @@ where
         }
         // Уведомляем подписчиков WatchFile о новой записи до того, как
         // движок начнёт слать `StatusChanged`: у клиента этого id ещё
-        // нет, и событие без предшествующего `Snapshot` было бы выброшено.
-        let _ = self.shared.lifecycle_tx.send(FileLifecycleEvent::Snapshot {
+        // нет, и событие без предшествующего `Created` было бы выброшено.
+        let _ = self.shared.lifecycle_tx.send(FileLifecycleEvent::Created {
             file: Box::new(file),
         });
         self.try_spawn_next().await;
@@ -371,8 +390,23 @@ where
             had_record
         };
         match self.shared.queue.remove(id).await {
-            Ok(()) => Ok(()),
-            Err(Error::NotFound) if !was_known => Ok(()),
+            Ok(()) => {
+                let _ = self
+                    .shared
+                    .lifecycle_tx
+                    .send(FileLifecycleEvent::Removed { id });
+                Ok(())
+            }
+            Err(Error::NotFound) if !was_known => {
+                // Запись была только в памяти (рассинхрон с БД) — всё равно
+                // сообщим клиентам об удалении, чтобы их view-model не
+                // расходился с нашим.
+                let _ = self
+                    .shared
+                    .lifecycle_tx
+                    .send(FileLifecycleEvent::Removed { id });
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }

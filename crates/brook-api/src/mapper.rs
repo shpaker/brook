@@ -104,6 +104,16 @@ pub fn systime_to_proto(t: SystemTime) -> prost_types::Timestamp {
     }
 }
 
+/// `prost_types::Timestamp` → `SystemTime`. `None` → `None`. Отрицательные
+/// `seconds` (timestamp до UNIX-эпохи) клэмпятся до `UNIX_EPOCH`, потому
+/// что `Duration` — unsigned.
+pub fn proto_ts_to_systime(t: Option<&prost_types::Timestamp>) -> Option<SystemTime> {
+    let t = t?;
+    let secs = t.seconds.max(0) as u64;
+    let nanos = t.nanos.max(0) as u32;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
 // ─── File ────────────────────────────────────────────────────────────────
 
 pub fn file_to_proto(d: &File) -> proto::File {
@@ -125,6 +135,9 @@ pub fn file_to_proto(d: &File) -> proto::File {
 pub fn lifecycle_event_to_proto(ev: &FileLifecycleEvent) -> proto::FileEvent {
     use proto::file_event::Kind;
     let kind = match ev {
+        FileLifecycleEvent::Created { file } => Kind::Created(proto::CreatedEvent {
+            file: Some(file_to_proto(file)),
+        }),
         FileLifecycleEvent::StatusChanged { id, status } => {
             Kind::StatusChanged(proto::StatusChangedEvent {
                 id: Some(id_to_proto(*id)),
@@ -138,22 +151,11 @@ pub fn lifecycle_event_to_proto(ev: &FileLifecycleEvent) -> proto::FileEvent {
             id: Some(id_to_proto(*id)),
             error: error.clone(),
         }),
-        FileLifecycleEvent::Snapshot { file } => Kind::Snapshot(proto::SnapshotEvent {
-            file: Some(file_to_proto(file)),
+        FileLifecycleEvent::Removed { id } => Kind::Removed(proto::RemovedEvent {
+            id: Some(id_to_proto(*id)),
         }),
     };
     proto::FileEvent { kind: Some(kind) }
-}
-
-/// Обёртка: синтетический `Snapshot` поверх уже имеющегося `File`.
-/// Используется для initial-stream в `WatchFile` и для реконсиляции при
-/// `broadcast::RecvError::Lagged`.
-pub fn snapshot_event(d: &File) -> proto::FileEvent {
-    proto::FileEvent {
-        kind: Some(proto::file_event::Kind::Snapshot(proto::SnapshotEvent {
-            file: Some(file_to_proto(d)),
-        })),
-    }
 }
 
 pub fn progress_event_to_proto(ev: &ProgressEvent) -> proto::ProgressTick {
@@ -297,6 +299,9 @@ mod tests {
         let id = FileId::new();
         let d = File::new(id, CoreSpec::new("https://x", "/tmp"));
         let variants = [
+            FileLifecycleEvent::Created {
+                file: Box::new(d.clone()),
+            },
             FileLifecycleEvent::StatusChanged {
                 id,
                 status: FileStatus::Paused,
@@ -306,7 +311,7 @@ mod tests {
                 id,
                 error: "e".into(),
             },
-            FileLifecycleEvent::Snapshot { file: Box::new(d) },
+            FileLifecycleEvent::Removed { id },
         ];
         for ev in &variants {
             let p = lifecycle_event_to_proto(ev);

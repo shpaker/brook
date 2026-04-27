@@ -10,6 +10,7 @@
 //! [`super::piece_storage`].
 
 use std::future::Future;
+use std::time::SystemTime;
 
 use crate::domain::{
     FailureReason,
@@ -22,6 +23,21 @@ use crate::error::Result;
 pub trait TQueueStore: Send + Sync {
     /// Все файлы из хранилища (при старте демона).
     fn load_all(&self) -> impl Future<Output = Result<Vec<File>>> + Send;
+
+    /// Файлы с активностью >= `since` — последний по времени timestamp
+    /// любой модификации в самой записи или в её кусках/попытках. Сортировка
+    /// `last_activity_at DESC`. Используется для главного экрана TUI
+    /// (`recently`).
+    fn list_recently(&self, since: SystemTime) -> impl Future<Output = Result<Vec<File>>> + Send;
+
+    /// Пагинированный список всех файлов, ORDER BY `created_at DESC`.
+    /// `limit = 0` → реализация сама решит дефолт. Используется экраном
+    /// «История».
+    fn list_paginated(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<File>>> + Send;
 
     /// Вставить новую запись. Ошибка, если `id` уже существует.
     fn insert(&self, file: &File) -> impl Future<Output = Result<()>> + Send;

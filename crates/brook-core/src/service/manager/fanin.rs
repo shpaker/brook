@@ -92,7 +92,10 @@ pub(super) async fn fan_in_lifecycle<PF, QS, F, WR, AR>(
                             error.clone(),
                         ));
                     }
-                    FileLifecycleEvent::Snapshot { .. } => {}
+                    FileLifecycleEvent::Created { .. } | FileLifecycleEvent::Removed { .. } => {
+                        // Persistence уже выполнена в `add`/`remove` —
+                        // fanin'у тут делать нечего.
+                    }
                 }
             }
         }

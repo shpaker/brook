@@ -3,7 +3,8 @@
 //!
 //! Реконнект — backoff 1s → 2s → 4s → … → 60s. При успешном
 //! подключении `WatchFile`-стрима шлём `UiEvent::StreamConnected` (UI
-//! чистит модель и заливается из initial-Snapshot'ов). `WatchProgress`
+//! чистит модель и тут же запрашивает `GetRecently` — стрим больше не
+//! делает initial-sync, отдаёт только дельты). `WatchProgress`
 //! подписывается отдельно, без initial-sync, и молча переподключается
 //! по той же схеме — коннект статус-бара отражает именно `WatchFile`.
 
@@ -109,7 +110,8 @@ async fn run_progress(channel: AuthedChannel, tx: mpsc::UnboundedSender<UiEvent>
 
 fn file_event_to_stream(kind: FileEventKind) -> Option<StreamEvent> {
     match kind {
-        FileEventKind::Snapshot(ev) => ev.file.map(StreamEvent::Snapshot),
+        FileEventKind::Created(ev) => ev.file.map(StreamEvent::Created),
+        FileEventKind::Removed(ev) => ev.id.map(StreamEvent::Removed),
         FileEventKind::StatusChanged(ev) => Some(StreamEvent::StatusChanged(ev.id?, ev.status)),
         FileEventKind::Completed(ev) => Some(StreamEvent::Completed(ev.id?)),
         FileEventKind::Failed(ev) => Some(StreamEvent::Failed(ev.id?, ev.error)),

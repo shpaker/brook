@@ -122,6 +122,31 @@ pub enum ConnectionState {
     Disconnected { reason: String },
 }
 
+/// Какой экран сейчас активен. `Mode` (модалки) поверх любого `Screen`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// Главный экран — recently (активность за 24ч).
+    Main,
+    /// Экран «история» — пагинированный список всех загрузок.
+    History,
+}
+
+/// Состояние экрана истории. Порядок строк строго от сервера, никакой
+/// клиентской пере-сортировки. `ids` ссылаются на `vm.downloads` по
+/// строковому id.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryState {
+    pub ids: Vec<String>,
+    pub cursor: usize,
+    pub has_more: bool,
+    /// Идёт ли сейчас фоновый запрос следующей страницы — UI рисует
+    /// `loading next page…` и блокирует повторный запрос.
+    pub loading: bool,
+    /// Сколько записей уже загружено — следующий `GetFiles` идёт с этим
+    /// offset'ом.
+    pub next_offset: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub message: String,
@@ -274,6 +299,15 @@ pub struct ViewModel {
     pub port: u16,
     pub settings: proto::GetSettingsResponse,
     pub mode: Mode,
+    /// Активный экран. По умолчанию — `Main`.
+    pub screen: Screen,
+    /// Состояние экрана истории.
+    pub history: HistoryState,
+    /// `true` — после первого успешного `GetRecently`. Empty-state
+    /// `"No activity in the last 24 hours."` показывается только когда
+    /// этот флаг `true` и `visible_ids().is_empty()` — иначе мог бы
+    /// мигать в момент между connect'ом и приходом ответа.
+    pub recently_loaded: bool,
     /// Можем ли мы предложить «остановить демон» в `QuitConfirm`.
     /// `true` — только если TUI сам запустил локального демона; для
     /// remote-сессий и случаев, когда демон уже крутился — `false`.
@@ -290,21 +324,32 @@ impl ViewModel {
             port,
             settings,
             mode: Mode::Normal,
+            screen: Screen::Main,
+            history: HistoryState::default(),
+            recently_loaded: false,
             can_stop_daemon,
         }
     }
 
-    /// Применить стримовое событие к модели. Снимки добавляют или
-    /// перезаписывают запись; частные события обновляют подмножество
-    /// полей. Если события приходят для незнакомого id (например,
-    /// Progress до Snapshot), запись молча создаётся из пустого —
-    /// последующий Snapshot её перезальёт.
+    /// Применить стримовое событие к модели. Дельта-события обновляют
+    /// подмножество полей; для незнакомого id частные события молча
+    /// игнорируются (без `Created` запись считается невалидной).
     pub fn apply_stream(&mut self, ev: crate::events::StreamEvent) {
         use crate::events::StreamEvent as E;
         match ev {
-            E::Snapshot(d) => {
+            E::Created(d) => {
                 let row = DownloadRow::from_snapshot(&d);
                 self.downloads.insert(row.id.clone(), row);
+            }
+            E::Removed(id) => {
+                self.downloads.shift_remove(&id.value);
+                self.history.ids.retain(|x| x != &id.value);
+                let visible_len = self.visible_ids().len();
+                self.clamp_cursor(visible_len);
+                let history_len = self.history.ids.len();
+                if self.history.cursor >= history_len {
+                    self.history.cursor = history_len.saturating_sub(1);
+                }
             }
             E::Progress(tick) => {
                 if let Some(id) = tick.file_id.as_ref()
@@ -338,6 +383,9 @@ impl ViewModel {
     pub fn reset(&mut self) {
         self.downloads.clear();
         self.cursor = 0;
+        self.history = HistoryState::default();
+        self.recently_loaded = false;
+        self.screen = Screen::Main;
     }
 
     /// Идентификаторы в отображаемом порядке с учётом сортировки и

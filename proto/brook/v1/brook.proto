@@ -17,12 +17,27 @@ service BrookService {
   // Перезапустить упавшую загрузку (Failed → Pending).
   rpc Retry(IdRequest) returns (StatusResponse);
 
-  // Server-streaming: события жизненного цикла по всем файлам (status,
-  // snapshot, completed, failed).
+  // Server-streaming: дельта-события жизненного цикла по всем файлам
+  // (created, status_changed, completed, failed, removed). Initial-sync
+  // больше не делается — клиент получает starting state через
+  // GetRecently/GetFiles, стрим отдаёт только последующие изменения.
+  // На переполнении broadcast-канала сервер закрывает стрим с
+  // Status::DataLoss; клиент по reconnect-ветке сам переснимает
+  // состояние через GetRecently.
   rpc WatchFile(WatchFileRequest) returns (stream FileEvent);
 
   // Server-streaming: тики прогресса по всем файлам.
   rpc WatchProgress(WatchProgressRequest) returns (stream ProgressTick);
+
+  // Записи с активностью за интервал [since, now]: любые изменения в
+  // самой записи File или в её кусках/попытках. Сортировка по
+  // last_activity_at DESC. Используется главным экраном TUI ("recently").
+  rpc GetRecently(GetRecentlyRequest) returns (GetRecentlyResponse);
+
+  // Пагинированный список всех загрузок (без фильтра по времени).
+  // ORDER BY created_at DESC. Используется экраном "history" с
+  // infinite-scroll.
+  rpc GetFiles(GetFilesRequest) returns (GetFilesResponse);
 
   // Настройки демона — дефолты и политики — для префилла модалок клиента.
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
@@ -97,18 +112,27 @@ message FailedEvent {
   string error = 2;
 }
 
-// Полный снимок — initial-sync для WatchFile и реконсиляция после Lagged.
-message SnapshotEvent {
+// Запись добавлена.
+message CreatedEvent {
   File file = 1;
 }
 
+// Запись удалена.
+message RemovedEvent {
+  FileId id = 1;
+}
+
 // Событие жизненного цикла файла. Формы варьируются в `kind`.
+// Поле 1 (`SnapshotEvent`) удалено — initial-sync больше не делается.
 message FileEvent {
+  reserved 1;
+  reserved "snapshot";
   oneof kind {
-    SnapshotEvent snapshot = 1;
     StatusChangedEvent status_changed = 2;
     CompletedEvent completed = 3;
     FailedEvent failed = 4;
+    CreatedEvent created = 5;
+    RemovedEvent removed = 6;
   }
 }
 
@@ -133,7 +157,9 @@ message AddRequest {
 }
 
 message AddResponse {
-  FileId id = 1;
+  // Полный снимок созданной записи. Клиент может сразу вставить её в
+  // свой view-model, не дожидаясь дельта-событий из WatchFile.
+  File file = 1;
 }
 
 message RemoveRequest {
@@ -161,6 +187,35 @@ message WatchFileRequest {
 
 // Параметры подписки на прогресс-тики.
 message WatchProgressRequest {
+}
+
+// Запросить записи с активностью за интервал [since, now].
+message GetRecentlyRequest {
+  // Нижняя граница активности (включительно). Клиент обычно выставляет
+  // now - 24h. Поле обязательно.
+  google.protobuf.Timestamp since = 1;
+}
+
+message GetRecentlyResponse {
+  // Сортировка по last_activity_at DESC.
+  repeated File files = 1;
+}
+
+// Пагинированный запрос всех загрузок.
+message GetFilesRequest {
+  // Сколько строк пропустить с начала отсортированного списка.
+  uint32 offset = 1;
+  // Размер страницы. 0 → серверный дефолт (50). Сервер кэпит сверху
+  // (cap 200), чтобы не возвращать произвольно большой ответ.
+  uint32 limit = 2;
+}
+
+message GetFilesResponse {
+  // Сортировка по created_at DESC.
+  repeated File files = 1;
+  // true, если за этой страницей есть ещё записи (сервер вернул ровно
+  // effective_limit). Клиент использует для инфинит-скролла.
+  bool has_more = 2;
 }
 
 message GetSettingsRequest {

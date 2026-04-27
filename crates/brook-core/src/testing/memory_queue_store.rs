@@ -55,6 +55,33 @@ impl TQueueStore for MemoryTQueueStore {
         Ok(all)
     }
 
+    async fn list_recently(&self, since: SystemTime) -> Result<Vec<File>> {
+        // В памяти нет колонки `last_activity_at` — приближаем её через
+        // `updated_at` (триггеры на pieces/piece_attempts тут не моделируем,
+        // эта реализация для unit-тестов ядра).
+        let inner = self.inner.lock().expect("mutex poisoned");
+        let mut all: Vec<File> = inner
+            .values()
+            .filter(|d| d.updated_at >= since)
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(all)
+    }
+
+    async fn list_paginated(&self, offset: u32, limit: u32) -> Result<Vec<File>> {
+        let inner = self.inner.lock().expect("mutex poisoned");
+        let mut all: Vec<File> = inner.values().cloned().collect();
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let start = (offset as usize).min(all.len());
+        let end = if limit == 0 {
+            all.len()
+        } else {
+            (start + limit as usize).min(all.len())
+        };
+        Ok(all[start..end].to_vec())
+    }
+
     async fn insert(&self, download: &File) -> Result<()> {
         let mut inner = self.inner.lock().expect("mutex poisoned");
         if inner.contains_key(&download.id) {
