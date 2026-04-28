@@ -130,7 +130,7 @@ pub fn top_brand(vm: &ViewModel) -> Line<'static> {
 pub fn hints_bar(vm: &ViewModel, no_color: bool) -> Line<'static> {
     match vm.screen {
         Screen::Main => main_hints_bar(vm, no_color),
-        Screen::History => history_hints_bar(no_color),
+        Screen::History => history_hints_bar(vm, no_color),
     }
 }
 
@@ -155,7 +155,7 @@ fn main_hints_bar(vm: &ViewModel, no_color: bool) -> Line<'static> {
     Line::from(spans).alignment(Alignment::Center)
 }
 
-fn history_hints_bar(no_color: bool) -> Line<'static> {
+fn history_hints_bar(vm: &ViewModel, no_color: bool) -> Line<'static> {
     let (key_style, label_style) = if no_color {
         let d = Style::default().add_modifier(Modifier::DIM);
         (d, d)
@@ -165,12 +165,30 @@ fn history_hints_bar(no_color: bool) -> Line<'static> {
             Style::default().fg(Color::DarkGray),
         )
     };
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(12);
+    // `retry` показываем, только если строка под курсором — Failed.
+    // На любых других статусах действия нет (история — read-only,
+    // кроме delete и retry).
+    let show_retry = vm
+        .history
+        .ids
+        .get(vm.history.cursor)
+        .and_then(|id| vm.downloads.get(id))
+        .map(|row| row.status == FileStatus::Failed)
+        .unwrap_or(false);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(16);
     spans.push(dim("[  "));
     // `Esc · back` — раздельные spans (мульти-символьная клавиша).
     spans.push(Span::styled("Esc", key_style));
     spans.push(Span::styled(" · ", label_style));
     spans.push(Span::styled("back", label_style));
+
+    if show_retry {
+        spans.push(dim("  |  "));
+        let [k_r, t_r] = word_with_key("retry", no_color);
+        spans.push(k_r);
+        spans.push(t_r);
+    }
 
     spans.push(dim("  |  "));
     let [k_d, t_d] = word_with_key("delete", no_color);

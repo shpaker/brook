@@ -366,14 +366,16 @@ fn handle_key_normal(
 
 /// Клавиатура экрана истории. Esc — назад на главный, w/s — движение
 /// курсора, q — quit, d — delete (открывает Mode::ConfirmDelete для
-/// записи под курсором). При скролле к концу страницы запускается
-/// фоновая подгрузка следующей.
+/// записи под курсором), r — retry для Failed-записи (тот же
+/// ConfirmRetry, что и на главном). При скролле к концу страницы
+/// запускается фоновая подгрузка следующей.
 fn handle_key_history(
     vm: &mut ViewModel,
     k: KeyEvent,
     channel: &AuthedChannel,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
+    use brook_proto::brook::v1::FileStatus as S;
     match k.code {
         KeyCode::Esc => {
             vm.screen = Screen::Main;
@@ -406,6 +408,18 @@ fn handle_key_history(
         KeyCode::Char('d') => {
             if let Some(id) = vm.history.ids.get(vm.history.cursor).cloned() {
                 vm.mode = Mode::ConfirmDelete { ids: vec![id] };
+            }
+        }
+        // `r` в истории — retry для Failed под курсором. Hard-restart
+        // обрабатывается тем же `Mode::ConfirmRetry` → `command::retry`,
+        // что и на главном экране; после успеха `RetryAccepted` дёрнет
+        // `drop_rows`, который чистит и `downloads`, и `history.ids`.
+        KeyCode::Char('r') => {
+            if let Some(id) = vm.history.ids.get(vm.history.cursor).cloned()
+                && let Some(row) = vm.downloads.get(&id)
+                && row.status == S::Failed
+            {
+                vm.mode = Mode::ConfirmRetry { ids: vec![id] };
             }
         }
         _ => {}

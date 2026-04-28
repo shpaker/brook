@@ -412,9 +412,18 @@ impl ViewModel {
     /// Выкинуть строки из ViewModel локально. Нужно, когда удаление
     /// произошло на стороне демона (или по ghost-алерту): демон не
     /// шлёт явного `Removed`-события, и без ручной чистки запись висит.
+    /// Чистим и `downloads`, и `history.ids`, чтобы id не оставался
+    /// «призраком» в истории и не рендерился пустой карточкой.
     pub fn drop_rows(&mut self, ids: &[String]) {
         for id in ids {
             self.downloads.shift_remove(id);
+        }
+        if !ids.is_empty() {
+            self.history.ids.retain(|x| !ids.contains(x));
+            let len = self.history.ids.len();
+            if self.history.cursor >= len {
+                self.history.cursor = len.saturating_sub(1);
+            }
         }
         let visible_len = self.visible_ids().len();
         self.clamp_cursor(visible_len);
