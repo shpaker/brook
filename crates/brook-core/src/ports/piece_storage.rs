@@ -192,4 +192,12 @@ pub trait TPieceStorageFactory: Send + Sync {
         id: FileId,
         spec: &FileSpec,
     ) -> impl Future<Output = Result<PreparedDownload<Self::Storage, Self::StreamStorage>>> + Send;
+
+    /// Удалить рядом-лежащие артефакты загрузки (`.data.brook` и т.п.)
+    /// для пары `(target_dir, filename)` без открытия хранилища.
+    /// Идемпотентно: отсутствие файла — Ok. Вызывается `manager::remove`
+    /// для inactive-записей (Failed/Cancelled/Pending в waiting), чтобы
+    /// частичник не оставался на диске. Для активных engine
+    /// `.data.brook` уже сносит штатный `abort`-путь.
+    fn wipe_artifacts(&self, spec: &FileSpec) -> impl Future<Output = Result<()>> + Send;
 }

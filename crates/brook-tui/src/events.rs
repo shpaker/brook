@@ -91,6 +91,13 @@ pub enum CmdOutcome {
     /// демон отвечает `NotFound`. UI открывает алерт с предложением
     /// пере-загрузить или удалить призрак.
     NotFound { ids: Vec<String> },
+    /// Retry на сервере прошёл (remove + add): старый id уехал, для
+    /// того же `FileSpec` создана новая запись. UI должен выкинуть
+    /// `old_id` и вставить `row` под её новым id.
+    RetryAccepted {
+        old_id: String,
+        row: Box<DownloadRow>,
+    },
 }
 
 /// Форма Add-модалки.

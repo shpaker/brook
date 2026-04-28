@@ -84,6 +84,7 @@ use crate::error::{
 use crate::ports::{
     NoopAttemptRepo,
     NoopWorkerRepo,
+    TFilePresenceCheck,
     TPieceAttemptRepo,
     TPieceStorageFactory,
     TQueueStore,
@@ -164,6 +165,10 @@ where
     pub(super) fetch: Arc<F>,
     pub(super) workers_repo: Arc<WR>,
     pub(super) attempts_repo: Arc<AR>,
+    /// Проверяет, что Done-файл всё ещё лежит на диске. Используется
+    /// `list_recently` / `list_files` для ленивого аудита и переноса
+    /// записи в Failed при удалённом файле.
+    pub(super) file_presence: Arc<dyn TFilePresenceCheck>,
     pub(super) inner: Mutex<Inner>,
     pub(super) lifecycle_tx: broadcast::Sender<FileLifecycleEvent>,
     pub(super) progress_tx: broadcast::Sender<ProgressEvent>,
@@ -189,13 +194,20 @@ where
 {
     /// Собрать менеджер без аналитики воркеров/попыток (no-op репозитории).
     /// Используется в юнит-тестах ядра и in-memory harness'ах.
-    pub fn new(factory: Arc<PF>, queue: Arc<QS>, fetch: Arc<F>, config: ManagerConfig) -> Self {
+    pub fn new(
+        factory: Arc<PF>,
+        queue: Arc<QS>,
+        fetch: Arc<F>,
+        file_presence: Arc<dyn TFilePresenceCheck>,
+        config: ManagerConfig,
+    ) -> Self {
         Self::with_tracking(
             factory,
             queue,
             fetch,
             Arc::new(NoopWorkerRepo),
             Arc::new(NoopAttemptRepo),
+            file_presence,
             config,
         )
     }
@@ -220,6 +232,7 @@ where
         fetch: Arc<F>,
         workers_repo: Arc<WR>,
         attempts_repo: Arc<AR>,
+        file_presence: Arc<dyn TFilePresenceCheck>,
         config: ManagerConfig,
     ) -> Self {
         let (lifecycle_tx, _) = broadcast::channel(config.events_capacity);
@@ -231,6 +244,7 @@ where
                 fetch,
                 workers_repo,
                 attempts_repo,
+                file_presence,
                 inner: Mutex::new(Inner {
                     records: HashMap::new(),
                     engines: HashMap::new(),
@@ -270,13 +284,91 @@ where
     /// Файлы с активностью >= `since`. Источник — репо
     /// (`TQueueStore::list_recently`), потому что `last_activity_at`
     /// поддерживается триггерами в БД и in-memory не дублируется.
+    /// На выходе прогоняется ленивый аудит существования файлов:
+    /// каждая `Done`-запись stat'ается, пропавшие переезжают в
+    /// `Failed`/`FileMissing` (и в БД, и в возвращаемом снимке).
     pub async fn list_recently(&self, since: SystemTime) -> Result<Vec<File>> {
-        self.shared.queue.list_recently(since).await
+        let mut files = self.shared.queue.list_recently(since).await?;
+        self.audit_done_presence(&mut files).await;
+        Ok(files)
     }
 
     /// Пагинированный список всех файлов (`TQueueStore::list_paginated`).
+    /// Аудит существования Done-файлов — как в [`Self::list_recently`].
     pub async fn list_files(&self, offset: u32, limit: u32) -> Result<Vec<File>> {
-        self.shared.queue.list_paginated(offset, limit).await
+        let mut files = self.shared.queue.list_paginated(offset, limit).await?;
+        self.audit_done_presence(&mut files).await;
+        Ok(files)
+    }
+
+    /// Сообщение, которое записываем в `error` (и в `reason_message`
+    /// строки `status_changes`) при переводе пропавшего Done-файла в
+    /// Failed. UI рендерит его в meta-строке карточки.
+    const MISSING_FILE_MSG: &'static str = "file no longer exists on disk";
+
+    /// Прогон по списку: каждый `Done`-файл проверяем на наличие на
+    /// диске и при отсутствии переводим в `Failed` (с `FileMissing`
+    /// reason'ом). Запись в БД, in-memory снимок и возвращаемый
+    /// `files`-вектор синхронно патчатся; broadcast lifecycle-event
+    /// шлётся, чтобы подключённые наблюдатели увидели транзицию без
+    /// нового `GetRecently`.
+    async fn audit_done_presence(&self, files: &mut [File]) {
+        for f in files.iter_mut() {
+            if f.status != FileStatus::Done {
+                continue;
+            }
+            let Some(filename) = f.spec.filename.as_deref() else {
+                // Без resolved-имени проверять нечего; такой Done быть
+                // не должен (resolve обязателен для Add), но защищаемся.
+                continue;
+            };
+            let path = f.spec.target_dir.join(filename);
+            if self.shared.file_presence.exists(&path).await {
+                continue;
+            }
+            self.flip_done_to_failed_missing(f.id).await;
+            f.status = FileStatus::Failed;
+            f.error = Some(Self::MISSING_FILE_MSG.into());
+            f.updated_at = SystemTime::now();
+        }
+    }
+
+    /// Hot-path транзиции «Done → Failed (FileMissing)». Пишем в БД,
+    /// in-memory и broadcast — ровно по тому же шаблону, что и
+    /// engine-driven переходы (см. fanin.rs). Гонки с другим аудитом
+    /// безопасны: `update_status` идемпотентна на уровне SQLite, второй
+    /// проход просто допишет ещё один `status_changes`-row.
+    async fn flip_done_to_failed_missing(&self, id: FileId) {
+        {
+            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+            if let Some(record) = inner.records.get_mut(&id) {
+                // Если кто-то уже перевёл запись (другой аудит, retry)
+                // — не перетираем. Транзиция нужна только из Done.
+                if record.status != FileStatus::Done {
+                    return;
+                }
+                record.status = FileStatus::Failed;
+                record.error = Some(Self::MISSING_FILE_MSG.into());
+                record.updated_at = SystemTime::now();
+            }
+            // Если в in-memory записи нет (бывает: bootstrap ещё не
+            // прогрузился, или запись только что remove'нули) — делаем
+            // только DB-запись, чтобы следующий `GetRecently` уже видел
+            // Failed. Broadcast в этом случае слать некому.
+        }
+        let reason = FailureReason::with_message(ReasonCode::FileMissing, Self::MISSING_FILE_MSG);
+        if let Err(e) = self
+            .shared
+            .queue
+            .update_status(id, FileStatus::Failed, Some(reason))
+            .await
+        {
+            warn!(%id, error = %e, "audit: failed to persist Done→Failed transition");
+        }
+        let _ = self
+            .shared
+            .lifecycle_tx
+            .send(FileLifecycleEvent::failed(id, Self::MISSING_FILE_MSG));
     }
 
     /// Загрузить очередь из `TQueueStore` и запустить продвижение.
@@ -387,13 +479,21 @@ where
                 }
             }
         }
+        // Снимаем spec до выкидывания записи: для inactive id `.data.brook`
+        // никем больше не сносится, и без spec'а его не найти. Активные
+        // engine удаляют свой `.data.brook` сами через `abort` — для них
+        // ниже `wipe_artifacts` будет no-op.
+        let spec = {
+            let inner = self.shared.inner.lock().expect("mutex poisoned");
+            inner.records.get(&id).map(|f| f.spec.clone())
+        };
         let was_known = {
             let mut inner = self.shared.inner.lock().expect("mutex poisoned");
             let had_record = inner.records.remove(&id).is_some();
             inner.waiting.retain(|x| *x != id);
             had_record
         };
-        match self.shared.queue.remove(id).await {
+        let queue_result = match self.shared.queue.remove(id).await {
             Ok(()) => Ok(()),
             // Запись могла быть только в памяти (рассинхрон с БД) или
             // вообще не существовать — оба случая считаем успехом
@@ -401,7 +501,17 @@ where
             // ghost-режим TUI на следующей команде).
             Err(Error::NotFound) if !was_known => Ok(()),
             Err(e) => Err(e),
+        };
+        // Best-effort покос `.data.brook`. Делаем после queue.remove:
+        // если SQL упал, на диске ещё лежит файл, при ретрае Remove
+        // дойдём сюда снова. Ошибки FS логируем и игнорируем — Remove
+        // идемпотентен и не должен падать из-за стейл-файла.
+        if let Some(spec) = spec
+            && let Err(e) = self.shared.factory.wipe_artifacts(&spec).await
+        {
+            warn!(%id, error = %e, "remove: wipe_artifacts failed; ignoring");
         }
+        queue_result
     }
 
     /// Поставить загрузку на паузу.
@@ -568,33 +678,32 @@ where
         }
     }
 
-    /// Перезапустить упавшую загрузку: `Failed` → `Pending`, сбрасываем
-    /// текст ошибки и продвигаем очередь. На не-`Failed` записи — ошибка:
-    /// retry — это явный пользовательский жест после терминального падения.
-    pub async fn retry(&self, id: FileId) -> Result<()> {
-        {
-            let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-            let record = inner.records.get_mut(&id).ok_or(Error::NotFound)?;
+    /// Перезапустить упавшую загрузку. Hard restart: запись со старым
+    /// `id` уходит со всем каскадом (`pieces`, `status_changes`,
+    /// `workers`, `piece_attempts`) и `.data.brook` через
+    /// [`Self::remove`], затем для того же `FileSpec` создаётся новая
+    /// запись через [`Self::add`] — со свежим `FileId`, повторным
+    /// resolve / inspect / новой piece-раскладкой. Возвращает снимок
+    /// созданной записи (по аналогии с `add` → `AddResponse.file`).
+    ///
+    /// На не-`Failed` записи — ошибка: retry это явный пользовательский
+    /// жест после терминального падения, на Running/Done и т.п. он не
+    /// предлагается в UI и не должен срабатывать через API.
+    pub async fn retry(&self, id: FileId) -> Result<File> {
+        let spec = {
+            let inner = self.shared.inner.lock().expect("mutex poisoned");
+            let record = inner.records.get(&id).ok_or(Error::NotFound)?;
             if record.status != FileStatus::Failed {
                 return Err(Error::Other("download is not in failed state".into()));
             }
-            record.status = FileStatus::Pending;
-            record.error = None;
-            record.updated_at = SystemTime::now();
-            if !inner.waiting.iter().any(|x| *x == id) {
-                inner.waiting.push_back(id);
-            }
-            let _ = self
-                .shared
-                .lifecycle_tx
-                .send(FileLifecycleEvent::status(id, FileStatus::Pending));
-        }
-        self.shared
-            .queue
-            .update_status(id, FileStatus::Pending, None)
-            .await?;
-        self.try_spawn_next().await;
-        Ok(())
+            record.spec.clone()
+        };
+        // Каскадный снос старой записи + `.data.brook`.
+        self.remove(id).await?;
+        // Та же дорога, что и при ручном Add: factory.resolve (HEAD),
+        // inspect-поля, новые pieces, push в waiting, try_spawn_next.
+        let new_id = self.add(spec).await?;
+        self.get_file(&new_id).ok_or(Error::NotFound)
     }
 
     /// Возобновить все `Paused`.

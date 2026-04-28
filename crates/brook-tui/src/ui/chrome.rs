@@ -9,8 +9,9 @@
 //!
 //! Низ рамки — хинт-бар со всеми действиями нормального режима. На
 //! главном экране: `[ add | <primary> | delete | history | quit ]`,
-//! `<primary>` зависит от строки под курсором (pause/resume/retry/reveal);
-//! для пустого списка primary и delete пропускаются — `[ add | history |
+//! `<primary>` зависит от строки под курсором (pause/resume/retry);
+//! для Done primary пуст (терминальное состояние без действия), для
+//! пустого списка primary и delete пропускаются — `[ add | history |
 //! quit ]`. На экране истории: `[ Esc · back | delete | quit ]`. Тост
 //! (`toast_line`, align Left) при активном `vm.toast` рисуется на той
 //! же нижней линии слева — ratatui поддерживает несколько titles на
@@ -115,8 +116,8 @@ pub fn top_brand(vm: &ViewModel) -> Line<'static> {
 /// **Main:** `[ add | <primary> | delete | history | quit ]`. `add`,
 /// `history` и `quit` — глобальные клавиши нормального режима, всегда
 /// видимы. `<primary>` выбирается по статусу строки под курсором
-/// (pause/resume/retry/reveal); если её нет или Unspecified — primary
-/// и delete пропускаются.
+/// (pause/resume/retry); для Done primary пуст (терминал без действия);
+/// если строки нет или Unspecified — primary и delete пропускаются.
 ///
 /// **History:** `[ Esc · back | delete | quit ]`. `Esc · back` — мульти-
 /// символьная клавиша, рендерится через раздельные key + " · " + label
@@ -187,8 +188,8 @@ fn history_hints_bar(no_color: bool) -> Line<'static> {
 
 /// Действия для строки под курсором: (primary, secondary).
 ///
-/// Primary зависит от статуса: pause для активных, resume/retry/reveal
-/// для Paused/Failed/Done. Для Cancelled и Unspecified primary пусто.
+/// Primary зависит от статуса: pause для активных, resume для Paused,
+/// retry для Failed. Для Done, Cancelled и Unspecified primary пусто.
 /// Secondary всегда `delete`, кроме Unspecified. Если видимый список
 /// пуст — оба слова пусты.
 fn cursor_actions(vm: &ViewModel) -> (&'static str, &'static str) {
@@ -203,8 +204,7 @@ fn cursor_actions(vm: &ViewModel) -> (&'static str, &'static str) {
         FileStatus::Running | FileStatus::Retrying | FileStatus::Pending => "pause",
         FileStatus::Paused => "resume",
         FileStatus::Failed => "retry",
-        FileStatus::Done => "reveal",
-        FileStatus::Cancelled | FileStatus::Unspecified => "",
+        FileStatus::Done | FileStatus::Cancelled | FileStatus::Unspecified => "",
     };
     let secondary = if matches!(row.status, FileStatus::Unspecified) {
         ""

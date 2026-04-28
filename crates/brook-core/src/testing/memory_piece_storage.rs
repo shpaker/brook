@@ -379,6 +379,11 @@ impl TPieceStorageFactory for MemoryPieceStorageFactory {
             effective_url: None,
         })
     }
+
+    async fn wipe_artifacts(&self, _spec: &FileSpec) -> Result<()> {
+        // In-memory фабрика не держит артефактов на диске; удалять нечего.
+        Ok(())
+    }
 }
 
 #[cfg(test)]

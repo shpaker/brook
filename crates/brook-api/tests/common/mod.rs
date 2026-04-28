@@ -19,6 +19,7 @@ use brook_api::{
     BrookServiceServer,
 };
 use brook_core::testing::{
+    AlwaysPresent,
     MemoryPieceStorageFactory,
     MemoryTQueueStore,
     MockRangeFetch,
@@ -119,7 +120,13 @@ impl HarnessBuilder {
             events_capacity: self.events_capacity,
             engine: fast_engine_config(),
         };
-        let manager = Arc::new(DownloadManager::new(factory, queue, fetch, cfg));
+        let manager = Arc::new(DownloadManager::new(
+            factory,
+            queue,
+            fetch,
+            Arc::new(AlwaysPresent),
+            cfg,
+        ));
         let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel(1);
         let policy: Arc<dyn TPathPolicy> = Arc::new(AllowAnyPath);
         let service = BrookService::new(

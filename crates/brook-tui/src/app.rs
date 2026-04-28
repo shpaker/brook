@@ -256,6 +256,15 @@ fn handle_cmd_result(vm: &mut ViewModel, outcome: CmdOutcome) {
                 vm.set_toast("download not found on daemon");
             }
         }
+        CmdOutcome::RetryAccepted { old_id, row } => {
+            // Hard-restart на сервере: старая запись ушла, появилась
+            // новая под другим id. Симметрично AddAccepted, но
+            // дополнительно выкидываем старый id из ViewModel, чтобы
+            // карточка не задвоилась.
+            vm.drop_rows(&[old_id]);
+            let id = row.id.clone();
+            vm.downloads.insert(id, *row);
+        }
     }
 }
 
@@ -326,14 +335,11 @@ fn handle_key_normal(
             vm.cursor = vm.cursor.saturating_add(1);
             vm.clamp_cursor(visible_len);
         }
-        // `r` — первая буква primary-действий группы
-        // resume/retry/reveal (соответственно Paused/Failed/Done).
+        // `r` — первая буква primary-действий группы resume/retry
+        // (соответственно Paused/Failed). Для Done действия нет.
         KeyCode::Char('r') => r_action_cursor(vm, channel, tx),
         // `p` — первая буква `pause` (Running/Retrying/Pending).
         KeyCode::Char('p') => p_action_cursor(vm, channel, tx),
-        // Enter оставлен как исторический alias reveal'а — no-op для
-        // не-Done, никакой подсказки про него в UI нет.
-        KeyCode::Enter => reveal_cursor(vm),
         KeyCode::Char('a') => {
             let default_dir = vm.settings.default_dir.clone();
             let clipboard_url = command::clipboard_url().unwrap_or_default();
@@ -407,10 +413,10 @@ fn handle_key_history(
     false
 }
 
-/// `r` на курсоре: reveal для Done, resume для Paused, retry (через
-/// ConfirmRetry) для Failed. Для остальных статусов — no-op; на таких
-/// строках в карточке справа показан `pause  delete` (или пусто), так
-/// что `r` там не должна вызывать никаких действий.
+/// `r` на курсоре: resume для Paused, retry (через ConfirmRetry) для
+/// Failed. Для остальных статусов — no-op; на таких строках в карточке
+/// справа показан `pause  delete` (или пусто), так что `r` там не
+/// должна вызывать никаких действий.
 fn r_action_cursor(
     vm: &mut ViewModel,
     channel: &AuthedChannel,
@@ -432,10 +438,7 @@ fn r_action_cursor(
         S::Failed => {
             vm.mode = Mode::ConfirmRetry { ids: vec![id] };
         }
-        S::Done => {
-            command::reveal_in_finder(&row.target_dir, &row.filename);
-        }
-        S::Running | S::Retrying | S::Pending | S::Cancelled | S::Unspecified => {}
+        S::Running | S::Retrying | S::Pending | S::Done | S::Cancelled | S::Unspecified => {}
     }
 }
 
@@ -460,16 +463,6 @@ fn p_action_cursor(
             command::pause(channel.clone(), tx.clone(), vec![id]);
         }
         S::Paused | S::Failed | S::Done | S::Cancelled | S::Unspecified => {}
-    }
-}
-
-fn reveal_cursor(vm: &ViewModel) {
-    let visible = vm.visible_ids();
-    let Some(id) = visible.get(vm.cursor.min(visible.len().saturating_sub(1))) else {
-        return;
-    };
-    if let Some(row) = vm.downloads.get(id) {
-        command::reveal_in_finder(&row.target_dir, &row.filename);
     }
 }
 
@@ -605,7 +598,13 @@ fn handle_key_confirm_retry(
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => vm.mode = Mode::Normal,
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             vm.mode = Mode::Normal;
-            command::retry(channel, tx, ids);
+            // ConfirmRetry открывается из `r_action_cursor` всегда c
+            // одним id — берём первый, остальные (если когда-то будут
+            // bulk-retry) можно подцепить позже. Hard-restart требует
+            // отдельной RPC на каждую запись, у нас — на одну.
+            if let Some(id) = ids.into_iter().next() {
+                command::retry(channel, tx, id);
+            }
         }
         _ => {}
     }

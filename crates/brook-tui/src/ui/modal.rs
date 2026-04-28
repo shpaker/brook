@@ -297,7 +297,7 @@ fn draw_confirm_retry(f: &mut Frame, vm: &ViewModel, ids: &[String], no_color: b
     let lines = vec![
         Line::from(""),
         Line::from(format!(" {summary}")),
-        Line::from(" download will resume from where it stopped."),
+        Line::from(" partial data will be discarded — download starts over."),
         Line::from(""),
     ];
     f.render_widget(Paragraph::new(lines), inner);

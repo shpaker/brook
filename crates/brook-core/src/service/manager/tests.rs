@@ -13,6 +13,7 @@ use crate::domain::{
 use crate::service::engine::EngineConfig;
 use crate::service::retry::RetryPolicy;
 use crate::testing::{
+    AlwaysPresent,
     MemoryPieceStorageFactory,
     MemoryTQueueStore,
     MockRangeFetch,
@@ -53,7 +54,7 @@ fn make_manager(
         engine: fast_engine_config(),
     };
     (
-        DownloadManager::new(factory, queue.clone(), fetch, cfg),
+        DownloadManager::new(factory, queue.clone(), fetch, Arc::new(AlwaysPresent), cfg),
         queue,
     )
 }
@@ -99,7 +100,7 @@ async fn all_added_downloads_spawn() {
         events_capacity: 128,
         engine: fast_engine_config(),
     };
-    let mgr = DownloadManager::new(factory, queue, fetch, cfg);
+    let mgr = DownloadManager::new(factory, queue, fetch, Arc::new(AlwaysPresent), cfg);
 
     let a = mgr.add(spec("https://t/a")).await.unwrap();
     let b = mgr.add(spec("https://t/b")).await.unwrap();
@@ -131,7 +132,7 @@ async fn cancel_marks_cancelled() {
         events_capacity: 64,
         engine: fast_engine_config(),
     };
-    let mgr = DownloadManager::new(factory, queue.clone(), fetch, cfg);
+    let mgr = DownloadManager::new(factory, queue.clone(), fetch, Arc::new(AlwaysPresent), cfg);
     let id = mgr.add(spec("https://t/a")).await.unwrap();
     mgr.cancel(id).await.unwrap();
     // cancel на активной загрузке только сигналит engine — ждём,
@@ -156,7 +157,7 @@ async fn remove_cancels_active_download() {
         events_capacity: 64,
         engine: fast_engine_config(),
     };
-    let mgr = DownloadManager::new(factory, queue.clone(), fetch, cfg);
+    let mgr = DownloadManager::new(factory, queue.clone(), fetch, Arc::new(AlwaysPresent), cfg);
     let id = mgr.add(spec("https://t/slow")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
     // Remove активного файла сам дергает cancel и ждёт завершения engine.
@@ -188,7 +189,7 @@ async fn bootstrap_restores_from_queue() {
         events_capacity: 64,
         engine: fast_engine_config(),
     };
-    let mgr = DownloadManager::new(factory, queue.clone(), fetch, cfg);
+    let mgr = DownloadManager::new(factory, queue.clone(), fetch, Arc::new(AlwaysPresent), cfg);
     mgr.bootstrap().await.unwrap();
     // Running должен быть нормализован до Queued, записано в очередь.
     let persisted = queue.load_all().await.unwrap();
@@ -234,7 +235,7 @@ async fn shutdown_pauses_active_engines() {
         events_capacity: 128,
         engine: fast_engine_config(),
     };
-    let mgr = DownloadManager::new(factory, queue, fetch, cfg);
+    let mgr = DownloadManager::new(factory, queue, fetch, Arc::new(AlwaysPresent), cfg);
     let a = mgr.add(spec("https://t/a")).await.unwrap();
     let b = mgr.add(spec("https://t/b")).await.unwrap();
     // Дать engine'ам стартовать.
@@ -291,4 +292,122 @@ async fn events_fan_in_delivers_completed() {
         }
     }
     assert!(saw_completed, "Completed event was not delivered");
+}
+
+#[tokio::test]
+async fn retry_replaces_failed_record_with_fresh_id() {
+    use crate::ports::TQueueStore;
+    use crate::testing::FetchOutcome;
+
+    let factory = Arc::new(MemoryPieceStorageFactory::new(2, 10));
+    let queue = Arc::new(MemoryTQueueStore::new());
+    let fetch = Arc::new(MockRangeFetch::always_ok(sequential_bytes(20)));
+    // Все попытки первой загрузки кладём в Permanent, чтобы движок
+    // ушёл в Failed после исчерпания max_attempts. Хвост (для retry-Add)
+    // отрабатывает по дефолту Ok.
+    fetch.push_outcomes(std::iter::repeat_n(FetchOutcome::Permanent, 50));
+    let cfg = ManagerConfig {
+        events_capacity: 64,
+        engine: fast_engine_config(),
+    };
+    let mgr = DownloadManager::new(factory, queue.clone(), fetch, Arc::new(AlwaysPresent), cfg);
+
+    let old_id = mgr.add(spec("https://t/retry")).await.unwrap();
+    wait_for_terminal(&mgr, old_id).await;
+    assert_eq!(
+        mgr.snapshot()
+            .iter()
+            .find(|d| d.id == old_id)
+            .unwrap()
+            .status,
+        FileStatus::Failed
+    );
+
+    let new = mgr.retry(old_id).await.unwrap();
+    assert_ne!(new.id, old_id, "retry must mint a new FileId");
+    assert_eq!(new.spec.url, "https://t/retry");
+    assert_eq!(new.status, FileStatus::Pending);
+    assert!(new.error.is_none());
+
+    // Старая запись и в памяти, и в очереди исчезла.
+    let snap = mgr.snapshot();
+    assert!(snap.iter().all(|d| d.id != old_id));
+    let persisted = queue.load_all().await.unwrap();
+    assert!(persisted.iter().all(|d| d.id != old_id));
+    assert!(persisted.iter().any(|d| d.id == new.id));
+}
+
+#[tokio::test]
+async fn retry_rejects_non_failed_state() {
+    let (mgr, _) = make_manager(1, 10);
+    let id = mgr.add(spec("https://t/r")).await.unwrap();
+    // Сразу после Add загрузка либо Pending, либо Running — точно не Failed.
+    let err = mgr.retry(id).await.unwrap_err();
+    match err {
+        Error::Other(msg) => assert!(msg.contains("not in failed state")),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn list_recently_flips_missing_done_to_failed() {
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    use async_trait::async_trait;
+
+    use crate::ports::{
+        TFilePresenceCheck,
+        TQueueStore,
+    };
+
+    /// Аудит видит «файла нет» — провоцирует транзицию.
+    struct NeverPresent;
+
+    #[async_trait]
+    impl TFilePresenceCheck for NeverPresent {
+        async fn exists(&self, _path: &Path) -> bool {
+            false
+        }
+    }
+
+    let factory = Arc::new(MemoryPieceStorageFactory::new(2, 10));
+    let queue = Arc::new(MemoryTQueueStore::new());
+    let fetch = Arc::new(MockRangeFetch::always_ok(sequential_bytes(20)));
+    let cfg = ManagerConfig {
+        events_capacity: 64,
+        engine: fast_engine_config(),
+    };
+    let mgr = DownloadManager::new(factory, queue.clone(), fetch, Arc::new(NeverPresent), cfg);
+
+    // FileSpec с заранее заданным filename: in-memory queue не персистит
+    // filename из `factory.resolve` (в реальной фабрике это делает
+    // `files_repo::set_inspect_fields`), а аудит без filename'а
+    // пропустить запись — нечего проверять. В тесте задаём явно.
+    let mut s = spec("https://t/m");
+    s.filename = Some("m.bin".to_owned());
+    let id = mgr.add(s).await.unwrap();
+    wait_for_terminal(&mgr, id).await;
+    assert_eq!(
+        mgr.snapshot().iter().find(|d| d.id == id).unwrap().status,
+        FileStatus::Done
+    );
+
+    // Аудит должен повернуть Done → Failed и в возвращаемом снимке, и
+    // в БД (через `queue.update_status`), и в in-memory state менеджера.
+    let listed = mgr.list_recently(SystemTime::UNIX_EPOCH).await.unwrap();
+    let listed_row = listed.iter().find(|d| d.id == id).unwrap();
+    assert_eq!(listed_row.status, FileStatus::Failed);
+    assert_eq!(
+        listed_row.error.as_deref(),
+        Some("file no longer exists on disk")
+    );
+
+    assert_eq!(
+        mgr.snapshot().iter().find(|d| d.id == id).unwrap().status,
+        FileStatus::Failed
+    );
+    let persisted = queue.load_all().await.unwrap();
+    let persisted_row = persisted.iter().find(|d| d.id == id).unwrap();
+    assert_eq!(persisted_row.status, FileStatus::Failed);
 }

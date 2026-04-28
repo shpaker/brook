@@ -16,6 +16,7 @@
 //! Всё, что здесь живёт, — это только `trait` и сопутствующие типы.
 //! Никаких `impl for ...` конкретных бэкендов в ядре нет и быть не должно.
 
+pub mod file_presence;
 pub mod http;
 pub mod noop_repos;
 pub mod path_policy;
@@ -24,6 +25,7 @@ pub mod piece_storage;
 pub mod queue_store;
 pub mod worker_repo;
 
+pub use file_presence::TFilePresenceCheck;
 pub use http::{
     ByteStream,
     InspectError,

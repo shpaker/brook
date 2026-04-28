@@ -183,13 +183,16 @@ where
     async fn retry(
         &self,
         req: Request<proto::IdRequest>,
-    ) -> Result<Response<proto::StatusResponse>, Status> {
+    ) -> Result<Response<proto::RetryResponse>, Status> {
         let id = mapper::id_from_proto_opt(req.into_inner().id.as_ref())?;
-        self.manager
+        let file = self
+            .manager
             .retry(id)
             .await
             .map_err(mapper::core_err_to_status)?;
-        Ok(ok_status())
+        Ok(Response::new(proto::RetryResponse {
+            file: Some(mapper::file_to_proto(&file)),
+        }))
     }
 
     async fn get_recently(
