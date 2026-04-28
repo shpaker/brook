@@ -57,6 +57,7 @@ pub use ports::{
     PreparedMode,
     RangeError,
     RangeGuard,
+    TFilePresenceCheck,
     THttpInspect,
     TPathPolicy,
     TPieceAttemptRepo,

@@ -247,6 +247,7 @@ const REASON_CODES: &[&str] = &[
     "disk_full",
     "invalid_response",
     "cancelled_by_user",
+    "file_missing",
     "unknown",
 ];
 
@@ -328,7 +329,7 @@ mod tests {
         );
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM statuses"), 7);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 9);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 10);
     }
 
     #[test]
@@ -358,7 +359,7 @@ mod tests {
                 .unwrap();
             assert_eq!(version, 1);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM statuses"), 7);
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 9);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM reason_codes"), 10);
         }
     }
 

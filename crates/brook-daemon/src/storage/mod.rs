@@ -7,6 +7,7 @@
 pub mod db;
 pub mod error;
 pub mod factory;
+pub mod file_presence;
 pub mod files;
 pub mod fs;
 pub mod local;
@@ -21,3 +22,4 @@ pub use error::{
     StorageError,
     StorageResult,
 };
+pub use file_presence::LocalFilePresence;

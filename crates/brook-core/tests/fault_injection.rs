@@ -73,7 +73,13 @@ fn spin_up_manager(
             events_capacity: 256,
         },
     };
-    DownloadManager::new(Arc::new(factory), Arc::new(queue), Arc::new(fetch), cfg)
+    DownloadManager::new(
+        Arc::new(factory),
+        Arc::new(queue),
+        Arc::new(fetch),
+        Arc::new(brook_core::testing::AlwaysPresent),
+        cfg,
+    )
 }
 
 /// Подождать первое терминальное событие (`Completed` / `Failed`) по id.

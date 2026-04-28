@@ -263,12 +263,14 @@ pub async fn build_runtime(paths: &Paths, args: &ServerArgs) -> Result<Runtime> 
 
     // 6. Manager + bootstrap.
     let manager_cfg = ManagerConfig::default();
+    let file_presence = Arc::new(crate::storage::LocalFilePresence);
     let manager = Arc::new(DownloadManager::with_tracking(
         factory,
         queue,
         fetch,
         Arc::clone(&workers_repo),
         Arc::clone(&attempts_repo),
+        file_presence,
         manager_cfg,
     ));
     manager.bootstrap().await.context("manager bootstrap")?;

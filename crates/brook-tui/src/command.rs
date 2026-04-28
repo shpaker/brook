@@ -161,29 +161,39 @@ pub fn resume(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, ids: Vec<String>)
     });
 }
 
-pub fn retry(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, ids: Vec<String>) {
-    run_bulk(ch, tx, ids, "retry", |mut client, req| {
-        Box::pin(async move { client.retry(req).await.map(|_| ()) })
+/// Hard-restart упавшей загрузки. На сервере одна RPC = remove + add:
+/// старый id уезжает со всем каскадом, для того же FileSpec создаётся
+/// новая запись (новый id). UI получает свежий снимок и сам выкидывает
+/// старый id, вставляя новый — ровно как при `Add`.
+pub fn retry(ch: AuthedChannel, tx: UnboundedSender<UiEvent>, id: String) {
+    tokio::spawn(async move {
+        let mut client = BrookServiceClient::new(ch);
+        let req = IdRequest {
+            id: Some(FileId { value: id.clone() }),
+        };
+        match client.retry(req).await {
+            Ok(resp) => {
+                let Some(file) = resp.into_inner().file else {
+                    send(
+                        &tx,
+                        CmdOutcome::Error("daemon returned empty RetryResponse.file".into()),
+                    );
+                    return;
+                };
+                let row = Box::new(DownloadRow::from_snapshot(&file));
+                send(&tx, CmdOutcome::RetryAccepted { old_id: id, row });
+            }
+            Err(st) if st.code() == Code::NotFound => {
+                send(&tx, CmdOutcome::NotFound { ids: vec![id] });
+            }
+            Err(st) => {
+                send(
+                    &tx,
+                    CmdOutcome::Error(format!("retry failed: {}", st.message())),
+                );
+            }
+        }
     });
-}
-
-/// macOS Finder reveal: `open -R <path>` на файл, либо `open <dir>`,
-/// если имени файла нет (демон не всегда пробрасывает resolved filename
-/// в snapshot — тогда хотя бы открываем родительскую папку, это лучше
-/// молчаливого no-op). Ошибки игнорируем — «открыть» не часть контракта
-/// UI, а удобство.
-pub fn reveal_in_finder(target_dir: &str, filename: &str) {
-    if target_dir.is_empty() {
-        return;
-    }
-    let mut cmd = std::process::Command::new("open");
-    if filename.is_empty() {
-        cmd.arg(target_dir);
-    } else {
-        let path = std::path::Path::new(target_dir).join(filename);
-        cmd.arg("-R").arg(path);
-    }
-    let _ = cmd.spawn();
 }
 
 /// Remove идемпотентен на стороне демона (см. `manager::remove`): ghost

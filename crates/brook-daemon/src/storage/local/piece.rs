@@ -144,6 +144,26 @@ impl LocalPieceStorage {
         .await?)
     }
 
+    /// Удалить остаток `.data.brook` для пары `(target_dir, filename)` без
+    /// открытия хранилища. Идемпотентно: «нет файла» — Ok. Используется
+    /// `manager::remove`, чтобы добить частично скачанный контейнер у
+    /// записей, для которых engine не запущен (Failed/Cancelled/Pending);
+    /// у активных engine `.data.brook` уже сносит `abort_inner` через
+    /// штатный cancel-путь.
+    pub async fn wipe_artifacts(target_dir: &Path, filename: &str) -> StorageResult<()> {
+        let target_path = resolve_target(target_dir, filename)?;
+        let data_path = with_suffix(&target_path, ".data.brook");
+        tokio::task::spawn_blocking(move || -> StorageResult<()> {
+            match std::fs::remove_file(&data_path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(StorageError::Io(e)),
+            }
+        })
+        .await??;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn open_inner(
         target_dir: &Path,

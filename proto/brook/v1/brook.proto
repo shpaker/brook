@@ -14,8 +14,13 @@ service BrookService {
   rpc Pause(IdRequest) returns (StatusResponse);
   // Возобновить приостановленную загрузку файла.
   rpc Resume(IdRequest) returns (StatusResponse);
-  // Перезапустить упавшую загрузку (Failed → Pending).
-  rpc Retry(IdRequest) returns (StatusResponse);
+  // Перезапустить упавшую загрузку. Семантика — hard restart:
+  // старая запись со всем каскадом (pieces / status_changes /
+  // workers / piece_attempts) и `.data.brook` удаляются, затем для
+  // того же FileSpec создаётся новая запись (новый FileId, свежий
+  // resolve / inspect / pieces). В ответе — снимок созданной записи,
+  // как у Add.
+  rpc Retry(IdRequest) returns (RetryResponse);
 
   // Server-streaming: статусные переходы известных файлов. Стартовое
   // состояние клиент получает через GetRecently/GetFiles, стрим отдаёт
@@ -129,6 +134,13 @@ message AddRequest {
 message AddResponse {
   // Полный снимок созданной записи. Клиент может сразу вставить её в
   // свой view-model, не дожидаясь дельта-событий из WatchFile.
+  File file = 1;
+}
+
+message RetryResponse {
+  // Полный снимок свежей записи (новый FileId, тот же FileSpec).
+  // Клиент сразу вставляет её в view-model и выкидывает строку со
+  // старым id (которая ушла на стороне сервера в `manager::remove`).
   File file = 1;
 }
 

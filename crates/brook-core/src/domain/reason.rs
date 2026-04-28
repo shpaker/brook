@@ -48,6 +48,10 @@ pub enum ReasonCode {
     InvalidResponse,
     /// Пользователь запросил отмену.
     CancelledByUser,
+    /// Завершённый ранее файл больше не лежит на диске (удалён
+    /// пользователем или внешним процессом). Выставляется аудитом
+    /// `manager::list_recently` / `manager::list_files`.
+    FileMissing,
     /// Прочее — запасной вариант, пока нет отдельной категории.
     Unknown,
 }
@@ -63,6 +67,7 @@ impl ReasonCode {
             Self::DiskFull => "disk_full",
             Self::InvalidResponse => "invalid_response",
             Self::CancelledByUser => "cancelled_by_user",
+            Self::FileMissing => "file_missing",
             Self::Unknown => "unknown",
         }
     }
@@ -108,6 +113,7 @@ impl FromStr for ReasonCode {
             "disk_full" => Self::DiskFull,
             "invalid_response" => Self::InvalidResponse,
             "cancelled_by_user" => Self::CancelledByUser,
+            "file_missing" => Self::FileMissing,
             "unknown" => Self::Unknown,
             other => return Err(Error::Other(format!("unknown reason code: {other}"))),
         })
@@ -170,6 +176,7 @@ mod tests {
             ReasonCode::DiskFull,
             ReasonCode::InvalidResponse,
             ReasonCode::CancelledByUser,
+            ReasonCode::FileMissing,
             ReasonCode::Unknown,
         ] {
             let parsed: ReasonCode = c.as_str().parse().unwrap();

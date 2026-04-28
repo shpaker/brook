@@ -217,6 +217,30 @@ where
             }
         }
     }
+
+    fn wipe_artifacts(
+        &self,
+        spec: &FileSpec,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        let policy = Arc::clone(&self.policy);
+        let spec = spec.clone();
+        async move {
+            // Без resolved-имени `.data.brook` не сосчитать. Резолва ещё
+            // не было (например, Add упал на inspect'е) → удалять нечего.
+            let Some(filename) = spec.filename.as_deref() else {
+                return Ok(());
+            };
+            // Out-of-sandbox target_dir не наш — пропускаем без ошибки;
+            // удалять чужие пути в любом случае не должны.
+            let target_dir = match policy.check_target_dir(&spec.target_dir) {
+                Ok(d) => d,
+                Err(_) => return Ok(()),
+            };
+            LocalPieceStorage::wipe_artifacts(&target_dir, filename)
+                .await
+                .map_err(|e| Error::Other(format!("wipe_artifacts: {e}")))
+        }
+    }
 }
 
 /// Реконструкция [`RangeGuard`] из уже персистнутых inspect-полей.
